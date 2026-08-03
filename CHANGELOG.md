@@ -2,6 +2,17 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.117 - 2026-08-03
+
+- Restrict the Secret Bottle value threshold and NPC selling to confirmed
+  Unique rewards; currency, gems, scarabs and all other rarities are kept.
+- Preserve transferred reward state, wait for DPB's three-second vendor Accept
+  lock to clear, and confirm the offer was consumed before counting a sale.
+- Add Bottle reward notifications after inventory placement is confirmed, with
+  independent Valuable Items alerts for rewards above the configured threshold.
+- Add a Bottle Rewards card to the Notifications tab and migrate existing
+  settings with notifications enabled by default.
+
 ## 0.23.116 - 2026-08-03
 
 - Remember the confirmed remaining Chart count for every main/sub storage page

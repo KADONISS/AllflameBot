@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.116";
+        public const string Current = "0.23.117";
     }
 
     public sealed class AllflameBot : IBot
@@ -30283,9 +30283,11 @@ namespace AllflameBot
         private sealed class RewardDecision
         {
             public bool Sell { get; set; }
+            public bool ThresholdEligible { get; set; }
             public bool TrustedPrice { get; set; }
             public bool PriceFresh { get; set; }
             public bool FixedPrice { get; set; }
+            public string Rarity { get; set; }
             public AllflamePriceQuote Quote { get; set; }
         }
 
@@ -30319,6 +30321,7 @@ namespace AllflameBot
         private int _vendorAcceptAttempts;
         private Npc _vendor;
         private DateTime _vendorStartedUtc = DateTime.MinValue;
+        private DateTime _vendorAcceptDeadlineUtc = DateTime.MinValue;
         private DateTime _nextSessionUtc = DateTime.MinValue;
         private uint _sessionAreaHash;
 
@@ -30469,10 +30472,18 @@ namespace AllflameBot
                 return true;
             }
 
-            if (_sellLocalIds.Count == 0)
+            if (_sellLocalIds.Count == 0 &&
+                _transferredLocalIds.Count == 0)
             {
                 FinishSession("NoLowValueRewards", false, 2);
                 return false;
+            }
+
+            if (_sellLocalIds.Count == 0 &&
+                _transferredLocalIds.Count > 0 &&
+                _stage != ProcessingStage.Accept)
+            {
+                BeginVendorAcceptWait();
             }
 
             if (_stage == ProcessingStage.FindVendor)
@@ -30501,6 +30512,7 @@ namespace AllflameBot
             _vendorAcceptAttempts = 0;
             _vendor = null;
             _vendorStartedUtc = DateTime.MinValue;
+            _vendorAcceptDeadlineUtc = DateTime.MinValue;
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
@@ -30824,6 +30836,7 @@ namespace AllflameBot
             }
 
             Item decisionItem = placement.PlacedItem;
+            int decisionKey = 0;
             if (decisionItem == null &&
                 placement.Decision != null &&
                 newItems.Count == 1)
@@ -30836,8 +30849,33 @@ namespace AllflameBot
                     decisionItem,
                     placement.Decision,
                     "CursorBeforePlacement");
-                int decisionKey = ItemKey(decisionItem);
+                decisionKey = ItemKey(decisionItem);
                 newItems.RemoveAll(item => ItemKey(item) == decisionKey);
+            }
+
+            foreach (Item mergedReward in increasedStacks)
+            {
+                int mergedKey = ItemKey(mergedReward);
+                if (mergedKey == decisionKey)
+                {
+                    continue;
+                }
+                ItemSnapshot old;
+                int rewardQuantity =
+                    before.TryGetValue(mergedKey, out old)
+                        ? Math.Max(
+                            1,
+                            Math.Max(1, mergedReward.StackCount) -
+                            old.StackCount)
+                        : 1;
+                AllflamePriceQuote mergedQuote =
+                    AllflamePrices.Quote(mergedReward);
+                mergedQuote.Quantity = rewardQuantity;
+                AllflameNotifications.SendSecretBottleReward(
+                    mergedQuote,
+                    mergedReward.Rarity.ToString(),
+                    "Keep",
+                    "MergedExistingStack");
             }
 
             if (newItems.Count == 0 && decisionItem == null)
@@ -31672,7 +31710,15 @@ namespace AllflameBot
                     TimeSpan.FromHours(
                         Math.Max(24, settings.PriceUpdateHours * 2));
             bool trustedPrice = quote.IsPriced && (fixedPrice || priceFresh);
+            string rarity = reward == null
+                ? String.Empty
+                : reward.Rarity.ToString();
+            bool thresholdEligible = String.Equals(
+                rarity,
+                "Unique",
+                StringComparison.OrdinalIgnoreCase);
             bool sell =
+                thresholdEligible &&
                 settings.SecretBottleSellLowValue &&
                 trustedPrice &&
                 quote.TotalDivines <
@@ -31680,9 +31726,11 @@ namespace AllflameBot
             return new RewardDecision
             {
                 Sell = sell,
+                ThresholdEligible = thresholdEligible,
                 TrustedPrice = trustedPrice,
                 PriceFresh = priceFresh,
                 FixedPrice = fixedPrice,
+                Rarity = rarity,
                 Quote = quote
             };
         }
@@ -31723,6 +31771,8 @@ namespace AllflameBot
                 "|Source=" + source +
                 "|LocalId=" + reward.LocalId +
                 "|Name=" + (reward.FullName ?? reward.Name ?? String.Empty) +
+                "|Rarity=" + decision.Rarity +
+                "|ThresholdEligible=" + decision.ThresholdEligible +
                 "|UnitDivines=" +
                 quote.UnitDivines.ToString(
                     "0.####",
@@ -31735,11 +31785,19 @@ namespace AllflameBot
                 "|PriceFresh=" + decision.PriceFresh +
                 "|FixedOverride=" + decision.FixedPrice +
                 "|Decision=" + (sell ? "Sell" : "Keep") +
-                (!decision.TrustedPrice
+                (!decision.ThresholdEligible
+                    ? "|Reason=NonUniqueReward"
+                    : (!decision.TrustedPrice
                     ? "|Reason=UnpricedOrStale"
                     : (decision.Sell && key == 0
                         ? "|Reason=MissingStableItemId"
-                        : String.Empty)));
+                        : String.Empty))));
+
+            AllflameNotifications.SendSecretBottleReward(
+                quote,
+                decision.Rarity,
+                sell ? "Sell" : "Keep",
+                source);
         }
 
         private async Task<bool> FindAndOpenVendor(
@@ -31841,15 +31899,17 @@ namespace AllflameBot
                 _sellLocalIds.Contains(ItemKey(candidate)));
             if (item == null)
             {
-                _stage = ProcessingStage.Accept;
+                BeginVendorAcceptWait();
                 return true;
             }
 
             int key = ItemKey(item);
+            int localId = item.LocalId;
+            string itemName = item.FullName ?? item.Name ?? String.Empty;
             string result;
             try
             {
-                result = inventoryControl.FastMove(item.LocalId).ToString();
+                result = inventoryControl.FastMove(localId).ToString();
             }
             catch (Exception ex)
             {
@@ -31863,8 +31923,8 @@ namespace AllflameBot
             AllflameLog.Info(
                 "SECRET_BOTTLE_VENDOR" +
                 "|Action=Transfer" +
-                "|LocalId=" + item.LocalId +
-                "|Name=" + (item.FullName ?? item.Name ?? String.Empty) +
+                "|LocalId=" + localId +
+                "|Name=" + itemName +
                 "|Attempt=" + attempts +
                 "|Result=" + result +
                 "|Confirmed=" + transferred);
@@ -31873,6 +31933,10 @@ namespace AllflameBot
                 _sellLocalIds.Remove(key);
                 _transferredLocalIds.Add(key);
                 _transferAttempts.Remove(key);
+                if (_sellLocalIds.Count == 0)
+                {
+                    BeginVendorAcceptWait();
+                }
                 return true;
             }
             _transferAttempts[key] = attempts;
@@ -31891,12 +31955,48 @@ namespace AllflameBot
                 await FallbackToStash("SellUiClosedBeforeAccept");
                 return false;
             }
+            var tradeControl = LokiPoe.InGameState.SellUi.TradeControl;
+            string acceptText;
+            try
+            {
+                acceptText = tradeControl.AcceptButtonText ?? String.Empty;
+            }
+            catch (Exception ex)
+            {
+                acceptText = "Exception:" + ex.GetType().Name;
+            }
+            if (!String.Equals(
+                    acceptText,
+                    "Accept",
+                    StringComparison.Ordinal))
+            {
+                if (DateTime.UtcNow < _vendorAcceptDeadlineUtc)
+                {
+                    AllflameLog.Throttled(
+                        "secret_bottle_vendor_accept_wait",
+                        TimeSpan.FromMilliseconds(500),
+                        "SECRET_BOTTLE_VENDOR" +
+                        "|Action=WaitForAccept" +
+                        "|ButtonText=" + acceptText.Replace("|", "/") +
+                        "|Items=" + _transferredLocalIds.Count +
+                        "|RemainingMilliseconds=" +
+                        Math.Max(
+                            0,
+                            (int)(_vendorAcceptDeadlineUtc - DateTime.UtcNow)
+                                .TotalMilliseconds));
+                    await LokiCoroutine.Sleep(200);
+                    return true;
+                }
+                await FallbackToStash("VendorAcceptButtonTimeout");
+                return false;
+            }
+
+            int offerBefore = InventoryItems(
+                tradeControl.InventoryControl_YourOffer).Count;
             string result;
             try
             {
-                result = LokiPoe.InGameState.SellUi.TradeControl
-                    .Accept(true)
-                    .ToString();
+                result = tradeControl.Accept(true).ToString();
             }
             catch (Exception ex)
             {
@@ -31904,17 +32004,28 @@ namespace AllflameBot
             }
             await LokiCoroutine.Sleep(600);
             _vendorAcceptAttempts++;
-            bool accepted = String.Equals(
-                result,
-                "None",
-                StringComparison.OrdinalIgnoreCase) &&
-                _transferredLocalIds.Count > 0;
+            bool sellUiOpened = LokiPoe.InGameState.SellUi.IsOpened;
+            int offerAfter = sellUiOpened
+                ? InventoryItems(
+                    LokiPoe.InGameState.SellUi.TradeControl
+                        .InventoryControl_YourOffer).Count
+                : 0;
+            bool accepted =
+                String.Equals(
+                    result,
+                    "None",
+                    StringComparison.OrdinalIgnoreCase) &&
+                _transferredLocalIds.Count > 0 &&
+                (!sellUiOpened || offerAfter == 0);
             AllflameLog.Info(
                 "SECRET_BOTTLE_VENDOR" +
                 "|Action=Accept" +
                 "|Attempt=" + _vendorAcceptAttempts +
                 "|Maximum=3" +
                 "|Items=" + _transferredLocalIds.Count +
+                "|OfferBefore=" + offerBefore +
+                "|OfferAfter=" + offerAfter +
+                "|SellUiOpened=" + sellUiOpened +
                 "|Result=" + result +
                 "|Confirmed=" + accepted);
             if (!accepted)
@@ -31922,6 +32033,8 @@ namespace AllflameBot
                 if (_vendorAcceptAttempts < 3 &&
                     LokiPoe.InGameState.SellUi.IsOpened)
                 {
+                    _vendorAcceptDeadlineUtc =
+                        DateTime.UtcNow.AddSeconds(6);
                     await LokiCoroutine.Sleep(400);
                     return true;
                 }
@@ -31982,6 +32095,7 @@ namespace AllflameBot
             _stage = ProcessingStage.Opening;
             _vendor = null;
             _vendorStartedUtc = DateTime.MinValue;
+            _vendorAcceptDeadlineUtc = DateTime.MinValue;
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
@@ -31990,6 +32104,15 @@ namespace AllflameBot
             _withdrawAttempts.Clear();
             _vendorAcceptAttempts = 0;
             _sessionAreaHash = 0;
+        }
+
+        private void BeginVendorAcceptWait()
+        {
+            _stage = ProcessingStage.Accept;
+            if (_vendorAcceptDeadlineUtc == DateTime.MinValue)
+            {
+                _vendorAcceptDeadlineUtc = DateTime.UtcNow.AddSeconds(6);
+            }
         }
 
         private Npc FindVendorCandidate(string configuredName)

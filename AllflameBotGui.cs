@@ -391,9 +391,10 @@ namespace AllflameBot
             Grid.SetColumn(grid.Children[0], 0);
 
             grid.Children.Add(Card("PRICE DECISION", Stack(
-                DecimalNumber("Keep when value reaches (Divine)", "SecretBottleKeepMinDivines", 0d, 10000d),
-                Check("Sell rewards below threshold", "SecretBottleSellLowValue"),
-                Note("Unpriced rewards, stale price data and ambiguous stack merges are always kept."),
+                DecimalNumber("Keep Unique when value reaches (Divine)", "SecretBottleKeepMinDivines", 0d, 10000d),
+                Check("Sell Unique rewards below threshold", "SecretBottleSellLowValue"),
+                Note("Currency, gems, scarabs and every non-Unique reward are always kept."),
+                Note("Unpriced or stale Unique rewards and ambiguous stack merges are always kept."),
                 Note("Fixed price overrides from the Prices tab take priority."))));
             Grid.SetColumn(grid.Children[1], 1);
 
@@ -453,6 +454,14 @@ namespace AllflameBot
         private UIElement BuildNotificationsTab()
         {
             var grid = PanelGrid(4);
+            grid.RowDefinitions.Add(new RowDefinition
+            {
+                Height = GridLength.Auto
+            });
+            grid.RowDefinitions.Add(new RowDefinition
+            {
+                Height = GridLength.Auto
+            });
             _notificationStatus = new TextBlock
             {
                 Foreground = MutedBrush,
@@ -492,6 +501,14 @@ namespace AllflameBot
                 Note("Set the minimum to 1 to ping @everyone for confirmed pickups worth at least 1 Divine."),
                 Note("The alert is emitted only after the pickup is confirmed, so retries do not duplicate it."))));
             Grid.SetColumn(grid.Children[3], 3);
+
+            grid.Children.Add(Card("BOTTLE REWARDS", Stack(
+                Check("Notify rewards opened from Message in a Bottle", "NotifySecretBottleRewards"),
+                Note("A notification is sent only after the reward is confirmed in inventory."),
+                Note("Rewards meeting the Valuable Items threshold also use that alert independently."))));
+            Grid.SetRow(grid.Children[4], 1);
+            Grid.SetColumn(grid.Children[4], 0);
+            Grid.SetColumnSpan(grid.Children[4], 2);
             return grid;
         }
 

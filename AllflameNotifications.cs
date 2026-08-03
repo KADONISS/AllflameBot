@@ -976,6 +976,72 @@ namespace AllflameBot
                 AllflameSettings.Instance.TagEveryoneForValuableItems);
         }
 
+        public static void SendSecretBottleReward(
+            AllflamePriceQuote quote,
+            string rarity,
+            string decision,
+            string placement)
+        {
+            if (quote == null)
+            {
+                return;
+            }
+
+            AllflameSettings settings = AllflameSettings.Instance;
+            int quantity = Math.Max(1, quote.Quantity);
+            double valuableValue = quote.IsAmbiguousUnique
+                ? quote.MaxCandidateDivines * quantity
+                : quote.TotalDivines;
+            bool bottleNotification = settings.NotifySecretBottleRewards;
+            bool valuableNotification =
+                settings.NotifyValuableItems &&
+                valuableValue >= settings.ValuableItemMinDivines;
+
+            AllflameLog.Info(
+                "SECRET_BOTTLE_NOTIFICATION" +
+                "|Name=" + (quote.Name ?? "Unknown").Replace("|", "/") +
+                "|Quantity=" + quantity +
+                "|Rarity=" + (rarity ?? String.Empty).Replace("|", "/") +
+                "|InventoryConfirmed=True" +
+                "|ValueDivines=" +
+                valuableValue.ToString("0.####", CultureInfo.InvariantCulture) +
+                "|BottleNotification=" + bottleNotification +
+                "|ValuableNotification=" + valuableNotification +
+                "|Decision=" + (decision ?? String.Empty).Replace("|", "/") +
+                "|Placement=" + (placement ?? String.Empty).Replace("|", "/"));
+
+            if (bottleNotification)
+            {
+                string valueText = quote.IsPriced
+                    ? FormatDivines(quote.TotalDivines)
+                    : quote.IsAmbiguousUnique &&
+                      quote.MaxCandidateDivines > 0d
+                        ? "up to " + FormatDivines(valuableValue)
+                        : "Unpriced";
+                var embed = NewEmbed(
+                    "Bottle reward added to inventory",
+                    BuildTable(new[]
+                    {
+                        Pair("Item", quote.Name ?? "Unknown"),
+                        Pair("Quantity", quantity.ToString()),
+                        Pair("Rarity", rarity ?? "Unknown"),
+                        Pair("Value", valueText),
+                        Pair("Decision", decision ?? "Keep")
+                    }),
+                    0xE67E22);
+                embed.Footer = new DiscordEmbedFooter
+                {
+                    Text = PriceFooter()
+                };
+                Send(embed);
+            }
+
+            if (valuableNotification)
+            {
+                SendValuableItem(quote, "Message in a Bottle");
+            }
+        }
+
         public static void SendPriceWarning(string message)
         {
             bool shouldSend;

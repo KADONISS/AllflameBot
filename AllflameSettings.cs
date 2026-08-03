@@ -205,6 +205,7 @@ namespace AllflameBot
         public bool TagEveryoneForLowVoyageStash { get; set; }
         public int VoyageStashEveryoneThreshold { get; set; }
         public bool NotifyValuableItems { get; set; }
+        public bool NotifySecretBottleRewards { get; set; }
         public int ValuableItemMinDivines { get; set; }
         public bool TagEveryoneForValuableItems { get; set; }
         public bool NotifyMapStarted { get; set; }
@@ -220,7 +221,7 @@ namespace AllflameBot
             {
                 ApplyRecommendedDefaults();
             }
-            else if (SettingsSchemaVersion < 39)
+            else if (SettingsSchemaVersion < 40)
             {
                 int oldSchema = SettingsSchemaVersion;
                 if (oldSchema < 3)
@@ -406,7 +407,11 @@ namespace AllflameBot
                 {
                     EnableChartStorageWithdrawal = false;
                 }
-                SettingsSchemaVersion = 39;
+                if (oldSchema < 40)
+                {
+                    NotifySecretBottleRewards = true;
+                }
+                SettingsSchemaVersion = 40;
                 Save();
             }
         }
@@ -787,12 +792,13 @@ namespace AllflameBot
             TagEveryoneForLowVoyageStash = false;
             VoyageStashEveryoneThreshold = 10;
             NotifyValuableItems = true;
+            NotifySecretBottleRewards = true;
             ValuableItemMinDivines = 10;
             TagEveryoneForValuableItems = false;
             NotifyMapStarted = true;
             NotifyMapCompleted = true;
             NotifySulphurCollected = true;
-            SettingsSchemaVersion = 39;
+            SettingsSchemaVersion = 40;
         }
 
         private void ApplySecretBottleDefaults()
