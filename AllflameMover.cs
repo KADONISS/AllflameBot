@@ -29,7 +29,7 @@ namespace AllflameBot
         public string Name => "Allflame Mover";
         public string Description => "Pathfinding mover for Allflame Chart Areas.";
         public string Author => "Codex";
-        public string Version => "0.23.40";
+        public string Version => "0.23.108";
         public UserControl Control => null;
         public JsonSettings Settings => AllflameSettings.Instance;
         public PathfindingCommand CurrentCommand => _currentCommand;
@@ -140,10 +140,24 @@ namespace AllflameBot
                 return true;
             }
 
-            LokiPoe.InGameState.SkillBarHud.BeginUseAt(
-                moveSlot,
-                false,
-                waypoint);
+            if (remainingDistance < 130f)
+            {
+                // Near an interaction target, use a single click so a held
+                // Move input cannot carry the player through the target ring.
+                LokiPoe.InGameState.SkillBarHud.UseAt(
+                    moveSlot,
+                    false,
+                    waypoint,
+                    true);
+            }
+            else
+            {
+                LokiPoe.InGameState.SkillBarHud.BeginUseAt(
+                    moveSlot,
+                    false,
+                    waypoint,
+                    true);
+            }
 
             int moveIntervalMs =
                 remainingDistance < 65f

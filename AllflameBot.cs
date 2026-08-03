@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.107";
+        public const string Current = "0.23.108";
     }
 
     public sealed class AllflameBot : IBot
@@ -5404,11 +5404,16 @@ namespace AllflameBot
                 Coroutines.FinishCurrentActionTimeout;
             try
             {
+                // Release a held Move input before waiting for DPB's current
+                // action. Otherwise a nearby target can be crossed while
+                // FinishCurrentAction is waiting for movement to end.
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 // Preserve DPB's FinishCurrentAction(true) synchronization,
                 // but never let a long MoveTowards action hold the complete
                 // bot task loop while an interaction target is already near.
                 Coroutines.FinishCurrentActionTimeout = 750;
                 await Coroutines.FinishCurrentAction(true);
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 AllflameLog.Throttled(
                     Name + "_finish_action_" + target,
                     TimeSpan.FromSeconds(2),
@@ -23394,9 +23399,7 @@ namespace AllflameBot
         private static float RescueInteractionThreshold(
             AllflameSettings settings)
         {
-            return Math.Max(
-                1f,
-                Math.Max(35f, settings.InteractDistance + 12f) - 5f);
+            return Math.Max(35f, settings.InteractDistance + 12f);
         }
 
         private NetworkObject FindLiveRescueCapsule(Vector2i anchor)
