@@ -2,6 +2,17 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.121 - 2026-08-03
+
+- Resolve the Chart Device from the stable `deepwater_charts_window` IdLabel
+  before bounded recursive UI scans, then click its visible Descend element
+  before falling back to image recognition.
+- Remove blind resolution-based Descend clicks and confirm the action only
+  after the Chart Device UI closes; retry a still-open UI at most three times.
+- Prevent the existing hub Bathysphere from being treated as proof that
+  Descend succeeded, and bound portal appearance and entry with controlled
+  recovery stops instead of an infinite interaction loop.
+
 ## 0.23.120 - 2026-08-03
 
 - Deposit remaining pre-Voyage Charts into Chart Storage first, confirm each

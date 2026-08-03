@@ -16340,6 +16340,7 @@ namespace AllflameBot
     {
         private const int MaximumNodesPerRoot = 450;
         private const int MaximumNodesPerScan = 1000;
+        private const string StableWindowId = "deepwater_charts_window";
         private const int DescendTemplateWidth = 48;
         private const int DescendTemplateHeight = 14;
         private const double MinimumImageCorrelation = 0.62;
@@ -16385,6 +16386,30 @@ namespace AllflameBot
             out Element descendButton)
         {
             descendButton = null;
+            Element stableWindow;
+            int stableRootIndex;
+            string stableButtonPath;
+            if (TryResolveStableWindow(
+                    out stableWindow,
+                    out descendButton,
+                    out stableRootIndex,
+                    out stableButtonPath))
+            {
+                _cachedDescendButton = descendButton;
+                AllflameLog.Throttled(
+                    "deepwater_chart_device_stable_window",
+                    TimeSpan.FromSeconds(3),
+                    "CHART_DEVICE_WINDOW_RESOLVED" +
+                    "|IdLabel=" + StableWindowId +
+                    "|RootIndex=" + stableRootIndex +
+                    "|WindowAddress=0x" +
+                    stableWindow.Address.ToString("X") +
+                    "|ButtonPath=" + stableButtonPath +
+                    "|ButtonAddress=0x" +
+                    descendButton.Address.ToString("X"));
+                return true;
+            }
+
             double cachedGeometryScore;
             if (IsVisibleDescend(_cachedDescendButton) ||
                 IsGeometryDescendCandidate(
@@ -16488,6 +16513,138 @@ namespace AllflameBot
             return false;
         }
 
+        public static bool IsStableWindowOpen
+        {
+            get
+            {
+                Element window;
+                Element button;
+                int rootIndex;
+                string buttonPath;
+                return TryResolveStableWindow(
+                    out window,
+                    out button,
+                    out rootIndex,
+                    out buttonPath,
+                    false);
+            }
+        }
+
+        private static bool TryResolveStableWindow(
+            out Element window,
+            out Element descendButton,
+            out int rootIndex,
+            out string buttonPath,
+            bool requireButton = true)
+        {
+            window = null;
+            descendButton = null;
+            rootIndex = -1;
+            buttonPath = String.Empty;
+            List<Element> roots;
+            try
+            {
+                roots = LokiPoe.GetGuiElements();
+            }
+            catch
+            {
+                return false;
+            }
+            if (roots == null)
+            {
+                return false;
+            }
+
+            // IdLabel is stable while the top-level root index changes between
+            // clients and UI sessions. Check every root before recursive scans.
+            for (int i = 0; i < roots.Count; i++)
+            {
+                Element candidate = roots[i];
+                try
+                {
+                    if (candidate == null ||
+                        !candidate.IsValid ||
+                        (!candidate.IsVisible &&
+                         !candidate.IsVisibleLocal) ||
+                        !String.Equals(
+                            candidate.IdLabel,
+                            StableWindowId,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+                catch
+                {
+                    continue;
+                }
+
+                window = candidate;
+                rootIndex = i;
+                int visited = 0;
+                descendButton = FindStableDescend(
+                    candidate,
+                    "root[" + i + "]",
+                    0,
+                    ref visited,
+                    out buttonPath);
+                return !requireButton || descendButton != null;
+            }
+            return false;
+        }
+
+        private static Element FindStableDescend(
+            Element element,
+            string path,
+            int depth,
+            ref int visited,
+            out string foundPath)
+        {
+            foundPath = String.Empty;
+            if (element == null ||
+                depth > 12 ||
+                visited >= MaximumNodesPerRoot)
+            {
+                return null;
+            }
+            visited++;
+            if (IsVisibleDescend(element))
+            {
+                foundPath = path;
+                return element;
+            }
+
+            List<Element> children;
+            try
+            {
+                children = element.Children;
+            }
+            catch
+            {
+                return null;
+            }
+            if (children == null)
+            {
+                return null;
+            }
+            for (int i = 0; i < children.Count; i++)
+            {
+                string childPath;
+                Element found = FindStableDescend(
+                    children[i],
+                    path + "/" + i,
+                    depth + 1,
+                    ref visited,
+                    out childPath);
+                if (found != null)
+                {
+                    foundPath = childPath;
+                    return found;
+                }
+            }
+            return null;
+        }
+
         private static bool HasVisibleSurface(Element root)
         {
             try
@@ -16524,26 +16681,6 @@ namespace AllflameBot
         {
             try
             {
-                Vector2i imageLocation;
-                double imageCorrelation;
-                if (TryFindDescendByImage(
-                        out imageLocation,
-                        out imageCorrelation))
-                {
-                    string strategy =
-                        DispatchDescendClick(
-                            imageLocation,
-                            attempt);
-                    AllflameLog.Info(
-                        "CHART_DEVICE_DESCEND_IMAGE|Client=" +
-                        imageLocation.X + "," + imageLocation.Y +
-                        "|Correlation=" +
-                        imageCorrelation.ToString("0.000") +
-                        "|Attempt=" + attempt +
-                        "|Strategy=" + strategy);
-                    return true;
-                }
-
                 double geometryScore;
                 if (IsVisibleDescend(descendButton) ||
                     IsGeometryDescendCandidate(
@@ -16570,30 +16707,32 @@ namespace AllflameBot
                     return true;
                 }
 
-                var client = LokiPoe.ClientWindowInfo.Client;
-                int width = client.Right - client.Left;
-                int height = client.Bottom - client.Top;
-                if (width <= 0 || height <= 0)
+                Vector2i imageLocation;
+                double imageCorrelation;
+                if (TryFindDescendByImage(
+                        out imageLocation,
+                        out imageCorrelation))
                 {
-                    return false;
+                    string strategy =
+                        DispatchDescendClick(
+                            imageLocation,
+                            attempt);
+                    AllflameLog.Info(
+                        "CHART_DEVICE_DESCEND_IMAGE|Client=" +
+                        imageLocation.X + "," + imageLocation.Y +
+                        "|Correlation=" +
+                        imageCorrelation.ToString("0.000") +
+                        "|Attempt=" + attempt +
+                        "|Strategy=" + strategy);
+                    return true;
                 }
 
-                int x = width / 2;
-                int y = (int)Math.Round(height * 0.607);
-                Vector2i fallbackLocation =
-                    new Vector2i(x, y);
-                string fallbackStrategy =
-                    DispatchDescendClick(
-                        fallbackLocation,
-                        attempt);
                 AllflameLog.Info(
-                    "CHART_DEVICE_DESCEND_FALLBACK|Client=" +
-                    x + "," + y + "|Client=" +
-                    client.Left + "," + client.Top + "," +
-                    width + "," + height +
+                    "CHART_DEVICE_DESCEND_UNRESOLVED" +
                     "|Attempt=" + attempt +
-                    "|Strategy=" + fallbackStrategy);
-                return true;
+                    "|Element=False|Image=False" +
+                    "|Action=RetryWithoutBlindCoordinate");
+                return false;
             }
             catch
             {
@@ -17652,9 +17791,15 @@ namespace AllflameBot
 
     internal sealed class EnterBathysphereTask : ObserverTask
     {
-        private const int MaximumDescendAttempts = 7;
+        private const int MaximumDescendAttempts = 3;
         private static readonly TimeSpan CapacityFullConfirmation =
             TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan DescendConfirmationTimeout =
+            TimeSpan.FromSeconds(2);
+        private static readonly TimeSpan PortalAppearanceTimeout =
+            TimeSpan.FromSeconds(6);
+        private static readonly TimeSpan PortalEntryTimeout =
+            TimeSpan.FromSeconds(15);
         private DateTime _nextActivateUtc = DateTime.MinValue;
         private DateTime _descendDisabledSinceUtc =
             DateTime.MinValue;
@@ -17662,7 +17807,10 @@ namespace AllflameBot
         private int _customChartLocalId;
         private int _descendAttempts;
         private bool _descendIssued;
+        private bool _descendConfirmed;
         private bool _loadConfirmationLogged;
+        private DateTime _descendIssuedUtc = DateTime.MinValue;
+        private DateTime _portalConfirmedUtc = DateTime.MinValue;
         private DateTime _portalWaitUntilUtc = DateTime.MinValue;
 
         public EnterBathysphereTask()
@@ -17675,7 +17823,10 @@ namespace AllflameBot
             _customChartLocalId = 0;
             _descendAttempts = 0;
             _descendIssued = false;
+            _descendConfirmed = false;
             _loadConfirmationLogged = false;
+            _descendIssuedUtc = DateTime.MinValue;
+            _portalConfirmedUtc = DateTime.MinValue;
             _portalWaitUntilUtc = DateTime.MinValue;
             _descendDisabledSinceUtc = DateTime.MinValue;
         }
@@ -17687,7 +17838,10 @@ namespace AllflameBot
             _customChartLocalId = 0;
             _descendAttempts = 0;
             _descendIssued = false;
+            _descendConfirmed = false;
             _loadConfirmationLogged = false;
+            _descendIssuedUtc = DateTime.MinValue;
+            _portalConfirmedUtc = DateTime.MinValue;
             _portalWaitUntilUtc = DateTime.MinValue;
             _descendDisabledSinceUtc = DateTime.MinValue;
         }
@@ -17704,13 +17858,100 @@ namespace AllflameBot
                 _customChartLocalId = 0;
                 _descendAttempts = 0;
                 _descendIssued = false;
+                _descendConfirmed = false;
                 _loadConfirmationLogged = false;
+                _descendIssuedUtc = DateTime.MinValue;
+                _portalConfirmedUtc = DateTime.MinValue;
                 _portalWaitUntilUtc = DateTime.MinValue;
                 _descendDisabledSinceUtc = DateTime.MinValue;
                 return false;
             }
 
-            if (_descendIssued &&
+            if (_descendIssued)
+            {
+                bool nativeUiOpen =
+                    NativeDeepwaterChartDeviceUi.IsOpened;
+                bool stableUiOpen =
+                    DeepwaterChartDeviceUi.IsStableWindowOpen;
+                TimeSpan issuedFor =
+                    DateTime.UtcNow - _descendIssuedUtc;
+                if (!nativeUiOpen && !stableUiOpen)
+                {
+                    _descendIssued = false;
+                    _descendIssuedUtc = DateTime.MinValue;
+                    _descendConfirmed = true;
+                    _portalConfirmedUtc = DateTime.UtcNow;
+                    _portalWaitUntilUtc =
+                        DateTime.UtcNow + PortalAppearanceTimeout;
+                    AllflameLog.Info(
+                        "CHART_DEVICE_DESCEND_CONFIRMED" +
+                        "|Evidence=UiClosed" +
+                        "|Attempt=" + _descendAttempts +
+                        "|ElapsedMs=" +
+                        (int)issuedFor.TotalMilliseconds);
+                }
+                else if (issuedFor < DescendConfirmationTimeout)
+                {
+                    AllflameLog.Throttled(
+                        "chart_device_descend_confirmation_wait",
+                        TimeSpan.FromMilliseconds(500),
+                        "CHART_DEVICE_DESCEND_CONFIRM_WAIT" +
+                        "|Attempt=" + _descendAttempts +
+                        "|NativeUiOpen=" + nativeUiOpen +
+                        "|StableUiOpen=" + stableUiOpen +
+                        "|ElapsedMs=" +
+                        (int)issuedFor.TotalMilliseconds);
+                    return true;
+                }
+                else
+                {
+                    _descendIssued = false;
+                    _descendIssuedUtc = DateTime.MinValue;
+                    AllflameLog.Info(
+                        "CHART_DEVICE_DESCEND_RETRY" +
+                        "|Attempt=" + _descendAttempts +
+                        "|Reason=UiStillOpen" +
+                        "|NativeUiOpen=" + nativeUiOpen +
+                        "|StableUiOpen=" + stableUiOpen +
+                        "|ElapsedMs=" +
+                        (int)issuedFor.TotalMilliseconds);
+                }
+            }
+
+            if (_descendConfirmed)
+            {
+                bool chartUiReopened =
+                    NativeDeepwaterChartDeviceUi.IsOpened ||
+                    DeepwaterChartDeviceUi.IsStableWindowOpen;
+                if (chartUiReopened)
+                {
+                    _descendConfirmed = false;
+                    _portalConfirmedUtc = DateTime.MinValue;
+                    AllflameLog.Info(
+                        "CHART_DEVICE_DESCEND_RETRY" +
+                        "|Attempt=" + _descendAttempts +
+                        "|Reason=ChartDeviceReopenedAfterPortalInteraction");
+                }
+                else if (DateTime.UtcNow - _portalConfirmedUtc >=
+                         PortalEntryTimeout)
+                {
+                    AllflameLog.Info(
+                        "BATHYSPHERE_PORTAL_ENTRY_TIMEOUT" +
+                        "|Attempts=" + _descendAttempts +
+                        "|ElapsedMs=" +
+                        (int)(DateTime.UtcNow -
+                              _portalConfirmedUtc).TotalMilliseconds +
+                        "|Action=StopBot");
+                    AllflameStopController.Stop(
+                        "ChartPortalEntryTimeout",
+                        "DescendConfirmed=True|Attempts=" +
+                        _descendAttempts +
+                        "|ActiveTask=" + Name);
+                    return true;
+                }
+            }
+
+            if (_descendConfirmed &&
                 AllflameContext.BathysphereAvailable &&
                 AllflameContext.BathysphereObject != null)
             {
@@ -17766,7 +18007,7 @@ namespace AllflameBot
                 return true;
             }
 
-            if (_descendIssued &&
+            if (_descendConfirmed &&
                 DateTime.UtcNow < _portalWaitUntilUtc)
             {
                 AllflameLog.Throttled(
@@ -17781,11 +18022,21 @@ namespace AllflameBot
                 return true;
             }
 
-            if (_descendIssued)
+            if (_descendConfirmed)
             {
-                _descendIssued = false;
                 AllflameLog.Info(
-                    "BATHYSPHERE_PORTAL_RETRY_DESCEND|Reason=PortalTimeout");
+                    "BATHYSPHERE_PORTAL_APPEARANCE_TIMEOUT" +
+                    "|Attempts=" + _descendAttempts +
+                    "|ElapsedMs=" +
+                    (int)(DateTime.UtcNow -
+                          _portalConfirmedUtc).TotalMilliseconds +
+                    "|Action=StopBot");
+                AllflameStopController.Stop(
+                    "ChartPortalMissing",
+                    "DescendConfirmed=True|Attempts=" +
+                    _descendAttempts +
+                    "|ActiveTask=" + Name);
+                return true;
             }
 
             Element descendButton;
@@ -18026,6 +18277,11 @@ namespace AllflameBot
                     _customLoadAttempted = false;
                     _customChartLocalId = 0;
                     _descendAttempts = 0;
+                    _descendIssued = false;
+                    _descendConfirmed = false;
+                    _descendIssuedUtc = DateTime.MinValue;
+                    _portalConfirmedUtc = DateTime.MinValue;
+                    _portalWaitUntilUtc = DateTime.MinValue;
                     _descendDisabledSinceUtc =
                         DateTime.MinValue;
                     await LokiCoroutine.Sleep(250);
@@ -18059,8 +18315,7 @@ namespace AllflameBot
             if (clicked)
             {
                 _descendIssued = true;
-                _portalWaitUntilUtc =
-                    DateTime.UtcNow.AddSeconds(6);
+                _descendIssuedUtc = DateTime.UtcNow;
             }
             _nextActivateUtc = DateTime.UtcNow.AddSeconds(2);
             AllflameLog.Info(
