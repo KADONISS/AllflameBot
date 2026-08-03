@@ -145,7 +145,6 @@ namespace AllflameBot
             grid.Children.Add(Card("MODE", Stack(
                 Check("Automatically run Chart Areas", "AutoRunChartAreas"),
                 Check("Run Charts from inventory only", "RunInventoryChartsOnly"),
-                Check("Check Voyage Stash tab first", "CheckVoyageStashFirst"),
                 Check("Explore whole Chart Area", "ExploreWholeChart"),
                 Number("Explore target (%)", "ChartExplorePercent", 50, 100),
                 Number("Maximum minutes per Chart", "MaxMinutesPerChart", 1, 60),
@@ -212,7 +211,8 @@ namespace AllflameBot
             Grid.SetColumn(grid.Children[2], 2);
 
             grid.Children.Add(Card("VOYAGE STASH", Stack(
-                Check("Withdraw Charts before running", "CheckVoyageStashFirst"),
+                Check("Withdraw from Chart Storage first", "EnableChartStorageWithdrawal"),
+                Check("Fall back to personal Stash", "CheckVoyageStashFirst"),
                 Text("Chart stash tab name/number", "VoyageStashTab"),
                 Number("Charts per withdrawal", "ChartsPerWithdrawal", 1, 60),
                 Button("DEBUG: Read visible Chart Storage page", delegate
@@ -221,7 +221,7 @@ namespace AllflameBot
                 }),
                 _chartStorageDebugStatus,
                 Note("Start the bot on The Sovereign. Debug opens Chart Storage, reads the visible page and never withdraws an item."),
-                Note("The bot withdraws the configured Chart batch only when no Charts remain in inventory."))));
+                Note("When inventory is empty, Chart Storage is checked first and personal Stash is used only as the enabled fallback."))));
             Grid.SetColumn(grid.Children[3], 3);
             return grid;
         }

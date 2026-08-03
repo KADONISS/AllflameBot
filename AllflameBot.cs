@@ -81,6 +81,7 @@ namespace AllflameBot
             _taskManager.Add(new UseAllflameCapsuleTask());
             _taskManager.Add(new CollectLootTask());
             _taskManager.Add(new PrepareVoyageTask());
+            _taskManager.Add(new OpenChartStorageTask());
             _taskManager.Add(new OpenVoyageStashTask());
             _taskManager.Add(new IdentifyInventoryChartsTask());
             _taskManager.Add(new PlanVoyageTask());
@@ -3341,6 +3342,8 @@ namespace AllflameBot
         private static bool _returnOutwardInitialized;
 
         public static bool ChartStorageChecked { get; private set; }
+        public static bool ChartStorageProbeCompleted { get; private set; }
+        public static bool VoyageStashProbeCompleted { get; private set; }
         public static bool ChartRequested { get; private set; }
         public static bool CustomChartDeviceExpected { get; private set; }
         public static bool VoyagePlanChecked { get; private set; }
@@ -3421,6 +3424,8 @@ namespace AllflameBot
         {
             _lastPhase = AllflamePhase.NotInGame;
             ChartStorageChecked = false;
+            ChartStorageProbeCompleted = false;
+            VoyageStashProbeCompleted = false;
             ChartRequested = false;
             CustomChartDeviceExpected = false;
             VoyagePlanChecked = false;
@@ -3532,7 +3537,7 @@ namespace AllflameBot
                         "|Ready=" + VoyageReadyForPlanning +
                         "|Source=ChartAreaCompleted");
                 }
-                ChartStorageChecked = false;
+                ResetChartSupplyChecks();
                 ChartRequested = false;
                 CustomChartDeviceExpected = false;
                 LanternWasActive = false;
@@ -4009,6 +4014,23 @@ namespace AllflameBot
             ChartStorageChecked = true;
         }
 
+        public static void MarkChartStorageProbeCompleted()
+        {
+            ChartStorageProbeCompleted = true;
+        }
+
+        public static void MarkVoyageStashProbeCompleted()
+        {
+            VoyageStashProbeCompleted = true;
+        }
+
+        public static void ResetChartSupplyChecks()
+        {
+            ChartStorageChecked = false;
+            ChartStorageProbeCompleted = false;
+            VoyageStashProbeCompleted = false;
+        }
+
         public static void MarkVoyagePlanChecked(int availableCharts)
         {
             bool initialBaseline =
@@ -4024,7 +4046,7 @@ namespace AllflameBot
                 // The previous Chart batch was consumed before the Voyage
                 // chain began. Re-arm withdrawal now; otherwise the Chart
                 // Device task owns an empty-inventory wait forever.
-                ChartStorageChecked = false;
+                ResetChartSupplyChecks();
                 ChartRequested = false;
                 CustomChartDeviceExpected = false;
                 AllflameLog.Info(
@@ -11294,11 +11316,20 @@ namespace AllflameBot
             if (settings.RunInventoryChartsOnly ||
                 !settings.CheckVoyageStashFirst)
             {
+                if (!AllflameRunState.VoyageStashProbeCompleted)
+                {
+                    AllflameRunState.MarkVoyageStashProbeCompleted();
+                }
                 if (!AllflameRunState.ChartStorageChecked)
                 {
-                    AllflameRunState.MarkStorageChecked();
+                    if (AllflameContext.InventoryChartCount > 0)
+                    {
+                        AllflameRunState.MarkStorageChecked();
+                    }
                     AllflameLog.Info(
-                        "VOYAGE_STASH_SKIPPED|InventoryOnly=" +
+                        "VOYAGE_STASH_SOURCE_RESULT" +
+                        "|Result=Disabled" +
+                        "|InventoryOnly=" +
                         settings.RunInventoryChartsOnly +
                         "|SettingEnabled=" + settings.CheckVoyageStashFirst +
                         "|InventoryCharts=" +
@@ -11306,6 +11337,17 @@ namespace AllflameBot
                 }
                 if (AllflameContext.InventoryChartCount == 0)
                 {
+                    string supplyReason =
+                        !settings.EnableChartStorageWithdrawal &&
+                        !settings.CheckVoyageStashFirst
+                            ? "AllSourcesDisabled"
+                            : (settings.RunInventoryChartsOnly
+                                ? "InventoryOnlyEmpty"
+                                : "ChartStorageUnavailableAndStashDisabled");
+                    AllflameLog.Info(
+                        "CHART_SUPPLY_FAILED" +
+                        "|Reason=" + supplyReason +
+                        "|NextAction=ControlledStop");
                     AllflameStopController.Stop(
                         "NoChartsRemaining",
                         settings.RunInventoryChartsOnly
@@ -11324,6 +11366,15 @@ namespace AllflameBot
                 AllflameProgressWatchdog.Clear(Name);
                 return false;
             }
+            if (settings.EnableChartStorageWithdrawal &&
+                !AllflameRunState.ChartStorageProbeCompleted)
+            {
+                return false;
+            }
+            if (AllflameRunState.VoyageStashProbeCompleted)
+            {
+                return false;
+            }
 
             AllflameContext.Refresh(true);
             // A Voyage Stash withdrawal is a batch operation. Once a batch has
@@ -11331,6 +11382,7 @@ namespace AllflameBot
             // stash again. Do not top 19 back up to 20 after each run.
             if (AllflameContext.InventoryChartCount > 0)
             {
+                AllflameRunState.MarkVoyageStashProbeCompleted();
                 AllflameRunState.MarkStorageChecked();
                 AllflameLog.Info(
                     "VOYAGE_STASH_SKIPPED|Reason=BatchStillActive" +
@@ -11603,6 +11655,7 @@ namespace AllflameBot
 
             if (AllflameContext.InventoryChartCount > 0)
             {
+                AllflameRunState.MarkVoyageStashProbeCompleted();
                 AllflameRunState.MarkStorageChecked();
                 AllflameLog.Info(
                     "VOYAGE_STASH_DONE|Tab=" + tabName +
@@ -11611,6 +11664,16 @@ namespace AllflameBot
                     "|InventoryCharts=" +
                     AllflameContext.InventoryChartCount +
                     "|Target=" + TargetInventoryCharts);
+                AllflameLog.Info(
+                    "VOYAGE_STASH_SOURCE_RESULT" +
+                    "|Result=Success" +
+                    "|Withdrawn=" + withdrawnCharts +
+                    "|NextSource=None");
+                AllflameLog.Info(
+                    "CHART_SUPPLY_SUCCESS" +
+                    "|Source=VoyageStash" +
+                    "|InventoryCharts=" +
+                    AllflameContext.InventoryChartCount);
                 await Coroutines.CloseBlockingWindows();
                 ResetLocalState();
                 AllflameProgressWatchdog.Clear();
@@ -11620,7 +11683,17 @@ namespace AllflameBot
             AllflameLog.Info(
                 "VOYAGE_STASH_EMPTY|Tab=" + tabName +
                 "|InventoryCharts=0|Action=StopBot");
+            AllflameRunState.MarkVoyageStashProbeCompleted();
+            AllflameLog.Info(
+                "VOYAGE_STASH_SOURCE_RESULT" +
+                "|Result=Empty" +
+                "|Withdrawn=0" +
+                "|NextSource=None");
             await Coroutines.CloseBlockingWindows();
+            AllflameLog.Info(
+                "CHART_SUPPLY_FAILED" +
+                "|Reason=AllEnabledSourcesEmpty" +
+                "|NextAction=ControlledStop");
             AllflameStopController.Stop(
                 "NoChartsRemaining",
                 "VoyageStashTab=" + tabName +
@@ -12069,6 +12142,13 @@ namespace AllflameBot
                 "|InventoryCharts=" + inventoryCharts +
                 "|NextAction=" + action +
                 "|Recovery=" + (nextAction ?? String.Empty));
+            AllflameRunState.MarkVoyageStashProbeCompleted();
+            AllflameLog.Info(
+                "VOYAGE_STASH_SOURCE_RESULT" +
+                "|Result=Unavailable" +
+                "|Reason=" + reason +
+                "|Withdrawn=" + inventoryCharts +
+                "|NextSource=None");
             await Coroutines.CloseBlockingWindows();
             ResetLocalState();
             if (inventoryCharts > 0)
@@ -12077,6 +12157,10 @@ namespace AllflameBot
                 AllflameRunState.MarkStorageChecked();
                 return false;
             }
+            AllflameLog.Info(
+                "CHART_SUPPLY_FAILED" +
+                "|Reason=AllEnabledSourcesUnavailable" +
+                "|NextAction=ControlledStop");
             AllflameStopController.Stop(
                 "VoyageStashUnavailable",
                 "Reason=" + reason +
@@ -12223,17 +12307,32 @@ namespace AllflameBot
         private int _withdrawSubTab;
         private DateTime _scanAfterUtc;
         private DateTime _retryAfterUtc = DateTime.MinValue;
+        private int _openAttempts;
+        private int _resolveAttempts;
+        private int _tabFailures;
         private readonly int[] _lastUsedSubTab = { -1, -1, -1 };
         private readonly int[,] _pageCounts = new int[3, 5];
-        private readonly HashSet<int> _seenChartIds = new HashSet<int>();
+        private readonly HashSet<string> _seenChartKeys =
+            new HashSet<string>(StringComparer.Ordinal);
         private InventoryControlWrapper _storageControl;
         private Element _storageSlot;
 
         public OpenChartStorageTask()
             : base("OpenChartStorageTask", "Probes Chart pages forward and withdraws newest Charts in reverse.") { }
 
+        public override void Start()
+        {
+            ResetScan();
+        }
+
+        public override void Stop()
+        {
+            ResetScan();
+        }
+
         public override async Task<bool> Run()
         {
+            AllflameSettings settings = AllflameSettings.Instance;
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
                 AllflameContext.Phase == AllflamePhase.VoyagePlanning;
@@ -12243,12 +12342,12 @@ namespace AllflameBot
                 return false;
             }
 
-            if (AllflameSettings.Instance.RunInventoryChartsOnly)
+            if (settings.RunInventoryChartsOnly)
             {
                 ResetScan();
-                if (!AllflameRunState.ChartStorageChecked)
+                if (!AllflameRunState.ChartStorageProbeCompleted)
                 {
-                    AllflameRunState.MarkStorageChecked();
+                    AllflameRunState.MarkChartStorageProbeCompleted();
                     AllflameLog.Info(
                         "CHART_STORAGE_SKIPPED|Mode=InventoryChartsOnly" +
                         "|InventoryCharts=" +
@@ -12257,20 +12356,39 @@ namespace AllflameBot
                 return false;
             }
 
-            if (!AllflameSettings.Instance.CheckChartStorageFirst)
+            if (!settings.EnableChartStorageWithdrawal)
             {
                 ResetScan();
-                if (!AllflameRunState.ChartStorageChecked)
+                if (!AllflameRunState.ChartStorageProbeCompleted)
                 {
-                    AllflameRunState.MarkStorageChecked();
+                    AllflameRunState.MarkChartStorageProbeCompleted();
                     AllflameLog.Info(
-                        "CHART_STORAGE_SKIPPED|Setting=CheckChartStorageFirst:false");
+                        "CHART_STORAGE_SOURCE_RESULT" +
+                        "|Result=Disabled" +
+                        "|Withdrawn=0" +
+                        "|NextSource=" +
+                        (settings.CheckVoyageStashFirst
+                            ? "VoyageStash"
+                            : "None"));
                 }
                 return false;
             }
 
             if (AllflameRunState.ChartStorageChecked)
             {
+                return false;
+            }
+            if (AllflameRunState.ChartStorageProbeCompleted)
+            {
+                return false;
+            }
+
+            AllflameContext.Refresh(true);
+            if (AllflameContext.InventoryChartCount > 0)
+            {
+                AllflameRunState.MarkChartStorageProbeCompleted();
+                AllflameRunState.MarkStorageChecked();
+                ResetScan();
                 return false;
             }
 
@@ -12288,12 +12406,22 @@ namespace AllflameBot
                 }
 
                 NetworkObject storage = AllflameContext.ChartStorageObject;
-                if (storage == null)
+                if (storage == null || !storage.IsValid)
                 {
-                    AllflameLog.Throttled(
-                        "chart_storage_missing",
-                        TimeSpan.FromSeconds(5),
-                        "CHART_STORAGE_WAIT|ObjectAvailable=False");
+                    _openAttempts++;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_RETRY" +
+                        "|Attempt=" + _openAttempts +
+                        "|Maximum=3" +
+                        "|Reason=ObjectMissing" +
+                        "|NextAction=ReacquireStorage");
+                    if (_openAttempts >= 3)
+                    {
+                        return await CompleteSourceFailure(
+                            "StorageObjectMissing");
+                    }
+                    AllflameContext.Refresh(true);
+                    _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
                     return true;
                 }
 
@@ -12304,11 +12432,25 @@ namespace AllflameBot
                 }
 
                 bool interacted = await Coroutines.InteractWith(storage);
-                AllflameLog.Info("CHART_STORAGE_OPEN|Success=" + interacted);
+                _openAttempts++;
+                AllflameLog.Info(
+                    "CHART_STORAGE_OPEN|Success=" + interacted +
+                    "|Attempt=" + _openAttempts +
+                    "|Maximum=3");
                 if (interacted)
                 {
+                    _openAttempts = 0;
                     _stage = 1;
                     _scanAfterUtc = DateTime.UtcNow.AddMilliseconds(1200);
+                }
+                else if (_openAttempts >= 3)
+                {
+                    return await CompleteSourceFailure(
+                        "StorageInteractionRejected");
+                }
+                else
+                {
+                    _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(600);
                 }
                 return true;
             }
@@ -12322,23 +12464,32 @@ namespace AllflameBot
 
                 if (!TryResolveStorageUi())
                 {
-                    AllflameLog.Throttled(
-                        "chart_storage_ui_wait",
-                        TimeSpan.FromSeconds(2),
-                        "CHART_STORAGE_WAIT|UiOpened=False|Detector=CustomInventoryTree");
+                    _resolveAttempts++;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_RETRY" +
+                        "|Attempt=" + _resolveAttempts +
+                        "|Maximum=3" +
+                        "|Reason=InventoryControlNotResolved" +
+                        "|NextAction=ReopenStorage");
+                    if (_resolveAttempts >= 3)
+                    {
+                        return await CompleteSourceFailure(
+                            "InventoryControlNotResolved");
+                    }
                     _stage = 0;
-                    _retryAfterUtc = DateTime.UtcNow.AddSeconds(4);
+                    _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
                     return true;
                 }
 
+                _resolveAttempts = 0;
                 BeginScan();
                 return true;
             }
 
             if (!TryResolveStorageUi())
             {
-                _stage = 0;
-                return true;
+                return await CompleteSourceFailure(
+                    "InventoryControlLostDuringScan");
             }
 
             if (_stage == 2)
@@ -12362,7 +12513,7 @@ namespace AllflameBot
             _subTab = 0;
             _withdrawMainTab = -1;
             _withdrawSubTab = -1;
-            _seenChartIds.Clear();
+            _seenChartKeys.Clear();
             for (int main = 0; main < 3; main++)
             {
                 _lastUsedSubTab[main] = -1;
@@ -12373,6 +12524,14 @@ namespace AllflameBot
             }
             _stage = 2;
             AllflameLog.Info(
+                "CHART_SUPPLY_START" +
+                "|ChartStorageEnabled=" +
+                AllflameSettings.Instance.EnableChartStorageWithdrawal +
+                "|VoyageStashEnabled=" +
+                AllflameSettings.Instance.CheckVoyageStashFirst +
+                "|InventoryCharts=" +
+                AllflameContext.InventoryChartCount);
+            AllflameLog.Info(
                 "CHART_STORAGE_PROBE_BEGIN|Direction=1_TO_5|FullPage=" +
                 FullPageChartCount + "|TargetInventory=" + TargetInventoryCharts +
                 "|InventoryCharts=" + AllflameContext.InventoryChartCount);
@@ -12380,7 +12539,17 @@ namespace AllflameBot
 
         private async Task ProbeCurrentPage()
         {
-            await SelectStorageTab(_mainTab, _subTab);
+            if (!await SelectStorageTab(_mainTab, _subTab))
+            {
+                _tabFailures++;
+                if (_tabFailures >= 3)
+                {
+                    await CompleteSourceFailure(
+                        "StorageTabSelectionFailed");
+                }
+                return;
+            }
+            _tabFailures = 0;
             List<Item> charts = ReadCurrentStorageCharts();
             RememberPage(_mainTab, _subTab, charts);
 
@@ -12437,7 +12606,19 @@ namespace AllflameBot
                 return;
             }
 
-            await SelectStorageTab(_withdrawMainTab, _withdrawSubTab);
+            if (!await SelectStorageTab(
+                    _withdrawMainTab,
+                    _withdrawSubTab))
+            {
+                _tabFailures++;
+                if (_tabFailures >= 3)
+                {
+                    await CompleteSourceFailure(
+                        "StorageWithdrawTabSelectionFailed");
+                }
+                return;
+            }
+            _tabFailures = 0;
             List<Item> charts = ReadCurrentStorageCharts();
             RememberPage(_withdrawMainTab, _withdrawSubTab, charts);
 
@@ -12445,16 +12626,48 @@ namespace AllflameBot
             int needed = Math.Max(0, TargetInventoryCharts - AllflameContext.InventoryChartCount);
             foreach (Item chart in charts.Take(needed).ToList())
             {
-                var result = _storageControl.FastMove(chart.LocalId);
-                AllflameLog.Info(
-                    "CHART_WITHDRAW|Main=" + (_withdrawMainTab + 1) +
-                    "|Sub=" + (_withdrawSubTab + 1) +
-                    "|Id=" + chart.Id +
-                    "|LocalId=" + chart.LocalId +
-                    "|Name=" + chart.FullName +
-                    "|Result=" + result);
-                await LokiCoroutine.Sleep(90);
-                AllflameContext.Refresh(true);
+                int beforeInventory = AllflameContext.InventoryChartCount;
+                bool transferred = false;
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    string result;
+                    try
+                    {
+                        result = _storageControl.FastMove(chart.LocalId)
+                            .ToString();
+                    }
+                    catch (Exception ex)
+                    {
+                        result = "Exception:" + ex.GetType().Name;
+                    }
+                    await LokiCoroutine.Sleep(220);
+                    AllflameContext.Refresh(true);
+                    transferred =
+                        AllflameContext.InventoryChartCount > beforeInventory ||
+                        !ReadCurrentStorageCharts().Any(item =>
+                            item.LocalId == chart.LocalId);
+                    AllflameLog.Info(
+                        "CHART_WITHDRAW" +
+                        "|Main=" + (_withdrawMainTab + 1) +
+                        "|Sub=" + (_withdrawSubTab + 1) +
+                        "|Id=" + chart.Id +
+                        "|LocalId=" + chart.LocalId +
+                        "|Name=" + chart.FullName +
+                        "|Attempt=" + attempt +
+                        "|Maximum=3" +
+                        "|Result=" + result +
+                        "|Confirmed=" + transferred);
+                    if (transferred)
+                    {
+                        break;
+                    }
+                }
+                if (!transferred)
+                {
+                    await CompleteSourceFailure(
+                        "ChartTransferRejectedThreeTimes");
+                    return;
+                }
                 if (AllflameContext.InventoryChartCount >= TargetInventoryCharts)
                 {
                     await FinishScan();
@@ -12471,7 +12684,11 @@ namespace AllflameBot
             _pageCounts[mainTab, subTab] = page.Count;
             foreach (Item chart in page)
             {
-                _seenChartIds.Add(chart.Id);
+                _seenChartKeys.Add(
+                    mainTab + ":" + subTab + ":" +
+                    chart.LocationTopLeft + ":" +
+                    (chart.Metadata ?? chart.FullName ?? chart.Name ??
+                     String.Empty));
             }
         }
 
@@ -12487,34 +12704,85 @@ namespace AllflameBot
                 : items.Where(AllflameContext.IsChartItem).ToList();
         }
 
-        private async Task SelectStorageTab(int mainTab, int subTab)
+        private async Task<bool> SelectStorageTab(int mainTab, int subTab)
         {
             if (!ChartStorageUi.TryClickMainTab(mainTab))
             {
                 AllflameLog.Info(
                     "CHART_STORAGE_TAB_FAILED|Reason=MainTabMissing|Main=" +
                     (mainTab + 1));
-                return;
+                return false;
             }
-            await LokiCoroutine.Sleep(180);
+            await LokiCoroutine.Sleep(250);
 
             if (!ChartStorageUi.TryClickSubTab(mainTab, subTab))
             {
                 AllflameLog.Info(
                     "CHART_STORAGE_TAB_FAILED|Reason=SubTabMissing|Main=" +
                     (mainTab + 1) + "|Sub=" + (subTab + 1));
-                return;
+                return false;
             }
-            await LokiCoroutine.Sleep(260);
+            await LokiCoroutine.Sleep(350);
 
-            _storageControl = null;
-            _storageSlot = null;
-            TryResolveStorageUi();
+            string previousSignature = null;
+            int stableReads = 0;
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            while (DateTime.UtcNow < deadline && stableReads < 2)
+            {
+                _storageControl = null;
+                _storageSlot = null;
+                if (!TryResolveStorageUi())
+                {
+                    stableReads = 0;
+                    await LokiCoroutine.Sleep(150);
+                    continue;
+                }
+                string signature = CurrentStoragePageSignature();
+                if (String.Equals(
+                        signature,
+                        previousSignature,
+                        StringComparison.Ordinal))
+                {
+                    stableReads++;
+                }
+                else
+                {
+                    previousSignature = signature;
+                    stableReads = 1;
+                }
+                if (stableReads < 2)
+                {
+                    await LokiCoroutine.Sleep(150);
+                }
+            }
+            bool confirmed = _storageControl != null && stableReads >= 2;
             AllflameLog.Info(
                 "CHART_STORAGE_TAB|Main=" + (mainTab + 1) +
                 "|Sub=" + (subTab + 1) +
                 "|Mode=DirectUiElements|Control=" +
-                (_storageControl == null ? "Missing" : "Resolved"));
+                (_storageControl == null ? "Missing" : "Resolved") +
+                "|StableReads=" + stableReads +
+                "|Confirmed=" + confirmed);
+            return confirmed;
+        }
+
+        private string CurrentStoragePageSignature()
+        {
+            List<Item> items =
+                _storageControl == null ||
+                _storageControl.Inventory == null ||
+                _storageControl.Inventory.Items == null
+                    ? new List<Item>()
+                    : _storageControl.Inventory.Items
+                        .Where(item => item != null && item.IsValid)
+                        .ToList();
+            return String.Join(
+                ";",
+                items.OrderBy(item => item.LocationTopLeft.Y)
+                    .ThenBy(item => item.LocationTopLeft.X)
+                    .Select(item =>
+                        item.LocalId + "@" + item.LocationTopLeft)
+                    .ToArray());
         }
 
         private bool TryResolveStorageUi()
@@ -12556,29 +12824,89 @@ namespace AllflameBot
         {
             AllflameContext.Refresh(true);
             AllflameSettings settings = AllflameSettings.Instance;
-            settings.LastChartStorageTotal = _seenChartIds.Count;
+            settings.LastChartStorageTotal = _seenChartKeys.Count;
             settings.LastChartStorageScan = BuildStorageSnapshot();
             settings.Save();
 
             AllflameLog.Info(
-                "CHART_STORAGE_SCAN_DONE|StoredUnique=" + _seenChartIds.Count +
+                "CHART_STORAGE_SCAN_DONE|StoredUnique=" + _seenChartKeys.Count +
                 "|InventoryCharts=" + AllflameContext.InventoryChartCount +
                 "|Target=" + TargetInventoryCharts +
                 "|Mode=ProbeForwardWithdrawReverse" +
                 "|Tabs=" + settings.LastChartStorageScan);
 
             await Coroutines.CloseBlockingWindows();
+            AllflameRunState.MarkChartStorageProbeCompleted();
             if (AllflameContext.InventoryChartCount > 0)
             {
                 AllflameRunState.MarkStorageChecked();
-                _stage = 3;
+                AllflameLog.Info(
+                    "CHART_STORAGE_SOURCE_RESULT" +
+                    "|Result=Success" +
+                    "|Withdrawn=" +
+                    AllflameContext.InventoryChartCount +
+                    "|NextSource=None");
+                AllflameLog.Info(
+                    "CHART_SUPPLY_SUCCESS" +
+                    "|Source=ChartStorage" +
+                    "|InventoryCharts=" +
+                    AllflameContext.InventoryChartCount);
             }
             else
             {
-                AllflameLog.Info("CHART_STORAGE_EMPTY|RetryAfterSeconds=10");
-                ResetScan();
-                _retryAfterUtc = DateTime.UtcNow.AddSeconds(10);
+                AllflameLog.Info(
+                    "CHART_STORAGE_SOURCE_RESULT" +
+                    "|Result=Empty" +
+                    "|Withdrawn=0" +
+                    "|NextSource=" +
+                    (AllflameSettings.Instance.CheckVoyageStashFirst
+                        ? "VoyageStash"
+                        : "None"));
+                if (AllflameSettings.Instance.CheckVoyageStashFirst)
+                {
+                    AllflameLog.Info(
+                        "CHART_SUPPLY_FALLBACK" +
+                        "|From=ChartStorage" +
+                        "|To=VoyageStash" +
+                        "|Reason=Empty");
+                }
             }
+            ResetScan();
+        }
+
+        private async Task<bool> CompleteSourceFailure(string reason)
+        {
+            AllflameContext.Refresh(true);
+            bool hasInventoryCharts =
+                AllflameContext.InventoryChartCount > 0;
+            AllflameRunState.MarkChartStorageProbeCompleted();
+            if (hasInventoryCharts)
+            {
+                AllflameRunState.MarkStorageChecked();
+            }
+            AllflameLog.Info(
+                "CHART_STORAGE_SOURCE_RESULT" +
+                "|Result=Unavailable" +
+                "|Reason=" + reason +
+                "|Withdrawn=" + AllflameContext.InventoryChartCount +
+                "|NextSource=" +
+                (hasInventoryCharts
+                    ? "None"
+                    : (AllflameSettings.Instance.CheckVoyageStashFirst
+                        ? "VoyageStash"
+                        : "None")));
+            if (!hasInventoryCharts &&
+                AllflameSettings.Instance.CheckVoyageStashFirst)
+            {
+                AllflameLog.Info(
+                    "CHART_SUPPLY_FALLBACK" +
+                    "|From=ChartStorage" +
+                    "|To=VoyageStash" +
+                    "|Reason=" + reason);
+            }
+            await Coroutines.CloseBlockingWindows();
+            ResetScan();
+            return false;
         }
 
         private void ResetScan()
@@ -12588,9 +12916,14 @@ namespace AllflameBot
             _subTab = 0;
             _withdrawMainTab = -1;
             _withdrawSubTab = -1;
-            _seenChartIds.Clear();
+            _seenChartKeys.Clear();
             _storageControl = null;
             _storageSlot = null;
+            _scanAfterUtc = DateTime.MinValue;
+            _retryAfterUtc = DateTime.MinValue;
+            _openAttempts = 0;
+            _resolveAttempts = 0;
+            _tabFailures = 0;
         }
     }
 

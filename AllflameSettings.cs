@@ -47,6 +47,7 @@ namespace AllflameBot
         public bool AutoRunChartAreas { get; set; }
         public bool RunInventoryChartsOnly { get; set; }
         public bool CheckChartStorageFirst { get; set; }
+        public bool EnableChartStorageWithdrawal { get; set; }
         public bool CheckVoyageStashFirst { get; set; }
         public string VoyageStashTab { get; set; }
         public int ChartsPerWithdrawal { get; set; }
@@ -219,7 +220,7 @@ namespace AllflameBot
             {
                 ApplyRecommendedDefaults();
             }
-            else if (SettingsSchemaVersion < 37)
+            else if (SettingsSchemaVersion < 39)
             {
                 int oldSchema = SettingsSchemaVersion;
                 if (oldSchema < 3)
@@ -401,7 +402,11 @@ namespace AllflameBot
                     SecretBottleRevealTimeoutSeconds = 8;
                     SecretBottleCursorPlacementRetries = 3;
                 }
-                SettingsSchemaVersion = 38;
+                if (oldSchema < 39)
+                {
+                    EnableChartStorageWithdrawal = false;
+                }
+                SettingsSchemaVersion = 39;
                 Save();
             }
         }
@@ -678,6 +683,7 @@ namespace AllflameBot
 
             ChartDeviceUnlocked = false;
             CheckChartStorageFirst = true;
+            EnableChartStorageWithdrawal = false;
             CheckVoyageStashFirst = true;
             VoyageStashTab = "Charts";
             RunInventoryChartsOnly = false;
@@ -727,6 +733,7 @@ namespace AllflameBot
             AutoRunChartAreas = true;
             RunInventoryChartsOnly = false;
             CheckChartStorageFirst = true;
+            EnableChartStorageWithdrawal = false;
             CheckVoyageStashFirst = true;
             VoyageStashTab = "Charts";
             ChartsPerWithdrawal = 20;
@@ -785,7 +792,7 @@ namespace AllflameBot
             NotifyMapStarted = true;
             NotifyMapCompleted = true;
             NotifySulphurCollected = true;
-            SettingsSchemaVersion = 38;
+            SettingsSchemaVersion = 39;
         }
 
         private void ApplySecretBottleDefaults()
