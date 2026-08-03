@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.132";
+        public const string Current = "0.23.133";
     }
 
     public sealed class AllflameBot : IBot
@@ -345,8 +345,9 @@ namespace AllflameBot
             if (message != null &&
                 String.Equals(message.Id, "allflame_bot.snapshot", StringComparison.OrdinalIgnoreCase))
             {
-                AllflameContext.Refresh(true);
-                AllflameLog.Info("MANUAL_SNAPSHOT|" + AllflameContext.Describe());
+                AllflameContext.RequestManualSnapshot();
+                AllflameLog.Info(
+                    "MANUAL_SNAPSHOT_QUEUED|Action=ProcessOnMainTaskCycle");
                 return MessageResult.Processed;
             }
 
@@ -359,9 +360,22 @@ namespace AllflameBot
             {
                 try
                 {
+                    Stopwatch cycleTimer = Stopwatch.StartNew();
                     await _taskManager.Run(
                         TaskGroup.Enabled,
                         RunBehavior.UntilHandled);
+                    cycleTimer.Stop();
+                    if (cycleTimer.ElapsedMilliseconds >= 250)
+                    {
+                        AllflameLog.Throttled(
+                            "task_cycle_slow",
+                            TimeSpan.FromSeconds(1),
+                            "TASK_CYCLE_SLOW" +
+                            "|ElapsedMs=" +
+                            cycleTimer.ElapsedMilliseconds +
+                            "|" +
+                            AllflameProgressWatchdog.Describe());
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -390,6 +404,12 @@ namespace AllflameBot
     {
         private static readonly object Sync = new object();
         private static DateTime _nextRefreshUtc = DateTime.MinValue;
+        private static DateTime _nextObjectRefreshUtc = DateTime.MinValue;
+        private static DateTime _nextInventoryRefreshUtc = DateTime.MinValue;
+        private static DateTime _nextUiRefreshUtc = DateTime.MinValue;
+        private static HashSet<string> _cachedVisibleUiText =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static bool _manualSnapshotRequested;
         private static string _lastStateSignature = String.Empty;
         private static string _lastPlayerPosition = String.Empty;
         private static DateTime _positionChangedUtc = DateTime.UtcNow;
@@ -474,6 +494,11 @@ namespace AllflameBot
             lock (Sync)
             {
                 _nextRefreshUtc = DateTime.MinValue;
+                _nextObjectRefreshUtc = DateTime.MinValue;
+                _nextInventoryRefreshUtc = DateTime.MinValue;
+                _nextUiRefreshUtc = DateTime.MinValue;
+                _cachedVisibleUiText.Clear();
+                _manualSnapshotRequested = false;
                 _lastStateSignature = String.Empty;
                 _lastPlayerPosition = String.Empty;
                 _positionChangedUtc = DateTime.UtcNow;
@@ -502,12 +527,19 @@ namespace AllflameBot
             lock (Sync)
             {
                 DateTime now = DateTime.UtcNow;
+                bool manualSnapshot = _manualSnapshotRequested;
+                if (manualSnapshot)
+                {
+                    _manualSnapshotRequested = false;
+                    force = true;
+                }
                 if (!force && now < _nextRefreshUtc)
                 {
                     return;
                 }
 
-                _nextRefreshUtc = now.AddMilliseconds(400);
+                _nextRefreshUtc = now.AddMilliseconds(125);
+                Stopwatch refreshTimer = Stopwatch.StartNew();
 
                 try
                 {
@@ -535,10 +567,40 @@ namespace AllflameBot
                         ? String.Empty
                         : LokiPoe.Me.Position.ToString();
 
-                    SnapshotObjects();
-                    SnapshotInventory();
+                    bool objectScan =
+                        force || now >= _nextObjectRefreshUtc;
+                    bool inventoryScan =
+                        force || now >= _nextInventoryRefreshUtc;
+                    bool uiScan =
+                        force || now >= _nextUiRefreshUtc;
+                    if (objectScan)
+                    {
+                        SnapshotObjects();
+                        _nextObjectRefreshUtc = now.AddMilliseconds(
+                            Phase == AllflamePhase.ChartArea ||
+                            Phase == AllflamePhase.Voyage
+                                ? 225
+                                : 325);
+                    }
+                    else
+                    {
+                        LanternAuraActive = HasLanternAura();
+                    }
+                    if (inventoryScan)
+                    {
+                        SnapshotInventory();
+                        _nextInventoryRefreshUtc =
+                            now.AddMilliseconds(250);
+                    }
                     TrackPosition(now);
-                    HashSet<string> visibleUiText = CaptureVisibleUiText();
+                    if (uiScan)
+                    {
+                        _cachedVisibleUiText = CaptureVisibleUiText();
+                        _nextUiRefreshUtc = now.AddMilliseconds(
+                            UiRefreshIntervalMilliseconds());
+                    }
+                    HashSet<string> visibleUiText =
+                        _cachedVisibleUiText;
                     // "Plan Voyage" is also an NPC dialogue choice. Only the
                     // window title contains "Plan your Voyage"; using the
                     // shorter text incorrectly classified Valerie's dialogue
@@ -652,6 +714,25 @@ namespace AllflameBot
                             ExtractionObject.Position);
                     }
                     PublishStateIfChanged();
+                    refreshTimer.Stop();
+                    if (refreshTimer.ElapsedMilliseconds >= 25)
+                    {
+                        AllflameLog.Throttled(
+                            "context_refresh_slow",
+                            TimeSpan.FromSeconds(5),
+                            "CONTEXT_REFRESH_TIMING" +
+                            "|ElapsedMs=" +
+                            refreshTimer.ElapsedMilliseconds +
+                            "|ObjectScan=" + objectScan +
+                            "|InventoryScan=" + inventoryScan +
+                            "|UiScan=" + uiScan +
+                            "|Phase=" + Phase);
+                    }
+                    if (manualSnapshot)
+                    {
+                        AllflameLog.Info(
+                            "MANUAL_SNAPSHOT|" + Describe());
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -695,6 +776,31 @@ namespace AllflameBot
                 "|InventoryCharts=" + InventoryChartCount +
                 "|LanternCounter=" + LanternCounterCurrent + "/" + LanternCounterMaximum +
                 "|StorageSnapshot=" + Safe(AllflameSettings.Instance.LastChartStorageScan);
+        }
+
+        public static void RequestManualSnapshot()
+        {
+            lock (Sync)
+            {
+                _manualSnapshotRequested = true;
+                _nextRefreshUtc = DateTime.MinValue;
+            }
+        }
+
+        private static int UiRefreshIntervalMilliseconds()
+        {
+            if (PlanVoyageVisible || CapsuleUiVisible ||
+                AllflameRunState.ChartRequested ||
+                AllflameRunState.VoyageStarted)
+            {
+                return 175;
+            }
+            if (Phase == AllflamePhase.SovereignHub ||
+                Phase == AllflamePhase.VoyagePlanning)
+            {
+                return 450;
+            }
+            return 900;
         }
 
         private static void SnapshotLanternCounter(IEnumerable<string> visibleUiText)
@@ -5967,6 +6073,8 @@ namespace AllflameBot
         private DateTime _apiFirstAttemptUtc = DateTime.MinValue;
         private DateTime _apiAttemptIssuedUtc = DateTime.MinValue;
         private uint _apiAttemptAreaHash;
+        private bool _visualAwaitingConfirmation;
+        private DateTime _visualClickIssuedUtc = DateTime.MinValue;
         private const int MaximumVisualClickAttempts = 6;
         private const int MaximumApiAttempts = 3;
 
@@ -6108,6 +6216,34 @@ namespace AllflameBot
             if (DateTime.UtcNow < _nextAttemptUtc)
             {
                 return true;
+            }
+
+            if (_visualAwaitingConfirmation)
+            {
+                int elapsed = Math.Max(
+                    0,
+                    (int)(DateTime.UtcNow - _visualClickIssuedUtc)
+                        .TotalMilliseconds);
+                if (elapsed < 3000)
+                {
+                    _nextAttemptUtc =
+                        DateTime.UtcNow.AddMilliseconds(150);
+                    AllflameLog.Throttled(
+                        "respawn_visual_confirmation_wait",
+                        TimeSpan.FromMilliseconds(500),
+                        "RESPAWN_VISUAL_WAIT" +
+                        "|ElapsedMilliseconds=" + elapsed +
+                        "|VisualClicks=" + _visualClickAttempts +
+                        "|OneActionPerCycle=True");
+                    return true;
+                }
+
+                _visualAwaitingConfirmation = false;
+                _visualClickIssuedUtc = DateTime.MinValue;
+                AllflameLog.Info(
+                    "RESPAWN_VISUAL_WAIT_TIMEOUT" +
+                    "|VisualClicks=" + _visualClickAttempts +
+                    "|Action=RetryVisualDetection");
             }
 
             TimeSpan deadFor =
@@ -6266,23 +6402,9 @@ namespace AllflameBot
                 return true;
             }
 
-            for (int wait = 0; wait < 15; wait++)
-            {
-                await LokiCoroutine.Sleep(200);
-                if (!LokiPoe.IsInGame ||
-                    LokiPoe.Me == null ||
-                    !LokiPoe.Me.IsDead)
-                {
-                    return true;
-                }
-            }
-
-            _nextAttemptUtc =
-                DateTime.UtcNow.AddMilliseconds(700);
-            AllflameLog.Info(
-                "RESPAWN_VISUAL_WAIT_TIMEOUT" +
-                "|VisualClicks=" + _visualClickAttempts +
-                "|Action=RetryVisualDetection");
+            _visualAwaitingConfirmation = true;
+            _visualClickIssuedUtc = DateTime.UtcNow;
+            _nextAttemptUtc = DateTime.UtcNow.AddMilliseconds(150);
             return true;
         }
 
@@ -6455,6 +6577,8 @@ namespace AllflameBot
             _apiFirstAttemptUtc = DateTime.MinValue;
             _apiAttemptIssuedUtc = DateTime.MinValue;
             _apiAttemptAreaHash = 0;
+            _visualAwaitingConfirmation = false;
+            _visualClickIssuedUtc = DateTime.MinValue;
         }
 
         private void ResetTaskState()
@@ -6799,6 +6923,14 @@ namespace AllflameBot
         private DateTime _nextAttemptUtc = DateTime.MinValue;
         private readonly HashSet<int> _collectedWorldIds =
             new HashSet<int>();
+        private bool _pickupPending;
+        private int _pendingWorldId;
+        private string _pendingItemName = String.Empty;
+        private int _pendingInventoryBefore;
+        private int _pendingQuantity;
+        private float _pendingDistance;
+        private uint _pendingAreaHash;
+        private DateTime _pickupIssuedUtc = DateTime.MinValue;
 
         public CollectSulphurRewardTask()
             : base(
@@ -6811,7 +6943,65 @@ namespace AllflameBot
                 AllflameContext.Phase != AllflamePhase.VoyagePlanning)
             {
                 _collectedWorldIds.Clear();
+                ClearPendingPickup();
                 return false;
+            }
+
+            if (_pickupPending)
+            {
+                int inventoryAfter =
+                    AllflameContext.GetInventoryQuantity(
+                        _pendingItemName);
+                bool inventoryIncreased =
+                    _pendingInventoryBefore >= 0 &&
+                    inventoryAfter > _pendingInventoryBefore;
+                bool worldItemGone =
+                    IsWorldItemGone(_pendingWorldId);
+                bool confirmed =
+                    inventoryIncreased || worldItemGone;
+                if (confirmed)
+                {
+                    int quantity = inventoryIncreased
+                        ? Math.Max(
+                            1,
+                            inventoryAfter -
+                            _pendingInventoryBefore)
+                        : Math.Max(1, _pendingQuantity);
+                    AllflameLog.Info(
+                        "SULPHUR_REWARD|Action=PickupConfirmed" +
+                        "|WorldId=" + _pendingWorldId +
+                        "|Name=" + _pendingItemName +
+                        "|Quantity=" + quantity +
+                        "|Distance=" +
+                        _pendingDistance.ToString("0.0") +
+                        "|InventoryBefore=" +
+                        _pendingInventoryBefore +
+                        "|InventoryAfter=" + inventoryAfter +
+                        "|WorldItemGone=" + worldItemGone +
+                        "|OneActionPerCycle=True");
+                    _collectedWorldIds.Add(_pendingWorldId);
+                    AllflameRunState.MarkSulphurCollected();
+                    AllflameSession.RecordSulphurCollected(quantity);
+                    ClearPendingPickup();
+                    return true;
+                }
+
+                if (AllflameContext.AreaHash == _pendingAreaHash &&
+                    DateTime.UtcNow - _pickupIssuedUtc <
+                        TimeSpan.FromSeconds(2))
+                {
+                    return true;
+                }
+
+                AllflameLog.Info(
+                    "SULPHUR_REWARD|Action=PickupUnconfirmed" +
+                    "|WorldId=" + _pendingWorldId +
+                    "|Name=" + _pendingItemName +
+                    "|InventoryBefore=" +
+                    _pendingInventoryBefore +
+                    "|InventoryAfter=" + inventoryAfter +
+                    "|ActionNext=RetryFreshWorldItem");
+                ClearPendingPickup();
             }
 
             WorldItem sulphur = null;
@@ -6897,45 +7087,41 @@ namespace AllflameBot
                 AllflameContext.GetInventoryQuantity(itemName);
             float pickupDistance = sulphur.Distance;
             bool picked = await Coroutines.InteractWith(sulphur);
-            bool confirmed = false;
-            int inventoryAfter = inventoryBefore;
-            DateTime confirmationDeadline = DateTime.UtcNow.AddSeconds(2);
-            while (DateTime.UtcNow < confirmationDeadline)
-            {
-                if (!LokiPoe.IsInGame || LokiPoe.Me == null ||
-                    LokiPoe.Me.IsDead ||
-                    AllflameContext.AreaHash != pickupAreaHash)
-                {
-                    break;
-                }
-                inventoryAfter =
-                    AllflameContext.GetInventoryQuantity(itemName);
-                if (inventoryBefore >= 0 && inventoryAfter > inventoryBefore)
-                {
-                    confirmed = true;
-                    sulphurQuantity = inventoryAfter - inventoryBefore;
-                    break;
-                }
-                await LokiCoroutine.Sleep(100);
-            }
             AllflameLog.Info(
-                "SULPHUR_REWARD|Action=Pickup" +
+                "SULPHUR_REWARD|Action=PickupIssued" +
                 "|WorldId=" + worldId +
                 "|Name=" + itemName +
                 "|Quantity=" + sulphurQuantity +
                 "|Distance=" +
                 pickupDistance.ToString("0.0") +
                 "|InteractSuccess=" + picked +
-                "|Confirmed=" + confirmed +
                 "|InventoryBefore=" + inventoryBefore +
-                "|InventoryAfter=" + inventoryAfter);
-            if (confirmed)
+                "|ActionNext=ConfirmOnLaterCycle" +
+                "|OneActionPerCycle=True");
+            if (picked)
             {
-                _collectedWorldIds.Add(worldId);
-                AllflameRunState.MarkSulphurCollected();
-                AllflameSession.RecordSulphurCollected(sulphurQuantity);
+                _pickupPending = true;
+                _pendingWorldId = worldId;
+                _pendingItemName = itemName;
+                _pendingInventoryBefore = inventoryBefore;
+                _pendingQuantity = sulphurQuantity;
+                _pendingDistance = pickupDistance;
+                _pendingAreaHash = pickupAreaHash;
+                _pickupIssuedUtc = DateTime.UtcNow;
             }
             return true;
+        }
+
+        private void ClearPendingPickup()
+        {
+            _pickupPending = false;
+            _pendingWorldId = 0;
+            _pendingItemName = String.Empty;
+            _pendingInventoryBefore = 0;
+            _pendingQuantity = 0;
+            _pendingDistance = 0f;
+            _pendingAreaHash = 0;
+            _pickupIssuedUtc = DateTime.MinValue;
         }
 
         private static bool IsWorldItemGone(int worldId)
@@ -12943,6 +13129,11 @@ namespace AllflameBot
         private bool _lastApproachMoving;
         private readonly List<Vector2i> _triedAlternateCandidates =
             new List<Vector2i>();
+        private bool _stashWithdrawPending;
+        private int _stashWithdrawLocalId;
+        private int _stashWithdrawBeforeInventory;
+        private DateTime _stashWithdrawIssuedUtc = DateTime.MinValue;
+        private int _stashWithdrawnCharts;
 
         public OpenVoyageStashTask()
             : base(
@@ -13338,54 +13529,84 @@ namespace AllflameBot
                     .Where(AllflameContext.IsChartItem)
                     .ToList();
 
+            int liveInventoryCharts = CountInventoryChartsLive();
+            if (_stashWithdrawPending)
+            {
+                bool sourceGone = charts.All(chart =>
+                    chart.LocalId != _stashWithdrawLocalId);
+                bool confirmed =
+                    liveInventoryCharts >
+                    _stashWithdrawBeforeInventory ||
+                    sourceGone;
+                if (confirmed)
+                {
+                    _stashWithdrawnCharts++;
+                    _stashWithdrawPending = false;
+                    _stashWithdrawLocalId = 0;
+                    _stashWithdrawIssuedUtc = DateTime.MinValue;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "VoyageStashChartTransferred");
+                    AllflameLog.Info(
+                        "VOYAGE_STASH_WITHDRAW_CONFIRMED" +
+                        "|Tab=" + tabName +
+                        "|InventoryCharts=" + liveInventoryCharts +
+                        "|TotalWithdrawn=" +
+                        _stashWithdrawnCharts +
+                        "|OneActionPerCycle=True");
+                }
+                else if (DateTime.UtcNow - _stashWithdrawIssuedUtc <
+                         TimeSpan.FromSeconds(2))
+                {
+                    return true;
+                }
+                else
+                {
+                    AllflameLog.Info(
+                        "VOYAGE_STASH_WITHDRAW_REJECTED" +
+                        "|Tab=" + tabName +
+                        "|LocalId=" + _stashWithdrawLocalId +
+                        "|InventoryBefore=" +
+                        _stashWithdrawBeforeInventory +
+                        "|InventoryAfter=" + liveInventoryCharts +
+                        "|Action=RetryFreshSnapshot");
+                    _stashWithdrawPending = false;
+                    _stashWithdrawLocalId = 0;
+                    _stashWithdrawIssuedUtc = DateTime.MinValue;
+                }
+            }
+
             int needed = Math.Max(
                 0,
                 TargetInventoryCharts -
-                AllflameContext.InventoryChartCount);
-            int inventoryChartsBeforeWithdraw =
-                AllflameContext.InventoryChartCount;
-            int lastObservedInventoryCharts =
-                inventoryChartsBeforeWithdraw;
-            foreach (Item chart in charts.Take(needed).ToList())
+                liveInventoryCharts);
+            if (needed > 0 && charts.Count > 0)
             {
+                Item chart = charts[0];
                 var result = control.FastMove(chart.LocalId);
+                _stashWithdrawPending = true;
+                _stashWithdrawLocalId = chart.LocalId;
+                _stashWithdrawBeforeInventory = liveInventoryCharts;
+                _stashWithdrawIssuedUtc = DateTime.UtcNow;
                 AllflameLog.Info(
                     "VOYAGE_STASH_WITHDRAW|Tab=" + tabName +
                     "|Id=" + chart.Id +
                     "|LocalId=" + chart.LocalId +
                     "|Name=" + chart.FullName +
-                    "|Result=" + result);
-                await LokiCoroutine.Sleep(90);
-                AllflameContext.Refresh(true);
-                if (AllflameContext.InventoryChartCount >
-                    lastObservedInventoryCharts)
-                {
-                    lastObservedInventoryCharts =
-                        AllflameContext.InventoryChartCount;
-                    AllflameProgressWatchdog.MarkProgress(
-                        "VoyageStashChartTransferred");
-                }
-                if (AllflameContext.InventoryChartCount >=
-                    TargetInventoryCharts)
-                {
-                    break;
-                }
+                    "|Result=" + result +
+                    "|Action=ConfirmOnNextCycle" +
+                    "|OneActionPerCycle=True");
+                return true;
             }
 
-            int withdrawnCharts = Math.Max(
-                0,
-                AllflameContext.InventoryChartCount -
-                inventoryChartsBeforeWithdraw);
             settings.LastVoyageStashTotal = Math.Max(
                 0,
-                charts.Count - withdrawnCharts);
+                charts.Count);
             settings.LastChartStorageScan =
                 "VoyageStash:" + tabName + "=" +
                 settings.LastVoyageStashTotal;
             settings.Save();
-            AllflameContext.Refresh(true);
 
-            if (AllflameContext.InventoryChartCount > 0)
+            if (liveInventoryCharts > 0)
             {
                 AllflameRunState.MarkVoyageStashProbeCompleted();
                 AllflameRunState.MarkStorageChecked();
@@ -13394,18 +13615,18 @@ namespace AllflameBot
                     "|StoredCharts=" +
                     settings.LastVoyageStashTotal +
                     "|InventoryCharts=" +
-                    AllflameContext.InventoryChartCount +
+                    liveInventoryCharts +
                     "|Target=" + TargetInventoryCharts);
                 AllflameLog.Info(
                     "VOYAGE_STASH_SOURCE_RESULT" +
                     "|Result=Success" +
-                    "|Withdrawn=" + withdrawnCharts +
+                    "|Withdrawn=" + _stashWithdrawnCharts +
                     "|NextSource=None");
                 AllflameLog.Info(
                     "CHART_SUPPLY_SUCCESS" +
                     "|Source=VoyageStash" +
                     "|InventoryCharts=" +
-                    AllflameContext.InventoryChartCount);
+                    liveInventoryCharts);
                 await Coroutines.CloseBlockingWindows();
                 ResetLocalState();
                 AllflameProgressWatchdog.Clear();
@@ -13462,6 +13683,25 @@ namespace AllflameBot
             catch
             {
                 return 0;
+            }
+        }
+
+        private static int CountInventoryChartsLive()
+        {
+            try
+            {
+                InventoryControlWrapper control =
+                    LokiPoe.InGameState.InventoryUi
+                        .InventoryControl_Main;
+                return control == null || control.Inventory == null ||
+                       control.Inventory.Items == null
+                    ? AllflameContext.InventoryChartCount
+                    : control.Inventory.Items.Count(
+                        AllflameContext.IsChartItem);
+            }
+            catch
+            {
+                return AllflameContext.InventoryChartCount;
             }
         }
 
@@ -14021,6 +14261,11 @@ namespace AllflameBot
             _lastAreaHash = 0;
             _stashInteractionBlockedUtc = DateTime.MinValue;
             _uiRecoveryCycles = 0;
+            _stashWithdrawPending = false;
+            _stashWithdrawLocalId = 0;
+            _stashWithdrawBeforeInventory = 0;
+            _stashWithdrawIssuedUtc = DateTime.MinValue;
+            _stashWithdrawnCharts = 0;
             ResetApproachTracking();
         }
 
@@ -16611,10 +16856,7 @@ namespace AllflameBot
                     DreamPoeBot.BotFramework.MouseManager
                         .SetMousePosition(clickLocation, false);
                     DreamPoeBot.BotFramework.MouseManager
-                        .PressLMB(0, 0);
-                    System.Threading.Thread.Sleep(90);
-                    DreamPoeBot.BotFramework.MouseManager
-                        .ReleaseLMB(0, 0);
+                        .ClickLMB(0, 0);
                 }
                 return true;
             }
@@ -17810,7 +18052,6 @@ namespace AllflameBot
                 value =>
                     (value - DescendEnabled800TemplateMean) *
                     (value - DescendEnabled800TemplateMean));
-        private static Element _cachedDescendButton;
         private static DateTime _nextScanUtc = DateTime.MinValue;
 
         public static bool TryGetDescendButton(
@@ -17826,7 +18067,6 @@ namespace AllflameBot
                     out stableRootIndex,
                     out stableButtonPath))
             {
-                _cachedDescendButton = descendButton;
                 AllflameLog.Throttled(
                     "deepwater_chart_device_stable_window",
                     TimeSpan.FromSeconds(3),
@@ -17841,17 +18081,6 @@ namespace AllflameBot
                 return true;
             }
 
-            double cachedGeometryScore;
-            if (IsVisibleDescend(_cachedDescendButton) ||
-                IsGeometryDescendCandidate(
-                    _cachedDescendButton,
-                    out cachedGeometryScore))
-            {
-                descendButton = _cachedDescendButton;
-                return true;
-            }
-
-            _cachedDescendButton = null;
             if (DateTime.UtcNow < _nextScanUtc)
             {
                 return false;
@@ -17902,7 +18131,6 @@ namespace AllflameBot
                     ref bestGeometryScore);
                 if (found != null)
                 {
-                    _cachedDescendButton = found;
                     descendButton = found;
                     AllflameLog.Throttled(
                         "deepwater_chart_device_found",
@@ -17917,7 +18145,6 @@ namespace AllflameBot
 
             if (bestGeometryCandidate != null)
             {
-                _cachedDescendButton = bestGeometryCandidate;
                 descendButton = bestGeometryCandidate;
                 Vector2i center =
                     bestGeometryCandidate.CenterClickLocation();
@@ -18193,10 +18420,8 @@ namespace AllflameBot
                     DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
                         clientLocation,
                         false);
-                    DreamPoeBot.BotFramework.MouseManager.PressLMB(0, 0);
-                    System.Threading.Thread.Sleep(90);
-                    DreamPoeBot.BotFramework.MouseManager.ReleaseLMB(0, 0);
-                    return "MouseManagerPressRelease";
+                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                    return "MouseManagerClickRetry";
 
                 case 3:
                     LokiPoe.Input.MoveMouseToScreenPos(
@@ -18224,7 +18449,6 @@ namespace AllflameBot
                         0x0201,
                         new IntPtr(1),
                         new IntPtr(packedCoordinates));
-                    System.Threading.Thread.Sleep(90);
                     DreamPoeBot.Loki.Game.Interop.PostMessage(
                         LokiPoe.ClientWindowHandle,
                         0x0202,
@@ -18235,12 +18459,10 @@ namespace AllflameBot
                 case 5:
                     DreamPoeBot.Loki.Game.Interop.SetForegroundWindow(
                         LokiPoe.ClientWindowHandle);
-                    System.Threading.Thread.Sleep(80);
                     DreamPoeBot.Loki.Game.Interop.SetCursorPos(
                         clientRectangle.Left + clientLocation.X,
                         clientRectangle.Top + clientLocation.Y);
                     NativeMouseEvent(0x0002, 0, 0, 0, UIntPtr.Zero);
-                    System.Threading.Thread.Sleep(90);
                     NativeMouseEvent(0x0004, 0, 0, 0, UIntPtr.Zero);
                     return "Win32ForegroundMouseEvent";
 
@@ -18254,7 +18476,6 @@ namespace AllflameBot
                 default:
                     DreamPoeBot.Loki.Game.Interop.SetForegroundWindow(
                         LokiPoe.ClientWindowHandle);
-                    System.Threading.Thread.Sleep(80);
                     DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
                         clientLocation,
                         false);
@@ -19242,6 +19463,9 @@ namespace AllflameBot
         private DateTime _descendIssuedUtc = DateTime.MinValue;
         private DateTime _portalConfirmedUtc = DateTime.MinValue;
         private DateTime _portalWaitUntilUtc = DateTime.MinValue;
+        private DateTime _portalUiReopenedUtc = DateTime.MinValue;
+        private DateTime _nextPortalInteractUtc = DateTime.MinValue;
+        private int _portalUiRecoveries;
         private bool _capacityRecoveryClosePending;
 
         public EnterBathysphereTask()
@@ -19260,6 +19484,9 @@ namespace AllflameBot
             _descendIssuedUtc = DateTime.MinValue;
             _portalConfirmedUtc = DateTime.MinValue;
             _portalWaitUntilUtc = DateTime.MinValue;
+            _portalUiReopenedUtc = DateTime.MinValue;
+            _nextPortalInteractUtc = DateTime.MinValue;
+            _portalUiRecoveries = 0;
             _descendDisabledSinceUtc = DateTime.MinValue;
         }
 
@@ -19276,6 +19503,9 @@ namespace AllflameBot
             _descendIssuedUtc = DateTime.MinValue;
             _portalConfirmedUtc = DateTime.MinValue;
             _portalWaitUntilUtc = DateTime.MinValue;
+            _portalUiReopenedUtc = DateTime.MinValue;
+            _nextPortalInteractUtc = DateTime.MinValue;
+            _portalUiRecoveries = 0;
             _descendDisabledSinceUtc = DateTime.MinValue;
         }
 
@@ -19308,6 +19538,9 @@ namespace AllflameBot
                 _descendIssuedUtc = DateTime.MinValue;
                 _portalConfirmedUtc = DateTime.MinValue;
                 _portalWaitUntilUtc = DateTime.MinValue;
+                _portalUiReopenedUtc = DateTime.MinValue;
+                _nextPortalInteractUtc = DateTime.MinValue;
+                _portalUiRecoveries = 0;
                 _descendDisabledSinceUtc = DateTime.MinValue;
                 return false;
             }
@@ -19368,31 +19601,78 @@ namespace AllflameBot
                 bool chartUiReopened =
                     NativeDeepwaterChartDeviceUi.IsOpened ||
                     DeepwaterChartDeviceUi.IsStableWindowOpen;
-                if (chartUiReopened)
-                {
-                    _descendConfirmed = false;
-                    _portalConfirmedUtc = DateTime.MinValue;
-                    AllflameLog.Info(
-                        "CHART_DEVICE_DESCEND_RETRY" +
-                        "|Attempt=" + _descendAttempts +
-                        "|Reason=ChartDeviceReopenedAfterPortalInteraction");
-                }
-                else if (DateTime.UtcNow - _portalConfirmedUtc >=
-                         PortalEntryTimeout)
+                TimeSpan portalEntryElapsed =
+                    DateTime.UtcNow - _portalConfirmedUtc;
+                if (portalEntryElapsed >= PortalEntryTimeout)
                 {
                     AllflameLog.Info(
                         "BATHYSPHERE_PORTAL_ENTRY_TIMEOUT" +
                         "|Attempts=" + _descendAttempts +
+                        "|UiRecoveries=" + _portalUiRecoveries +
                         "|ElapsedMs=" +
-                        (int)(DateTime.UtcNow -
-                              _portalConfirmedUtc).TotalMilliseconds +
+                        (int)portalEntryElapsed.TotalMilliseconds +
                         "|Action=StopBot");
                     AllflameStopController.Stop(
                         "ChartPortalEntryTimeout",
                         "DescendConfirmed=True|Attempts=" +
                         _descendAttempts +
+                        "|UiRecoveries=" + _portalUiRecoveries +
                         "|ActiveTask=" + Name);
                     return true;
+                }
+
+                if (chartUiReopened)
+                {
+                    if (_portalUiReopenedUtc == DateTime.MinValue)
+                    {
+                        _portalUiReopenedUtc = DateTime.UtcNow;
+                        AllflameLog.Info(
+                            "CHART_PORTAL_UI_REOPENED" +
+                            "|State=Observed" +
+                            "|DescendConfirmed=True" +
+                            "|Action=WaitForFreshDeviceSnapshot");
+                        return true;
+                    }
+
+                    if (DateTime.UtcNow - _portalUiReopenedUtc <
+                        TimeSpan.FromMilliseconds(450))
+                    {
+                        return true;
+                    }
+
+                    List<Item> reopenedDeviceItems =
+                        NativeDeepwaterChartDeviceUi.IsOpened
+                            ? NativeDeepwaterChartDeviceUi.DeviceItems
+                            : new List<Item>();
+                    if (reopenedDeviceItems.Count == 0)
+                    {
+                        _portalUiRecoveries++;
+                        _portalUiReopenedUtc = DateTime.MinValue;
+                        _nextPortalInteractUtc =
+                            DateTime.UtcNow.AddMilliseconds(450);
+                        AllflameLog.Info(
+                            "CHART_PORTAL_UI_REOPENED" +
+                            "|State=Recovery" +
+                            "|Reason=PortalInteractionReopenedEmptyDevice" +
+                            "|Recovery=" + _portalUiRecoveries +
+                            "|DescendConfirmed=True" +
+                            "|Action=CloseUiAndReacquirePortal");
+                        await Coroutines.CloseBlockingWindows();
+                        return true;
+                    }
+
+                    _descendConfirmed = false;
+                    _portalConfirmedUtc = DateTime.MinValue;
+                    _portalUiReopenedUtc = DateTime.MinValue;
+                    AllflameLog.Info(
+                        "CHART_DEVICE_DESCEND_RETRY" +
+                        "|Attempt=" + _descendAttempts +
+                        "|Reason=ChartDeviceReopenedWithLoadedChart" +
+                        "|DeviceItems=" + reopenedDeviceItems.Count);
+                }
+                else
+                {
+                    _portalUiReopenedUtc = DateTime.MinValue;
                 }
             }
 
@@ -19413,7 +19693,8 @@ namespace AllflameBot
                     portal.Distance.ToString("0.0") +
                     "|Targetable=" + portal.IsTargetable);
 
-                if (portal.Distance <= 70f)
+                if (portal.Distance <= 70f &&
+                    DateTime.UtcNow >= _nextPortalInteractUtc)
                 {
                     await FinishMovementBeforeInteraction(
                         "Chart Bathysphere Portal");
@@ -19429,6 +19710,8 @@ namespace AllflameBot
                         "|Success=" + entered);
                     if (entered)
                     {
+                        _nextPortalInteractUtc =
+                            DateTime.UtcNow.AddMilliseconds(450);
                         return true;
                     }
                 }
@@ -19723,6 +20006,9 @@ namespace AllflameBot
                     _descendIssuedUtc = DateTime.MinValue;
                     _portalConfirmedUtc = DateTime.MinValue;
                     _portalWaitUntilUtc = DateTime.MinValue;
+                    _portalUiReopenedUtc = DateTime.MinValue;
+                    _nextPortalInteractUtc = DateTime.MinValue;
+                    _portalUiRecoveries = 0;
                     _descendDisabledSinceUtc =
                         DateTime.MinValue;
                     _capacityRecoveryClosePending = true;
@@ -24211,6 +24497,16 @@ namespace AllflameBot
         private readonly HashSet<string> _completedDropSignatures =
             new HashSet<string>(StringComparer.Ordinal);
         private int _lootSessionRevision = -1;
+        private bool _pendingPickupActive;
+        private int _pendingWorldId;
+        private uint _pendingAreaHash;
+        private string _pendingItemName = String.Empty;
+        private string _pendingDropSignature = String.Empty;
+        private int _pendingInventoryBefore;
+        private int _pendingAttempt;
+        private int _pendingPriority;
+        private bool _pendingInteractionAccepted;
+        private DateTime _pendingPickupDeadlineUtc = DateTime.MinValue;
 
         public LootGroundItemsTask()
             : base("LootGroundItemsTask", "Picks evaluated ground loot after opening a reward chest.") { }
@@ -24230,6 +24526,7 @@ namespace AllflameBot
                 _unlootableUntil.Clear();
                 _completedDropSignatures.Clear();
                 _lootSessionRevision = -1;
+                ClearPendingPickup();
                 return false;
             }
 
@@ -24247,6 +24544,12 @@ namespace AllflameBot
                 _retryAfter.Clear();
                 _unlootableUntil.Clear();
                 _completedDropSignatures.Clear();
+                ClearPendingPickup();
+            }
+
+            if (_pendingPickupActive)
+            {
+                return ConfirmPendingPickup(settings);
             }
 
             if (AllflameContext.InventoryFreeSquares == 0)
@@ -24275,12 +24578,7 @@ namespace AllflameBot
             }
 
             AllflameLootState.RefreshChestDrops(settings.GroundLootRadius);
-            WorldItem target = LokiPoe.ObjectManager.Objects
-                .OfType<WorldItem>()
-                .Where(world => ShouldPickup(world, settings))
-                .OrderByDescending(LootPriority)
-                .ThenBy(world => world.Distance)
-                .FirstOrDefault();
+            WorldItem target = SelectBestLootTarget(settings);
             if (target == null)
             {
                 if (BottleSafetyMovement.IsActive)
@@ -24450,120 +24748,16 @@ namespace AllflameBot
             }
             bool interactionAccepted =
                 await Coroutines.InteractWith(target);
-            await LokiCoroutine.Sleep(effectiveDelayMs);
-
-            WorldItem liveAfterClick = null;
-            try
-            {
-                liveAfterClick =
-                    LokiPoe.ObjectManager.Objects
-                        .OfType<WorldItem>()
-                        .FirstOrDefault(worldItem =>
-                            worldItem != null &&
-                            worldItem.IsValid &&
-                            worldItem.Id == target.Id);
-            }
-            catch
-            {
-            }
-
-            bool pickupConfirmed = false;
-            int inventoryAfter = inventoryBefore;
-            string rejectReason = "InventoryDeltaMissing";
-            DateTime confirmationDeadline =
-                DateTime.UtcNow.AddSeconds(2);
-            while (DateTime.UtcNow < confirmationDeadline)
-            {
-                bool inGame = LokiPoe.IsInGame;
-                bool playerAvailable = LokiPoe.Me != null;
-                bool playerDead = !playerAvailable || LokiPoe.Me.IsDead;
-                bool areaChanged =
-                    AllflameContext.AreaHash != interactionAreaHash ||
-                    LokiPoe.LocalData.AreaHash != interactionAreaHash;
-                if (!inGame || playerDead || areaChanged)
-                {
-                    rejectReason = !inGame
-                        ? "NotInGame"
-                        : playerDead
-                            ? "PlayerDead"
-                            : "AreaChanged";
-                    break;
-                }
-                inventoryAfter =
-                    AllflameContext.GetInventoryQuantity(inventoryItemName);
-                if (inventoryBefore >= 0 &&
-                    inventoryAfter > inventoryBefore)
-                {
-                    pickupConfirmed = true;
-                    break;
-                }
-                await LokiCoroutine.Sleep(100);
-            }
-            if (pickupConfirmed)
-            {
-                _completedDropSignatures.Add(dropSignature);
-                AllflameLootState.MarkMessageBottleCollected(item);
-                AllflameSession.RecordLoot(
-                    item,
-                    AllflameLootState.CurrentChestName,
-                    inventoryAfter - inventoryBefore,
-                    inventoryBefore,
-                    inventoryAfter,
-                    dropSignature);
-            }
-            else
-            {
-                bool playerDead = LokiPoe.Me == null || LokiPoe.Me.IsDead;
-                bool areaChanged =
-                    AllflameContext.AreaHash != interactionAreaHash;
-                AllflameSession.RecordRejectedPickup();
-                AllflameLog.Info(
-                    "NOTIFICATION_PICKUP_REJECTED|Item=" +
-                    inventoryItemName.Replace("|", "/") +
-                    "|Reason=" + rejectReason +
-                    "|PlayerDead=" + playerDead +
-                    "|AreaChanged=" + areaChanged +
-                    "|InventoryConfirmed=False" +
-                    "|WorldItemGone=" + (liveAfterClick == null) +
-                    "|InteractSuccess=" + interactionAccepted);
-            }
-            if (!pickupConfirmed && attempts + 1 >=
-                     MaxConsecutiveLootAttempts)
-            {
-                int completedAttempts = attempts + 1;
-                DateTime cooldownUntil = DateTime.UtcNow.AddSeconds(
-                    UnlootableCooldownSeconds);
-                _unlootableUntil[target.Id] = cooldownUntil;
-                AllflameLootState.MarkDropUnlootable(target.Id);
-                bool returnToSafeZone = HasNearbyMonster() ||
-                    (ZeroLanternSafety.IsExhausted(
-                        AllflameContext.IsVoyageMapArea &&
-                        AllflameContext.Phase == AllflamePhase.Voyage) &&
-                     !AllflameContext.LanternAuraActive);
-                string nextAction = returnToSafeZone
-                    ? "ReturnToSafeZone"
-                    : "ResumeChestRoute";
-                _retryAfter[target.Id] =
-                    cooldownUntil;
-                if (returnToSafeZone)
-                {
-                    AllflameLootState.Clear();
-                }
-                AllflameLog.Info(
-                    "GROUND_LOOT_GIVE_UP" +
-                    "|WorldId=" + target.Id +
-                    "|Attempts=" + completedAttempts +
-                    "|Reason=InteractionRejected" +
-                    "|CooldownSeconds=" +
-                    UnlootableCooldownSeconds +
-                    "|Action=" + nextAction);
-            }
-            if (!pickupConfirmed &&
-                BottleSafetyMovement.IsActive)
-            {
-                BottleSafetyMovement.Move(
-                    "BottlePickupNotConfirmed");
-            }
+            _pendingPickupActive = true;
+            _pendingWorldId = target.Id;
+            _pendingAreaHash = interactionAreaHash;
+            _pendingItemName = inventoryItemName;
+            _pendingDropSignature = dropSignature;
+            _pendingInventoryBefore = inventoryBefore;
+            _pendingAttempt = attempts + 1;
+            _pendingPriority = LootPriority(target);
+            _pendingInteractionAccepted = interactionAccepted;
+            _pendingPickupDeadlineUtc = DateTime.UtcNow.AddSeconds(2);
             AllflameLog.Info(
                 "GROUND_LOOT_PICKUP|WorldId=" + target.Id +
                 "|ItemId=" + (item == null ? 0 : item.Id) +
@@ -24572,8 +24766,220 @@ namespace AllflameBot
                 "|Priority=" + LootPriority(target) +
                 "|Attempt=" + (attempts + 1) +
                 "|InteractionAccepted=" + interactionAccepted +
-                "|ConfirmedRemoved=" + pickupConfirmed);
+                "|ConfirmedRemoved=False" +
+                "|Action=ConfirmOnNextCycle" +
+                "|OneActionPerCycle=True");
             return true;
+        }
+
+        private WorldItem SelectBestLootTarget(
+            AllflameSettings settings)
+        {
+            WorldItem best = null;
+            int bestPriority = Int32.MinValue;
+            float bestDistance = Single.MaxValue;
+            try
+            {
+                foreach (NetworkObject obj in
+                    LokiPoe.ObjectManager.Objects)
+                {
+                    WorldItem world = obj as WorldItem;
+                    if (!ShouldPickup(world, settings))
+                    {
+                        continue;
+                    }
+                    Item item = SafeItem(world);
+                    int priority = LootPriority(item);
+                    float distance = world.Distance;
+                    if (best == null ||
+                        priority > bestPriority ||
+                        priority == bestPriority &&
+                        distance < bestDistance)
+                    {
+                        best = world;
+                        bestPriority = priority;
+                        bestDistance = distance;
+                    }
+                }
+            }
+            catch
+            {
+                return best;
+            }
+            return best;
+        }
+
+        private bool ConfirmPendingPickup(
+            AllflameSettings settings)
+        {
+            bool inGame = LokiPoe.IsInGame;
+            bool playerDead = LokiPoe.Me == null || LokiPoe.Me.IsDead;
+            bool areaChanged =
+                !inGame ||
+                AllflameContext.AreaHash != _pendingAreaHash ||
+                LokiPoe.LocalData.AreaHash != _pendingAreaHash;
+            int inventoryAfter =
+                AllflameContext.GetInventoryQuantity(_pendingItemName);
+            bool pickupConfirmed =
+                _pendingInventoryBefore >= 0 &&
+                inventoryAfter > _pendingInventoryBefore;
+            WorldItem live = FindWorldItem(_pendingWorldId);
+            if (pickupConfirmed)
+            {
+                Item confirmedItem =
+                    FindInventoryItem(_pendingItemName);
+                _completedDropSignatures.Add(
+                    _pendingDropSignature);
+                AllflameLootState.MarkMessageBottleCollected(
+                    confirmedItem);
+                if (confirmedItem != null)
+                {
+                    AllflameSession.RecordLoot(
+                        confirmedItem,
+                        AllflameLootState.CurrentChestName,
+                        inventoryAfter - _pendingInventoryBefore,
+                        _pendingInventoryBefore,
+                        inventoryAfter,
+                        _pendingDropSignature);
+                }
+                AllflameLog.Info(
+                    "GROUND_LOOT_PICKUP_CONFIRMED" +
+                    "|WorldId=" + _pendingWorldId +
+                    "|Item=" + _pendingItemName.Replace("|", "/") +
+                    "|InventoryBefore=" + _pendingInventoryBefore +
+                    "|InventoryAfter=" + inventoryAfter +
+                    "|WorldItemGone=" + (live == null) +
+                    "|OneActionPerCycle=True");
+                ClearPendingPickup();
+                return true;
+            }
+
+            if (!areaChanged && !playerDead &&
+                DateTime.UtcNow < _pendingPickupDeadlineUtc)
+            {
+                return true;
+            }
+
+            string rejectReason = !inGame
+                ? "NotInGame"
+                : playerDead
+                    ? "PlayerDead"
+                    : areaChanged
+                        ? "AreaChanged"
+                        : "InventoryDeltaMissing";
+            int worldId = _pendingWorldId;
+            int attempt = _pendingAttempt;
+            bool interactionAccepted =
+                _pendingInteractionAccepted;
+            AllflameSession.RecordRejectedPickup();
+            AllflameLog.Info(
+                "NOTIFICATION_PICKUP_REJECTED|Item=" +
+                _pendingItemName.Replace("|", "/") +
+                "|Reason=" + rejectReason +
+                "|PlayerDead=" + playerDead +
+                "|AreaChanged=" + areaChanged +
+                "|InventoryConfirmed=False" +
+                "|WorldItemGone=" + (live == null) +
+                "|InteractSuccess=" + interactionAccepted);
+            if (attempt >= MaxConsecutiveLootAttempts)
+            {
+                DateTime cooldownUntil = DateTime.UtcNow.AddSeconds(
+                    UnlootableCooldownSeconds);
+                _unlootableUntil[worldId] = cooldownUntil;
+                _retryAfter[worldId] = cooldownUntil;
+                AllflameLootState.MarkDropUnlootable(worldId);
+                bool returnToSafeZone = HasNearbyMonster() ||
+                    (ZeroLanternSafety.IsExhausted(
+                        AllflameContext.IsVoyageMapArea &&
+                        AllflameContext.Phase == AllflamePhase.Voyage) &&
+                     !AllflameContext.LanternAuraActive);
+                if (returnToSafeZone)
+                {
+                    AllflameLootState.Clear();
+                }
+                AllflameLog.Info(
+                    "GROUND_LOOT_GIVE_UP" +
+                    "|WorldId=" + worldId +
+                    "|Attempts=" + attempt +
+                    "|Reason=InteractionRejected" +
+                    "|CooldownSeconds=" +
+                    UnlootableCooldownSeconds +
+                    "|Action=" +
+                    (returnToSafeZone
+                        ? "ReturnToSafeZone"
+                        : "ResumeChestRoute"));
+            }
+            if (BottleSafetyMovement.IsActive)
+            {
+                BottleSafetyMovement.Move(
+                    "BottlePickupNotConfirmed");
+            }
+            ClearPendingPickup();
+            return true;
+        }
+
+        private static WorldItem FindWorldItem(int worldId)
+        {
+            try
+            {
+                foreach (NetworkObject obj in
+                    LokiPoe.ObjectManager.Objects)
+                {
+                    WorldItem world = obj as WorldItem;
+                    if (world != null && world.Id == worldId &&
+                        world.IsValid)
+                    {
+                        return world;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return null;
+        }
+
+        private static Item FindInventoryItem(string itemName)
+        {
+            try
+            {
+                InventoryControlWrapper control =
+                    LokiPoe.InGameState.InventoryUi
+                        .InventoryControl_Main;
+                if (control == null || control.Inventory == null ||
+                    control.Inventory.Items == null)
+                {
+                    return null;
+                }
+                return control.Inventory.Items.FirstOrDefault(item =>
+                    item != null && item.IsValid &&
+                    (String.Equals(
+                         item.FullName,
+                         itemName,
+                         StringComparison.OrdinalIgnoreCase) ||
+                     String.Equals(
+                         item.Name,
+                         itemName,
+                         StringComparison.OrdinalIgnoreCase)));
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private void ClearPendingPickup()
+        {
+            _pendingPickupActive = false;
+            _pendingWorldId = 0;
+            _pendingAreaHash = 0;
+            _pendingItemName = String.Empty;
+            _pendingDropSignature = String.Empty;
+            _pendingInventoryBefore = -1;
+            _pendingAttempt = 0;
+            _pendingPriority = 0;
+            _pendingInteractionAccepted = false;
+            _pendingPickupDeadlineUtc = DateTime.MinValue;
         }
 
         private bool ShouldPickup(WorldItem worldItem, AllflameSettings settings)
@@ -24704,7 +25110,11 @@ namespace AllflameBot
 
         private static int LootPriority(WorldItem worldItem)
         {
-            Item item = SafeItem(worldItem);
+            return LootPriority(SafeItem(worldItem));
+        }
+
+        private static int LootPriority(Item item)
+        {
             if (item == null)
             {
                 return 0;
@@ -32760,6 +33170,16 @@ namespace AllflameBot
             Accept
         }
 
+        private enum BottleOpenStage
+        {
+            Idle,
+            ConfirmConsumed,
+            AwaitCursor,
+            PlaceCursor,
+            ConfirmPlacement,
+            ResolvePlacedItem
+        }
+
         private sealed class ItemSnapshot
         {
             public int LocalId { get; set; }
@@ -32839,6 +33259,15 @@ namespace AllflameBot
         private uint _sessionAreaHash;
         private string _cycleSettingsSignature = String.Empty;
         private string _snapshotCharacter = String.Empty;
+        private BottleOpenStage _bottleOpenStage = BottleOpenStage.Idle;
+        private int _activeBottleKey;
+        private int _activeBottleBeforeStack;
+        private string _activeBottleUseResult = String.Empty;
+        private Dictionary<int, ItemSnapshot> _activeBottleBefore;
+        private RewardPlacementResult _activePlacement;
+        private DateTime _bottleStageDeadlineUtc = DateTime.MinValue;
+        private DateTime _nextBottleAcceptClickUtc = DateTime.MinValue;
+        private int _bottlePlacementAttempts;
 
         public SecretBottleProcessingTask()
             : base(
@@ -33076,6 +33505,12 @@ namespace AllflameBot
                     return false;
                 }
 
+                if (_bottleOpenStage != BottleOpenStage.Idle)
+                {
+                    await ContinueBottleOpen(settings);
+                    return true;
+                }
+
                 Item bottle = items.FirstOrDefault(IsBottleItem);
                 int maximum = Math.Max(
                     1,
@@ -33086,7 +33521,7 @@ namespace AllflameBot
                     _stage = ProcessingStage.FindVendor;
                     return true;
                 }
-                await OpenOneBottle(inventoryControl, bottle, settings);
+                await BeginBottleOpen(inventoryControl, bottle);
                 return true;
             }
 
@@ -33485,67 +33920,305 @@ namespace AllflameBot
             return true;
         }
 
-        private async Task OpenOneBottle(
+        private async Task BeginBottleOpen(
             InventoryControlWrapper inventoryControl,
-            Item bottle,
-            AllflameSettings settings)
+            Item bottle)
         {
-            int bottleKey = ItemKey(bottle);
-            Dictionary<int, ItemSnapshot> before = SnapshotInventory(
+            _activeBottleKey = ItemKey(bottle);
+            _activeBottleBeforeStack = Math.Max(1, bottle.StackCount);
+            _activeBottleBefore = SnapshotInventory(
                 InventoryItems(inventoryControl));
-            int beforeBottleStack = Math.Max(1, bottle.StackCount);
-            string useResult = await RightClickBottle(
+            _activeBottleUseResult = await RightClickBottle(
                 inventoryControl,
                 bottle);
-            DateTime consumeDeadline = DateTime.UtcNow.AddSeconds(3);
-            List<Item> afterItems = null;
-            bool consumed = false;
-            while (DateTime.UtcNow < consumeDeadline)
+            _bottleStageDeadlineUtc = DateTime.UtcNow.AddSeconds(3);
+            _bottleOpenStage = BottleOpenStage.ConfirmConsumed;
+            AllflameLog.Info(
+                "SECRET_BOTTLE_OPEN_ISSUED" +
+                "|BottleKey=" + _activeBottleKey +
+                "|BeforeStack=" + _activeBottleBeforeStack +
+                "|Result=" + _activeBottleUseResult +
+                "|Action=ConfirmOnNextCycle" +
+                "|OneActionPerCycle=True");
+        }
+
+        private async Task ContinueBottleOpen(
+            AllflameSettings settings)
+        {
+            if (_bottleOpenStage == BottleOpenStage.ConfirmConsumed)
             {
-                await LokiCoroutine.Sleep(150);
-                inventoryControl = MainInventory();
-                afterItems = InventoryItems(inventoryControl);
-                Item remainingBottle = afterItems.FirstOrDefault(item =>
-                    IsBottleItem(item) && ItemKey(item) == bottleKey);
-                consumed = remainingBottle == null ||
-                    Math.Max(1, remainingBottle.StackCount) < beforeBottleStack;
-                if (consumed)
+                List<Item> items = InventoryItems(MainInventory());
+                Item remainingBottle = items.FirstOrDefault(item =>
+                    IsBottleItem(item) &&
+                    ItemKey(item) == _activeBottleKey);
+                bool consumed = remainingBottle == null ||
+                    Math.Max(1, remainingBottle.StackCount) <
+                    _activeBottleBeforeStack;
+                if (!consumed &&
+                    DateTime.UtcNow < _bottleStageDeadlineUtc)
                 {
-                    break;
+                    return;
                 }
-            }
-            if (!consumed)
-            {
-                int attempts;
-                _openAttempts.TryGetValue(bottleKey, out attempts);
-                attempts++;
-                _openAttempts[bottleKey] = attempts;
+                if (!consumed)
+                {
+                    int attempts;
+                    _openAttempts.TryGetValue(
+                        _activeBottleKey,
+                        out attempts);
+                    attempts++;
+                    _openAttempts[_activeBottleKey] = attempts;
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_OPEN" +
+                        "|Attempt=" + attempts +
+                        "|Consumed=False" +
+                        "|Result=" + _activeBottleUseResult +
+                        "|Action=" +
+                        (attempts >= 3
+                            ? "GiveUpSession"
+                            : "Retry"));
+                    ClearBottleOpenState();
+                    if (attempts >= 3)
+                    {
+                        _failed++;
+                        _cycleCompletionPending = true;
+                        _stage = ProcessingStage.FindVendor;
+                        _nextSessionUtc =
+                            DateTime.UtcNow.AddSeconds(30);
+                    }
+                    return;
+                }
+
+                _openAttempts.Remove(_activeBottleKey);
+                _opened++;
+                _activePlacement = new RewardPlacementResult
+                {
+                    Status = "AcceptOrCursorNotDetected",
+                    Column = -1,
+                    Row = -1
+                };
+                _bottleStageDeadlineUtc = DateTime.UtcNow.AddSeconds(
+                    Math.Max(
+                        3,
+                        Math.Min(
+                            30,
+                            settings.SecretBottleRevealTimeoutSeconds)));
+                _nextBottleAcceptClickUtc = DateTime.MinValue;
+                _bottleOpenStage = BottleOpenStage.AwaitCursor;
                 AllflameLog.Info(
                     "SECRET_BOTTLE_OPEN" +
-                    "|Attempt=" + attempts +
-                    "|Consumed=False" +
-                    "|Result=" + useResult +
-                    "|Action=" +
-                    (attempts >= 3
-                        ? "GiveUpSession"
-                        : "Retry"));
-                if (attempts >= 3)
+                    "|Consumed=True" +
+                    "|Result=" + _activeBottleUseResult +
+                    "|Action=AwaitRewardCursor" +
+                    "|OneActionPerCycle=True");
+                return;
+            }
+
+            if (_bottleOpenStage == BottleOpenStage.AwaitCursor)
+            {
+                Item cursorItem =
+                    LokiPoe.InGameState.CursorItemOverlay.Item;
+                Vector2i cursorSize =
+                    LokiPoe.InGameState.CursorItemOverlay.ItemSize;
+                bool cursorReady =
+                    LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
+                    cursorItem != null &&
+                    cursorSize.X > 0 && cursorSize.Y > 0;
+                if (cursorReady)
                 {
-                    _failed++;
-                    _cycleCompletionPending = true;
-                    _stage = ProcessingStage.FindVendor;
-                    _nextSessionUtc = DateTime.UtcNow.AddSeconds(30);
+                    _activePlacement.Decision =
+                        EvaluateReward(cursorItem, settings);
+                    _bottlePlacementAttempts = 0;
+                    _bottleOpenStage = BottleOpenStage.PlaceCursor;
+                    return;
+                }
+                if (DateTime.UtcNow >= _bottleStageDeadlineUtc)
+                {
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_TIMEOUT" +
+                        "|Stage=RevealOrAccept" +
+                        "|RewardUi=" + DescribeBottleRewardUi() +
+                        "|NextAction=ControlledStop");
+                    AllflameStopController.Stop(
+                        "SecretBottleRevealStuck",
+                        "Bottle consumed but reward cursor did not appear.");
+                    ClearBottleOpenState();
+                    return;
+                }
+
+                Vector2i acceptLocation;
+                long revealAddress;
+                int visited;
+                string topology;
+                bool foundByElement =
+                    TryFindBottleRevealAcceptButton(
+                        out acceptLocation,
+                        out revealAddress,
+                        out visited,
+                        out topology);
+                double correlation = -1d;
+                bool found = foundByElement;
+                string source = foundByElement
+                    ? "ElementTree"
+                    : "None";
+                if (!found)
+                {
+                    found = TryFindAcceptButton(
+                        out acceptLocation,
+                        out correlation);
+                    source = found ? "ImageFallback" : "None";
+                }
+                AllflameLog.Throttled(
+                    "secret_bottle_accept_incremental",
+                    TimeSpan.FromSeconds(1),
+                    "SECRET_BOTTLE_ACCEPT" +
+                    "|Found=" + found +
+                    "|Source=" + source +
+                    "|Correlation=" + correlation.ToString("0.000") +
+                    "|Visited=" + visited +
+                    "|OneActionPerCycle=True");
+                if (found &&
+                    DateTime.UtcNow >= _nextBottleAcceptClickUtc)
+                {
+                    _nextBottleAcceptClickUtc =
+                        DateTime.UtcNow.AddMilliseconds(600);
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                    DreamPoeBot.BotFramework.MouseManager
+                        .SetMousePosition(
+                            acceptLocation,
+                            foundByElement);
+                    await LokiCoroutine.Sleep(25);
+                    DreamPoeBot.BotFramework.MouseManager
+                        .ClickLMB(0, 0);
                 }
                 return;
             }
 
-            _openAttempts.Remove(bottleKey);
-            _opened++;
-            RewardPlacementResult placement = await AcceptAndPlaceReward(
-                inventoryControl,
-                settings);
+            if (_bottleOpenStage == BottleOpenStage.PlaceCursor)
+            {
+                Item cursorItem =
+                    LokiPoe.InGameState.CursorItemOverlay.Item;
+                Vector2i cursorSize =
+                    LokiPoe.InGameState.CursorItemOverlay.ItemSize;
+                InventoryControlWrapper inventoryControl =
+                    MainInventory();
+                if (cursorItem == null || cursorSize.X <= 0 ||
+                    cursorSize.Y <= 0 || inventoryControl == null ||
+                    inventoryControl.Inventory == null ||
+                    inventoryControl.InventorySlotUiElement == null)
+                {
+                    return;
+                }
+                int maximumAttempts = Math.Max(
+                    1,
+                    Math.Min(
+                        5,
+                        settings.SecretBottleCursorPlacementRetries));
+                if (_bottlePlacementAttempts >= maximumAttempts)
+                {
+                    AllflameStopController.Stop(
+                        "SecretBottleCursorStuck",
+                        "Could not place bottle reward after " +
+                        maximumAttempts + " attempts.");
+                    ClearBottleOpenState();
+                    return;
+                }
+                int column;
+                int row;
+                if (!inventoryControl.Inventory.CanFitItem(
+                        cursorSize,
+                        out column,
+                        out row))
+                {
+                    AllflameStopController.Stop(
+                        "SecretBottleCursorStuck",
+                        "No inventory space for bottle reward " +
+                        cursorSize.X + "x" + cursorSize.Y + ".");
+                    ClearBottleOpenState();
+                    return;
+                }
+                Vector2i slotLocation =
+                    inventoryControl.InventorySlotUiElement
+                        .SlotClickLocation(
+                            new Vector2i(column + 1, row + 1));
+                _bottlePlacementAttempts++;
+                _activePlacement.Column = column;
+                _activePlacement.Row = row;
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                DreamPoeBot.BotFramework.MouseManager
+                    .SetMousePosition(slotLocation, true);
+                await LokiCoroutine.Sleep(25);
+                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                _bottleStageDeadlineUtc =
+                    DateTime.UtcNow.AddSeconds(1);
+                _bottleOpenStage =
+                    BottleOpenStage.ConfirmPlacement;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_CURSOR_PLACE" +
+                    "|Attempt=" + _bottlePlacementAttempts +
+                    "|Maximum=" + maximumAttempts +
+                    "|Slot=" + column + "," + row +
+                    "|Confirmed=False" +
+                    "|Action=ConfirmOnNextCycle" +
+                    "|OneActionPerCycle=True");
+                return;
+            }
+
+            if (_bottleOpenStage ==
+                BottleOpenStage.ConfirmPlacement)
+            {
+                bool placed =
+                    !LokiPoe.InGameState.CursorItemOverlay.IsOpened;
+                if (!placed &&
+                    DateTime.UtcNow < _bottleStageDeadlineUtc)
+                {
+                    return;
+                }
+                if (!placed)
+                {
+                    _bottleOpenStage = BottleOpenStage.PlaceCursor;
+                    return;
+                }
+                _activePlacement.Status =
+                    "Placed:" + _activePlacement.Column + "," +
+                    _activePlacement.Row;
+                _bottleStageDeadlineUtc =
+                    DateTime.UtcNow.AddSeconds(1);
+                _bottleOpenStage =
+                    BottleOpenStage.ResolvePlacedItem;
+                return;
+            }
+
+            if (_bottleOpenStage ==
+                BottleOpenStage.ResolvePlacedItem)
+            {
+                _activePlacement.PlacedItem = FindInventoryItemAt(
+                    _activePlacement.Column,
+                    _activePlacement.Row);
+                if (_activePlacement.PlacedItem == null &&
+                    DateTime.UtcNow < _bottleStageDeadlineUtc)
+                {
+                    return;
+                }
+                FinalizeBottleReward(settings);
+                ClearBottleOpenState();
+            }
+        }
+
+        private void FinalizeBottleReward(
+            AllflameSettings settings)
+        {
+            RewardPlacementResult placement = _activePlacement ??
+                new RewardPlacementResult
+                {
+                    Status = "PlacementUnavailable",
+                    Column = -1,
+                    Row = -1
+                };
+            Dictionary<int, ItemSnapshot> before =
+                _activeBottleBefore ??
+                new Dictionary<int, ItemSnapshot>();
             string rewardResult = placement.Status ?? String.Empty;
-            afterItems = InventoryItems(MainInventory());
+            List<Item> afterItems = InventoryItems(MainInventory());
             List<Item> newItems = afterItems
                 .Where(item =>
                     item != null &&
@@ -33601,7 +34274,7 @@ namespace AllflameBot
                 "SECRET_BOTTLE_OPEN" +
                 "|Attempt=1" +
                 "|Consumed=True" +
-                "|Result=" + useResult +
+                "|Result=" + _activeBottleUseResult +
                 "|Reward=" + rewardResult +
                 "|NewItems=" + newItems.Count +
                 "|MergedStacks=" + increasedStacks.Count +
@@ -33710,221 +34383,17 @@ namespace AllflameBot
             }
         }
 
-        private async Task<RewardPlacementResult> AcceptAndPlaceReward(
-            InventoryControlWrapper inventoryControl,
-            AllflameSettings settings)
+        private void ClearBottleOpenState()
         {
-            var output = new RewardPlacementResult
-            {
-                Status = "AcceptOrCursorNotDetected",
-                Column = -1,
-                Row = -1
-            };
-            int timeoutSeconds = Math.Max(
-                3,
-                Math.Min(30, settings.SecretBottleRevealTimeoutSeconds));
-            DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-            bool cursorOpened = false;
-            bool revealTopologyLogged = false;
-            bool previousAcceptFound = false;
-            string previousAcceptSource = String.Empty;
-            DateTime nextAcceptClickUtc = DateTime.MinValue;
-            int attempt = 0;
-            while (DateTime.UtcNow < deadline)
-            {
-                attempt++;
-                Item currentCursorItem =
-                    LokiPoe.InGameState.CursorItemOverlay.Item;
-                Vector2i currentCursorSize =
-                    LokiPoe.InGameState.CursorItemOverlay.ItemSize;
-                bool validCursorItem =
-                    LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
-                    currentCursorItem != null &&
-                    currentCursorSize.X > 0 &&
-                    currentCursorSize.Y > 0;
-                if (validCursorItem)
-                {
-                    cursorOpened = true;
-                    break;
-                }
-
-                Vector2i acceptLocation;
-                long revealAddress;
-                int visited;
-                string topology;
-                bool foundByElement = TryFindBottleRevealAcceptButton(
-                    out acceptLocation,
-                    out revealAddress,
-                    out visited,
-                    out topology);
-                double correlation = -1d;
-                bool found = foundByElement;
-                string source = foundByElement ? "ElementTree" : "None";
-                if (!found)
-                {
-                    found = TryFindAcceptButton(
-                        out acceptLocation,
-                        out correlation);
-                    source = found ? "ImageFallback" : "None";
-                }
-
-                if (!revealTopologyLogged && revealAddress != 0)
-                {
-                    revealTopologyLogged = true;
-                    AllflameLog.Info(
-                        "SECRET_BOTTLE_REVEAL" +
-                        "|Found=True" +
-                        "|Address=0x" + revealAddress.ToString("X") +
-                        "|Visited=" + visited +
-                        "|Children=" + topology +
-                        "|RewardUi=" + DescribeBottleRewardUi());
-                }
-                if (attempt == 1 ||
-                    found != previousAcceptFound ||
-                    !String.Equals(
-                        source,
-                        previousAcceptSource,
-                        StringComparison.Ordinal) ||
-                    attempt % 5 == 0)
-                {
-                    AllflameLog.Info(
-                        "SECRET_BOTTLE_ACCEPT" +
-                        "|Attempt=" + attempt +
-                        "|Found=" + found +
-                        "|Source=" + source +
-                        "|Correlation=" + correlation.ToString("0.000") +
-                        (found
-                            ? "|Location=" + acceptLocation.X + "," +
-                              acceptLocation.Y
-                            : String.Empty));
-                }
-                previousAcceptFound = found;
-                previousAcceptSource = source;
-                if (found && DateTime.UtcNow >= nextAcceptClickUtc)
-                {
-                    nextAcceptClickUtc =
-                        DateTime.UtcNow.AddMilliseconds(600);
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                        acceptLocation,
-                        foundByElement);
-                    await LokiCoroutine.Sleep(25);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                }
-                await LokiCoroutine.Sleep(400);
-            }
-
-            Item finalCursorItem =
-                LokiPoe.InGameState.CursorItemOverlay.Item;
-            Vector2i finalCursorSize =
-                LokiPoe.InGameState.CursorItemOverlay.ItemSize;
-            cursorOpened = cursorOpened ||
-                (LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
-                 finalCursorItem != null &&
-                 finalCursorSize.X > 0 &&
-                 finalCursorSize.Y > 0);
-            if (!cursorOpened)
-            {
-                AllflameLog.Info(
-                    "SECRET_BOTTLE_TIMEOUT" +
-                    "|Stage=RevealOrAccept" +
-                    "|ElapsedSeconds=" + timeoutSeconds +
-                    "|RewardUi=" + DescribeBottleRewardUi() +
-                    "|NextAction=ControlledStop");
-                AllflameStopController.Stop(
-                    "SecretBottleRevealStuck",
-                    "Bottle consumed but reward cursor did not appear within " +
-                    timeoutSeconds + " seconds.");
-                return output;
-            }
-
-            output.Decision = EvaluateReward(finalCursorItem, settings);
-            int maximumPlacementAttempts = Math.Max(
-                1,
-                Math.Min(5, settings.SecretBottleCursorPlacementRetries));
-            for (int placementAttempt = 1;
-                 placementAttempt <= maximumPlacementAttempts;
-                 placementAttempt++)
-            {
-                inventoryControl = MainInventory();
-                if (inventoryControl == null ||
-                    inventoryControl.Inventory == null ||
-                    inventoryControl.InventorySlotUiElement == null)
-                {
-                    output.Status = "CursorHeld:InventoryUnavailable";
-                    await LokiCoroutine.Sleep(250);
-                    continue;
-                }
-
-                int column;
-                int row;
-                if (!inventoryControl.Inventory.CanFitItem(
-                        finalCursorSize,
-                        out column,
-                        out row))
-                {
-                    output.Status = "CursorHeld:NoSpaceFor" +
-                        finalCursorSize.X + "x" + finalCursorSize.Y;
-                    break;
-                }
-
-                Vector2i slotLocation =
-                    inventoryControl.InventorySlotUiElement
-                        .SlotClickLocation(
-                            new Vector2i(column + 1, row + 1));
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                    slotLocation,
-                    true);
-                await LokiCoroutine.Sleep(25);
-                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                await LokiCoroutine.Sleep(350);
-                bool placed =
-                    !LokiPoe.InGameState.CursorItemOverlay.IsOpened;
-                AllflameLog.Info(
-                    "SECRET_BOTTLE_CURSOR_PLACE" +
-                    "|Attempt=" + placementAttempt +
-                    "|Maximum=" + maximumPlacementAttempts +
-                    "|Name=" +
-                    (finalCursorItem.FullName ??
-                     finalCursorItem.Name ?? String.Empty) +
-                    "|Size=" + finalCursorSize.X + "x" +
-                    finalCursorSize.Y +
-                    "|Slot=" + column + "," + row +
-                    "|Location=" + slotLocation.X + "," + slotLocation.Y +
-                    "|Confirmed=" + placed);
-                if (!placed)
-                {
-                    output.Status = "CursorHeld:PlacementRejected";
-                    continue;
-                }
-
-                output.Column = column;
-                output.Row = row;
-                output.Status = "Placed:" + column + "," + row;
-                DateTime itemDeadline = DateTime.UtcNow.AddSeconds(1);
-                while (DateTime.UtcNow < itemDeadline &&
-                       output.PlacedItem == null)
-                {
-                    output.PlacedItem = FindInventoryItemAt(column, row);
-                    if (output.PlacedItem == null)
-                    {
-                        await LokiCoroutine.Sleep(100);
-                    }
-                }
-                return output;
-            }
-
-            AllflameLog.Info(
-                "SECRET_BOTTLE_FAILED" +
-                "|Reason=CursorPlacementExhausted" +
-                "|Result=" + output.Status +
-                "|NextAction=ControlledStop");
-            AllflameStopController.Stop(
-                "SecretBottleCursorStuck",
-                "Could not place bottle reward after " +
-                maximumPlacementAttempts + " attempts: " + output.Status);
-            return output;
+            _bottleOpenStage = BottleOpenStage.Idle;
+            _activeBottleKey = 0;
+            _activeBottleBeforeStack = 0;
+            _activeBottleUseResult = String.Empty;
+            _activeBottleBefore = null;
+            _activePlacement = null;
+            _bottleStageDeadlineUtc = DateTime.MinValue;
+            _nextBottleAcceptClickUtc = DateTime.MinValue;
+            _bottlePlacementAttempts = 0;
         }
 
         private static bool TryFindBottleRevealAcceptButton(
@@ -34919,6 +35388,7 @@ namespace AllflameBot
         private void ResetSessionState(bool resetSnapshot = false)
         {
             _active = false;
+            ClearBottleOpenState();
             _stage = ProcessingStage.Opening;
             _vendor = null;
             _vendorStartedUtc = DateTime.MinValue;

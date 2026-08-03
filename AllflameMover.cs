@@ -27,6 +27,15 @@ namespace AllflameBot
         private string _lastLoggedSkill = String.Empty;
         private bool _heldMoveActive;
         private string _lastApproachProfile = String.Empty;
+        private bool _fallbackSearchActive;
+        private Vector2i _fallbackRequestedPosition;
+        private int _fallbackRadiusIndex;
+        private int _fallbackAngleIndex;
+
+        private static readonly int[] FallbackRadii =
+            { 14, 20, 28, 36, 46, 58, 70 };
+        private const int FallbackAngleSamples = 16;
+        private const int FallbackChecksPerCycle = 6;
 
         private enum ApproachProfile
         {
@@ -40,7 +49,7 @@ namespace AllflameBot
         public string Name => "Allflame Mover";
         public string Description => "Pathfinding mover for Allflame Chart Areas.";
         public string Author => "Codex";
-        public string Version => "0.23.132";
+        public string Version => "0.23.133";
         public UserControl Control => null;
         public JsonSettings Settings => AllflameSettings.Instance;
         public PathfindingCommand CurrentCommand => _currentCommand;
@@ -61,6 +70,7 @@ namespace AllflameBot
             _lastLoggedSkill = String.Empty;
             _heldMoveActive = false;
             _lastApproachProfile = String.Empty;
+            ResetFallbackSearch();
         }
 
         public void Stop()
@@ -70,6 +80,7 @@ namespace AllflameBot
             _lastLoggedSkill = String.Empty;
             _heldMoveActive = false;
             _lastApproachProfile = String.Empty;
+            ResetFallbackSearch();
         }
 
         public void Tick()
@@ -241,6 +252,7 @@ namespace AllflameBot
             _nextMoveUtc = DateTime.MinValue;
             ClearStableApproach();
             _heldMoveActive = false;
+            ResetFallbackSearch();
         }
 
         public void LogSelectedMovementSkill(bool force)
@@ -350,8 +362,14 @@ namespace AllflameBot
                 ClearStableApproach();
             }
 
-            if (TryPath(playerPosition, requestedPosition))
+            bool continueFallback =
+                _fallbackSearchActive &&
+                _fallbackRequestedPosition.DistanceF(
+                    requestedPosition) <= 10f;
+            if (!continueFallback &&
+                TryPath(playerPosition, requestedPosition))
             {
+                ResetFallbackSearch();
                 RememberStableApproach(
                     playerPosition,
                     requestedPosition,
@@ -360,51 +378,82 @@ namespace AllflameBot
                 return true;
             }
 
+            if (!continueFallback)
+            {
+                _fallbackSearchActive = true;
+                _fallbackRequestedPosition = requestedPosition;
+                _fallbackRadiusIndex = 0;
+                _fallbackAngleIndex = 0;
+            }
+
             double baseAngle = Math.Atan2(
                 playerPosition.Y - requestedPosition.Y,
                 playerPosition.X - requestedPosition.X);
-            int[] radii = { 14, 20, 28, 36, 46, 58, 70 };
-            const int angleSamples = 16;
-
-            foreach (int radius in radii)
+            int checks = 0;
+            while (_fallbackRadiusIndex < FallbackRadii.Length &&
+                   checks < FallbackChecksPerCycle)
             {
-                for (int index = 0;
-                     index < angleSamples;
-                     index++)
+                int radius = FallbackRadii[_fallbackRadiusIndex];
+                int angleIndex = _fallbackAngleIndex++;
+                if (_fallbackAngleIndex >= FallbackAngleSamples)
                 {
-                    double angle =
-                        baseAngle +
-                        index * Math.PI * 2.0 / angleSamples;
-                    Vector2i candidate = new Vector2i(
-                        requestedPosition.X +
-                        (int)Math.Round(Math.Cos(angle) * radius),
-                        requestedPosition.Y +
-                        (int)Math.Round(Math.Sin(angle) * radius));
-                    PathfindingCommand candidateCommand =
-                        new PathfindingCommand(
-                            playerPosition,
-                            candidate,
-                            3f);
-                    if (!ExilePather.FindPath(
-                            ref candidateCommand) ||
-                        candidateCommand.Path == null ||
-                        candidateCommand.Path.Count == 0)
-                    {
-                        continue;
-                    }
-
-                    _currentCommand = candidateCommand;
-                    resolvedPosition = candidate;
-                    RememberStableApproach(
-                        playerPosition,
-                        requestedPosition,
-                        candidate,
-                        TimeSpan.FromSeconds(6));
-                    return true;
+                    _fallbackAngleIndex = 0;
+                    _fallbackRadiusIndex++;
                 }
+                checks++;
+                double angle =
+                    baseAngle +
+                    angleIndex * Math.PI * 2.0 /
+                    FallbackAngleSamples;
+                Vector2i candidate = new Vector2i(
+                    requestedPosition.X +
+                    (int)Math.Round(Math.Cos(angle) * radius),
+                    requestedPosition.Y +
+                    (int)Math.Round(Math.Sin(angle) * radius));
+                PathfindingCommand candidateCommand =
+                    new PathfindingCommand(
+                        playerPosition,
+                        candidate,
+                        3f);
+                if (!ExilePather.FindPath(ref candidateCommand) ||
+                    candidateCommand.Path == null ||
+                    candidateCommand.Path.Count == 0)
+                {
+                    continue;
+                }
+
+                _currentCommand = candidateCommand;
+                resolvedPosition = candidate;
+                ResetFallbackSearch();
+                RememberStableApproach(
+                    playerPosition,
+                    requestedPosition,
+                    candidate,
+                    TimeSpan.FromSeconds(6));
+                return true;
             }
 
+            if (_fallbackRadiusIndex >= FallbackRadii.Length)
+            {
+                ResetFallbackSearch();
+            }
+            AllflameLog.Throttled(
+                "mover_fallback_search",
+                TimeSpan.FromSeconds(1),
+                "MOVER_FALLBACK_SEARCH" +
+                "|Target=" + requestedPosition +
+                "|ChecksThisCycle=" + checks +
+                "|RadiusIndex=" + _fallbackRadiusIndex +
+                "|AngleIndex=" + _fallbackAngleIndex +
+                "|OneActionPerCycle=True");
             return false;
+        }
+
+        private void ResetFallbackSearch()
+        {
+            _fallbackSearchActive = false;
+            _fallbackRadiusIndex = 0;
+            _fallbackAngleIndex = 0;
         }
 
         private bool TryPath(

@@ -2,6 +2,26 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.133 - 2026-08-04
+
+- Recover when portal interaction reopens an empty Chart Device after Descend:
+  preserve the confirmed Descend state, close the stale UI, reacquire the
+  Bathysphere portal and retry with a bounded interaction cadence.
+- Distinguish a genuinely loaded reopened Chart Device from the empty-device
+  recovery case and include UI recovery counts in the portal timeout marker.
+- Make mover fallback search incremental while preserving the immediate direct
+  path, limiting expensive path candidates to six checks per task cycle.
+- Make ground loot, Bottle opening, personal Voyage Stash withdrawal, visual
+  respawn confirmation and Sulphur pickup cooperative across task cycles.
+- Refresh context on tiered object, inventory and UI schedules, and queue
+  manual snapshots for the next normal cycle instead of refreshing in the
+  message handler.
+- Remove blocking mouse sleeps and the retained Descend `Element`; reacquire
+  UI state before input and log `TASK_CYCLE_SLOW`/`CONTEXT_REFRESH_TIMING` for
+  remaining runtime stalls.
+- Add portal reopen, incremental action and one-action-per-cycle diagnostics
+  without slowing normal direct movement or exploration traversal.
+
 ## 0.23.132 - 2026-08-04
 
 - Rebuild Voyage Planner placement as a cooperative state machine: each task
