@@ -12345,6 +12345,8 @@ namespace AllflameBot
         private int _openAttempts;
         private int _resolveAttempts;
         private int _tabFailures;
+        private int _activeMainTab = -1;
+        private int _activeSubTab = -1;
         private readonly int[] _lastUsedSubTab = { -1, -1, -1 };
         private readonly int[,] _pageCounts = new int[3, 5];
         private readonly HashSet<string> _seenChartKeys =
@@ -12576,6 +12578,8 @@ namespace AllflameBot
             _subTab = 0;
             _withdrawMainTab = -1;
             _withdrawSubTab = -1;
+            _activeMainTab = -1;
+            _activeSubTab = -1;
             _seenChartKeys.Clear();
             for (int main = 0; main < 3; main++)
             {
@@ -12878,23 +12882,35 @@ namespace AllflameBot
 
         private async Task<bool> SelectStorageTab(int mainTab, int subTab)
         {
-            if (!ChartStorageUi.TryClickMainTab(mainTab))
+            if (_activeMainTab != mainTab)
             {
-                AllflameLog.Info(
-                    "CHART_STORAGE_TAB_FAILED|Reason=MainTabMissing|Main=" +
-                    (mainTab + 1));
-                return false;
+                if (!ChartStorageUi.TryClickMainTab(mainTab))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_FAILED" +
+                        "|Reason=MainTabMissing" +
+                        "|Main=" + (mainTab + 1));
+                    return false;
+                }
+                _activeMainTab = mainTab;
+                _activeSubTab = -1;
+                await LokiCoroutine.Sleep(300);
             }
-            await LokiCoroutine.Sleep(250);
 
-            if (!ChartStorageUi.TryClickSubTab(mainTab, subTab))
+            if (_activeSubTab != subTab)
             {
-                AllflameLog.Info(
-                    "CHART_STORAGE_TAB_FAILED|Reason=SubTabMissing|Main=" +
-                    (mainTab + 1) + "|Sub=" + (subTab + 1));
-                return false;
+                if (!ChartStorageUi.TryClickSubTab(mainTab, subTab))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_FAILED" +
+                        "|Reason=SubTabMissing" +
+                        "|Main=" + (mainTab + 1) +
+                        "|Sub=" + (subTab + 1));
+                    return false;
+                }
+                _activeSubTab = subTab;
+                await LokiCoroutine.Sleep(400);
             }
-            await LokiCoroutine.Sleep(350);
 
             string previousSignature = null;
             int stableReads = 0;
@@ -12937,6 +12953,9 @@ namespace AllflameBot
                 "|Control=" +
                 (_storageControl == null ? "Missing" : "Resolved") +
                 "|StableReads=" + stableReads +
+                "|SelectionRetained=" +
+                (_activeMainTab == mainTab &&
+                 _activeSubTab == subTab) +
                 "|Confirmed=" + confirmed);
             return confirmed;
         }
@@ -13090,6 +13109,8 @@ namespace AllflameBot
             _openAttempts = 0;
             _resolveAttempts = 0;
             _tabFailures = 0;
+            _activeMainTab = -1;
+            _activeSubTab = -1;
         }
     }
 
@@ -14386,32 +14407,18 @@ namespace AllflameBot
                 return false;
             }
 
-            Element button;
-            string mode;
-            if (!TryFindNumericTabButton(
-                    root,
-                    3,
-                    mainTab,
-                    true,
-                    out button))
-            {
-                button = SafeChild(
-                    root,
-                    2, 0, 0, 0, 0, mainTab);
-                mode = "DirectPath";
-            }
-            else
-            {
-                mode = "NumericRow";
-            }
+            Element button = SafeChild(
+                root,
+                2, 0, 0, 0, 0, mainTab);
             bool clicked = Click(button);
             AllflameLog.Info(
                 "CHART_STORAGE_TAB_CLICK" +
                 "|Level=Main" +
                 "|Main=" + (mainTab + 1) +
-                "|Mode=" + mode +
+                "|Mode=DirectIconPath" +
                 "|Clicked=" + clicked +
-                "|Address=" + FormatAddress(button));
+                "|Address=" + FormatAddress(button) +
+                "|Geometry=" + FormatGeometry(button));
             return clicked;
         }
 
@@ -14445,7 +14452,8 @@ namespace AllflameBot
                     "|Sub=" + (subTab + 1) +
                     "|Mode=NumericRow" +
                     "|Clicked=" + numericClicked +
-                    "|Address=" + FormatAddress(numericButton));
+                    "|Address=" + FormatAddress(numericButton) +
+                    "|Geometry=" + FormatGeometry(numericButton));
                 return numericClicked;
             }
 
@@ -14690,6 +14698,24 @@ namespace AllflameBot
             }
         }
 
+        private static string FormatGeometry(Element element)
+        {
+            try
+            {
+                if (element == null)
+                {
+                    return "invalid";
+                }
+                Vector2i center = element.CenterClickLocation();
+                return (int)element.Width + "x" +
+                    (int)element.Height + "@" + center;
+            }
+            catch
+            {
+                return "invalid";
+            }
+        }
+
         private static Element SafeChild(
             Element root,
             params int[] indices)
@@ -14767,7 +14793,7 @@ namespace AllflameBot
                             storageShape
                                 ? GetRawItemElements(rawSlot)
                                 : new List<KeyValuePair<int, Element>>();
-                        if (signatures.Count < 12)
+                        if (storageShape && signatures.Count < 20)
                         {
                             signatures.Add(
                                 "0x" + rawSlot.Address.ToString("X") +
@@ -14789,34 +14815,37 @@ namespace AllflameBot
                                 rawSlot.Width /
                                 Math.Max(1f, rawSlot.Height);
                             bool expectedGeometry =
-                                rawSlot.Width >= 380f &&
+                                rawSlot.Width >= 260f &&
                                 rawSlot.Width <= 1100f &&
-                                rawSlot.Height >= 140f &&
+                                rawSlot.Height >= 100f &&
                                 rawSlot.Height <= 600f &&
                                 aspect >= 1.7f &&
                                 aspect <= 3.4f;
-                            var wrapper = new InventoryControlWrapper();
-                            wrapper.SetInventorySlotUi(
-                                rawSlot,
-                                StashType.NormalStash);
-                            candidates.Add(
-                                new StorageGridCandidate
-                                {
-                                    Left = left,
-                                    Control = wrapper,
-                                    Slot = rawSlot,
-                                    Path = path,
-                                    RawItems = rawItems.Count,
-                                    RawKeys = new HashSet<int>(
-                                        rawItems.Select(pair => pair.Key)),
-                                    Score =
-                                        (expectedGeometry ? 1000 : 0) +
-                                        (center.Y <= rootCenter.Y ? 100 : 0) +
-                                        rawItems.Count * 20 +
-                                        (size.X == 12 && size.Y == 5
-                                            ? 200
-                                            : 0)
-                                });
+                            if (expectedGeometry)
+                            {
+                                var wrapper = new InventoryControlWrapper();
+                                wrapper.SetInventorySlotUi(
+                                    rawSlot,
+                                    StashType.NormalStash);
+                                candidates.Add(
+                                    new StorageGridCandidate
+                                    {
+                                        Left = left,
+                                        Control = wrapper,
+                                        Slot = rawSlot,
+                                        Path = path,
+                                        RawItems = rawItems.Count,
+                                        RawKeys = new HashSet<int>(
+                                            rawItems.Select(pair => pair.Key)),
+                                        Score =
+                                            1000 +
+                                            (center.Y <= rootCenter.Y ? 100 : 0) +
+                                            rawItems.Count * 20 +
+                                            (size.X == 12 && size.Y == 5
+                                                ? 200
+                                                : 0)
+                                    });
+                            }
                         }
                     }
                 }
@@ -14872,7 +14901,10 @@ namespace AllflameBot
                        slot.IsValid &&
                        slot.IsVisible &&
                        ((slot.Size.X == 12 && slot.Size.Y == 5) ||
-                        (slot.Size.X == 5 && slot.Size.Y == 12));
+                        (slot.Size.X == 5 && slot.Size.Y == 12)) &&
+                       slot.Width >= 260f &&
+                       slot.Height >= 100f &&
+                       slot.Width / Math.Max(1f, slot.Height) >= 1.7f;
             }
             catch
             {
