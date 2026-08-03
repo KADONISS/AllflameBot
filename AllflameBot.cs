@@ -11010,7 +11010,7 @@ namespace AllflameBot
         private DateTime _waitUntilUtc = DateTime.MinValue;
         private DateTime _timeoutUtc = DateTime.MinValue;
         private InventoryControlWrapper _storageControl;
-        private Element _storageSlot;
+        private InventorySlotUiElement _storageSlot;
 
         public DebugChartStorageTask()
             : base(
@@ -11130,26 +11130,48 @@ namespace AllflameBot
                 return true;
             }
 
+            Inventory storageInventory = _storageControl == null
+                ? null
+                : _storageControl.Inventory;
             List<Item> items =
-                _storageControl.Inventory == null ||
-                _storageControl.Inventory.Items == null
+                storageInventory == null ||
+                storageInventory.Items == null
                     ? new List<Item>()
-                    : _storageControl.Inventory.Items
+                    : storageInventory.Items
                         .Where(item => item != null && item.IsValid)
                         .ToList();
             List<Item> charts =
                 items.Where(AllflameContext.IsChartItem).ToList();
+            List<KeyValuePair<int, Element>> rawCharts =
+                storageInventory == null
+                    ? ChartStorageUi.GetRawItemElements(_storageSlot)
+                    : new List<KeyValuePair<int, Element>>();
             int chartStacks =
-                charts.Sum(item => Math.Max(1, item.StackCount));
+                storageInventory == null
+                    ? rawCharts.Count
+                    : charts.Sum(item => Math.Max(1, item.StackCount));
 
             AllflameLog.Info(
                 "CHART_STORAGE_DEBUG_RESULT" +
                 "|ControlAddress=0x" +
-                _storageControl.Address.ToString("X") +
-                "|Rows=" + _storageControl.Inventory.Rows +
-                "|Columns=" + _storageControl.Inventory.Columns +
-                "|AllItems=" + items.Count +
-                "|ChartItems=" + charts.Count +
+                (_storageSlot == null
+                    ? 0L
+                    : _storageSlot.Address).ToString("X") +
+                "|Mode=" + (storageInventory == null
+                    ? "RawGrid"
+                    : "ServerInventory") +
+                "|Rows=" + (storageInventory == null
+                    ? _storageSlot.Size.Y
+                    : storageInventory.Rows) +
+                "|Columns=" + (storageInventory == null
+                    ? _storageSlot.Size.X
+                    : storageInventory.Columns) +
+                "|AllItems=" + (storageInventory == null
+                    ? rawCharts.Count
+                    : items.Count) +
+                "|ChartItems=" + (storageInventory == null
+                    ? rawCharts.Count
+                    : charts.Count) +
                 "|ChartStacks=" + chartStacks +
                 "|ReadOnly=True");
             foreach (Item item in items)
@@ -11167,19 +11189,32 @@ namespace AllflameBot
                     "|Stack=" + Math.Max(1, item.StackCount) +
                     "|Location=" + item.LocationTopLeft);
             }
+            foreach (KeyValuePair<int, Element> pair in rawCharts)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEBUG_RAW_ITEM" +
+                    "|Key=" + pair.Key +
+                    "|Address=0x" + pair.Value.Address.ToString("X") +
+                    "|Center=" + pair.Value.CenterClickLocation());
+            }
 
             AllflameSettings settings =
                 AllflameSettings.Instance;
-            settings.LastChartStorageTotal = charts.Count;
+            int chartCount = storageInventory == null
+                ? rawCharts.Count
+                : charts.Count;
+            settings.LastChartStorageTotal = chartCount;
             settings.LastChartStorageScan =
-                "DebugVisiblePage:Items=" + items.Count +
-                ",Charts=" + charts.Count +
+                "DebugVisiblePage:Items=" + (storageInventory == null
+                    ? rawCharts.Count
+                    : items.Count) +
+                ",Charts=" + chartCount +
                 ",Stacks=" + chartStacks;
             settings.Save();
 
             AllflameChartStorageDebug.Complete(
                 true,
-                charts.Count,
+                chartCount,
                 chartStacks,
                 "Visible page read successfully.");
             await Coroutines.CloseBlockingWindows();
@@ -12315,7 +12350,35 @@ namespace AllflameBot
         private readonly HashSet<string> _seenChartKeys =
             new HashSet<string>(StringComparer.Ordinal);
         private InventoryControlWrapper _storageControl;
-        private Element _storageSlot;
+        private InventorySlotUiElement _storageSlot;
+
+        private sealed class StorageChartEntry
+        {
+            public Item Item;
+            public int RawKey;
+            public Element RawElement;
+
+            public string StableKey
+            {
+                get
+                {
+                    if (Item != null)
+                    {
+                        return Item.LocalId + "@" + Item.LocationTopLeft +
+                            ":" + (Item.Metadata ?? Item.FullName ??
+                            Item.Name ?? String.Empty);
+                    }
+                    Vector2i center = RawElement == null
+                        ? new Vector2i()
+                        : RawElement.CenterClickLocation();
+                    return RawKey + "@0x" +
+                        (RawElement == null
+                            ? "0"
+                            : RawElement.Address.ToString("X")) +
+                        ":" + center;
+                }
+            }
+        }
 
         public OpenChartStorageTask()
             : base("OpenChartStorageTask", "Probes Chart pages forward and withdraws newest Charts in reverse.") { }
@@ -12550,7 +12613,7 @@ namespace AllflameBot
                 return;
             }
             _tabFailures = 0;
-            List<Item> charts = ReadCurrentStorageCharts();
+            List<StorageChartEntry> charts = ReadCurrentStorageCharts();
             RememberPage(_mainTab, _subTab, charts);
 
             bool isFull = charts.Count >= FullPageChartCount;
@@ -12558,6 +12621,9 @@ namespace AllflameBot
                 "CHART_STORAGE_PAGE_SCAN|Main=" + (_mainTab + 1) +
                 "|Sub=" + (_subTab + 1) +
                 "|Charts=" + charts.Count +
+                "|Mode=" + (HasNativeStorageInventory()
+                    ? "ServerInventory"
+                    : "RawGrid") +
                 "|Full=" + isFull +
                 "|Sequence=" + (_mainTab * 5 + _subTab + 1) +
                 "/15");
@@ -12621,40 +12687,64 @@ namespace AllflameBot
                 return;
             }
             _tabFailures = 0;
-            List<Item> charts = ReadCurrentStorageCharts();
+            List<StorageChartEntry> charts = ReadCurrentStorageCharts();
             RememberPage(_withdrawMainTab, _withdrawSubTab, charts);
 
             AllflameContext.Refresh(true);
             int needed = Math.Max(0, TargetInventoryCharts - AllflameContext.InventoryChartCount);
-            foreach (Item chart in charts.Take(needed).ToList())
+            foreach (StorageChartEntry chart in charts.Take(needed).ToList())
             {
+                string chartKey = chart.StableKey;
                 int beforeInventory = AllflameContext.InventoryChartCount;
                 bool transferred = false;
                 for (int attempt = 1; attempt <= 3; attempt++)
                 {
                     string result;
-                    try
+                    string transferMode = chart.Item != null &&
+                        HasNativeStorageInventory()
+                            ? "FastMove"
+                            : "RawCtrlClick";
+                    if (transferMode == "FastMove")
                     {
-                        result = _storageControl.FastMove(chart.LocalId)
-                            .ToString();
+                        try
+                        {
+                            result = _storageControl.FastMove(
+                                chart.Item.LocalId).ToString();
+                        }
+                        catch (Exception ex)
+                        {
+                            result = "Exception:" + ex.GetType().Name;
+                        }
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        result = "Exception:" + ex.GetType().Name;
+                        bool clicked = await CtrlClickRawChart(
+                            chart.RawElement);
+                        result = clicked ? "Clicked" : "ClickRejected";
                     }
                     await LokiCoroutine.Sleep(220);
                     AllflameContext.Refresh(true);
                     transferred =
                         AllflameContext.InventoryChartCount > beforeInventory ||
                         !ReadCurrentStorageCharts().Any(item =>
-                            item.LocalId == chart.LocalId);
+                            String.Equals(
+                                item.StableKey,
+                                chartKey,
+                                StringComparison.Ordinal));
                     AllflameLog.Info(
-                        "CHART_WITHDRAW" +
+                        "CHART_STORAGE_TRANSFER" +
                         "|Main=" + (_withdrawMainTab + 1) +
                         "|Sub=" + (_withdrawSubTab + 1) +
-                        "|Id=" + chart.Id +
-                        "|LocalId=" + chart.LocalId +
-                        "|Name=" + chart.FullName +
+                        "|Mode=" + transferMode +
+                        "|Id=" + (chart.Item == null
+                            ? chart.RawKey
+                            : chart.Item.Id) +
+                        "|LocalId=" + (chart.Item == null
+                            ? chart.RawKey
+                            : chart.Item.LocalId) +
+                        "|Name=" + (chart.Item == null
+                            ? "RawChartElement"
+                            : chart.Item.FullName) +
                         "|Attempt=" + attempt +
                         "|Maximum=3" +
                         "|Result=" + result +
@@ -12680,30 +12770,110 @@ namespace AllflameBot
             _withdrawSubTab--;
         }
 
-        private void RememberPage(int mainTab, int subTab, IEnumerable<Item> charts)
+        private void RememberPage(
+            int mainTab,
+            int subTab,
+            IEnumerable<StorageChartEntry> charts)
         {
-            List<Item> page = charts == null ? new List<Item>() : charts.ToList();
+            List<StorageChartEntry> page = charts == null
+                ? new List<StorageChartEntry>()
+                : charts.ToList();
             _pageCounts[mainTab, subTab] = page.Count;
-            foreach (Item chart in page)
+            foreach (StorageChartEntry chart in page)
             {
                 _seenChartKeys.Add(
                     mainTab + ":" + subTab + ":" +
-                    chart.LocationTopLeft + ":" +
-                    (chart.Metadata ?? chart.FullName ?? chart.Name ??
-                     String.Empty));
+                    chart.StableKey);
             }
         }
 
-        private List<Item> ReadCurrentStorageCharts()
+        private List<StorageChartEntry> ReadCurrentStorageCharts()
         {
             List<Item> items =
                 _storageControl == null ||
                 _storageControl.Inventory == null
                     ? null
                     : _storageControl.Inventory.Items;
-            return items == null
-                ? new List<Item>()
-                : items.Where(AllflameContext.IsChartItem).ToList();
+            if (items != null)
+            {
+                return items
+                    .Where(AllflameContext.IsChartItem)
+                    .Select(item => new StorageChartEntry { Item = item })
+                    .ToList();
+            }
+
+            return ChartStorageUi.GetRawItemElements(_storageSlot)
+                .Select(pair => new StorageChartEntry
+                {
+                    RawKey = pair.Key,
+                    RawElement = pair.Value
+                })
+                .ToList();
+        }
+
+        private bool HasNativeStorageInventory()
+        {
+            try
+            {
+                return _storageControl != null &&
+                    _storageControl.Inventory != null &&
+                    _storageControl.Inventory.IsValid &&
+                    ChartStorageUi.IsStorageInventoryShape(
+                        _storageControl.Inventory);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static async Task<bool> CtrlClickRawChart(Element element)
+        {
+            try
+            {
+                if (element == null ||
+                    !element.IsValid ||
+                    !element.IsVisible)
+                {
+                    return false;
+                }
+
+                Vector2i location = element.CenterClickLocation();
+                bool controlDown = false;
+                try
+                {
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                    DreamPoeBot.BotFramework.MouseManager
+                        .SetMousePosition(location, true);
+                    LokiPoe.ProcessHookManager.SetKeyState(
+                        System.Windows.Forms.Keys.ControlKey,
+                        short.MinValue,
+                        System.Windows.Forms.Keys.None);
+                    controlDown = true;
+                    await LokiCoroutine.Sleep(25);
+                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                    await LokiCoroutine.Sleep(90);
+                    return true;
+                }
+                finally
+                {
+                    if (controlDown)
+                    {
+                        LokiPoe.ProcessHookManager.SetKeyState(
+                            System.Windows.Forms.Keys.ControlKey,
+                            (short)0,
+                            System.Windows.Forms.Keys.None);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_RAW_CLICK_FAILED|" +
+                    ex.GetType().Name + "|" +
+                    ex.Message.Replace("|", "/"));
+                return false;
+            }
         }
 
         private async Task<bool> SelectStorageTab(int mainTab, int subTab)
@@ -12757,11 +12927,14 @@ namespace AllflameBot
                     await LokiCoroutine.Sleep(150);
                 }
             }
-            bool confirmed = _storageControl != null && stableReads >= 2;
+            bool confirmed = _storageSlot != null && stableReads >= 2;
             AllflameLog.Info(
                 "CHART_STORAGE_TAB_CONFIRMED|Main=" + (mainTab + 1) +
                 "|Sub=" + (subTab + 1) +
-                "|Mode=DirectUiElements|Control=" +
+                "|Mode=" + (HasNativeStorageInventory()
+                    ? "ServerInventory"
+                    : "RawGrid") +
+                "|Control=" +
                 (_storageControl == null ? "Missing" : "Resolved") +
                 "|StableReads=" + stableReads +
                 "|Confirmed=" + confirmed);
@@ -12770,20 +12943,11 @@ namespace AllflameBot
 
         private string CurrentStoragePageSignature()
         {
-            List<Item> items =
-                _storageControl == null ||
-                _storageControl.Inventory == null ||
-                _storageControl.Inventory.Items == null
-                    ? new List<Item>()
-                    : _storageControl.Inventory.Items
-                        .Where(item => item != null && item.IsValid)
-                        .ToList();
             return String.Join(
                 ";",
-                items.OrderBy(item => item.LocationTopLeft.Y)
-                    .ThenBy(item => item.LocationTopLeft.X)
-                    .Select(item =>
-                        item.LocalId + "@" + item.LocationTopLeft)
+                ReadCurrentStorageCharts()
+                    .Select(item => item.StableKey)
+                    .OrderBy(key => key, StringComparer.Ordinal)
                     .ToArray());
         }
 
@@ -14067,16 +14231,22 @@ namespace AllflameBot
         {
             public float Left;
             public InventoryControlWrapper Control;
-            public Element Slot;
+            public InventorySlotUiElement Slot;
             public string Path;
             public int Score;
+            public int RawItems;
+            public HashSet<int> RawKeys;
         }
+
+        private static int _cachedServerInventoryId = -1;
+        private static DateTime _nextServerInventoryProbeUtc = DateTime.MinValue;
+        private static int _lastServerProbeRawItems = -1;
 
         public static bool TryResolve(
             InventoryControlWrapper cachedControl,
-            Element cachedSlot,
+            InventorySlotUiElement cachedSlot,
             out InventoryControlWrapper control,
-            out Element slot)
+            out InventorySlotUiElement slot)
         {
             control = null;
             slot = null;
@@ -14098,19 +14268,19 @@ namespace AllflameBot
             var addresses = new HashSet<long>();
             var signatures = new List<string>();
             int visited = 0;
-            int wrapperAttempts = 0;
-            int validWrappers = 0;
-            int validInventories = 0;
+            int rawSlotAttempts = 0;
+            int validRawSlots = 0;
+            Vector2i rootCenter = storageRoot.CenterClickLocation();
             CollectCandidates(
                 storageRoot,
                 "root",
                 candidates,
                 addresses,
                 signatures,
+                rootCenter,
                 ref visited,
-                ref wrapperAttempts,
-                ref validWrappers,
-                ref validInventories);
+                ref rawSlotAttempts,
+                ref validRawSlots);
 
             var best = candidates
                 .OrderByDescending(candidate =>
@@ -14124,9 +14294,8 @@ namespace AllflameBot
                     TimeSpan.FromSeconds(3),
                     "CHART_STORAGE_GRID_RESOLVE_FAILED" +
                     "|Visited=" + visited +
-                    "|WrapperAttempts=" + wrapperAttempts +
-                    "|ValidWrappers=" + validWrappers +
-                    "|ValidInventories=" + validInventories +
+                    "|RawSlotAttempts=" + rawSlotAttempts +
+                    "|ValidRawSlots=" + validRawSlots +
                     "|Candidates=0" +
                     "|Window=ChartStorage" +
                     "|Signatures=" +
@@ -14136,19 +14305,72 @@ namespace AllflameBot
 
             control = best.Control;
             slot = best.Slot;
+            Inventory serverInventory;
+            bool nativeBound = TryBindServerInventory(
+                control,
+                best.RawKeys,
+                out serverInventory);
             AllflameLog.Throttled(
                 "chart_storage_control_found",
                 TimeSpan.FromSeconds(3),
-                "CHART_STORAGE_UI|Found=True|Address=0x" +
-                control.Address.ToString("X") +
-                "|Rows=" + control.Inventory.Rows +
-                "|Cols=" + control.Inventory.Columns +
-                "|Items=" + control.Inventory.Items.Count +
+                "CHART_STORAGE_RAW_GRID|Found=True|Address=0x" +
+                slot.Address.ToString("X") +
+                "|Size=" + slot.Size.X + "x" + slot.Size.Y +
+                "|RawItems=" + best.RawItems +
+                "|NativeBound=" + nativeBound +
+                "|ServerInventoryId=" + (serverInventory == null
+                    ? -1
+                    : serverInventory.Id) +
                 "|Candidates=" + candidates.Count +
                 "|Path=" + best.Path +
                 "|Slot=" + (int)slot.Width + "x" + (int)slot.Height +
                 "|Score=" + best.Score);
             return true;
+        }
+
+        public static List<KeyValuePair<int, Element>> GetRawItemElements(
+            InventorySlotUiElement slot)
+        {
+            var output = new List<KeyValuePair<int, Element>>();
+            try
+            {
+                if (slot == null ||
+                    !slot.IsValid ||
+                    !slot.IsVisible ||
+                    slot.DictionaryIdElements == null)
+                {
+                    return output;
+                }
+
+                Vector2i center = slot.CenterClickLocation();
+                float halfWidth = Math.Max(1f, slot.Width / 2f);
+                float halfHeight = Math.Max(1f, slot.Height / 2f);
+                foreach (KeyValuePair<int, Element> pair in
+                    slot.DictionaryIdElements)
+                {
+                    Element element = pair.Value;
+                    if (element == null ||
+                        !element.IsValid ||
+                        !element.IsVisible)
+                    {
+                        continue;
+                    }
+                    Vector2i itemCenter = element.CenterClickLocation();
+                    if (itemCenter.X < center.X - halfWidth ||
+                        itemCenter.X > center.X + halfWidth ||
+                        itemCenter.Y < center.Y - halfHeight ||
+                        itemCenter.Y > center.Y + halfHeight)
+                    {
+                        continue;
+                    }
+                    output.Add(pair);
+                }
+            }
+            catch
+            {
+                output.Clear();
+            }
+            return output;
         }
 
         public static bool TryClickMainTab(int mainTab)
@@ -14514,10 +14736,10 @@ namespace AllflameBot
             IList<StorageGridCandidate> candidates,
             ISet<long> addresses,
             IList<string> signatures,
+            Vector2i rootCenter,
             ref int visited,
-            ref int wrapperAttempts,
-            ref int validWrappers,
-            ref int validInventories)
+            ref int rawSlotAttempts,
+            ref int validRawSlots)
         {
             if (element == null ||
                 visited >= MaximumVisitedElements)
@@ -14530,80 +14752,71 @@ namespace AllflameBot
             {
                 if (element.IsValid)
                 {
-                    wrapperAttempts++;
-                    var wrapper =
-                        new InventoryControlWrapper(element.Address);
-                    if (wrapper.IsValid)
+                    rawSlotAttempts++;
+                    var rawSlot = new InventorySlotUiElement(
+                        element.Address,
+                        StashType.NormalStash);
+                    if (rawSlot.IsValid && rawSlot.IsVisible)
                     {
-                        validWrappers++;
-                        Inventory inventory = wrapper.Inventory;
-                        if (inventory != null && inventory.IsValid)
+                        validRawSlots++;
+                        Vector2i size = rawSlot.Size;
+                        bool storageShape =
+                            (size.X == 12 && size.Y == 5) ||
+                            (size.X == 5 && size.Y == 12);
+                        List<KeyValuePair<int, Element>> rawItems =
+                            storageShape
+                                ? GetRawItemElements(rawSlot)
+                                : new List<KeyValuePair<int, Element>>();
+                        if (signatures.Count < 12)
                         {
-                            validInventories++;
-                            Element slot =
-                                wrapper.InventorySlotUiElement;
-                            bool slotUsable =
-                                slot != null &&
-                                slot.IsValid &&
-                                slot.IsVisible;
-                            bool storageShape =
-                                IsStorageInventoryShape(inventory);
-                            if (signatures.Count < 10)
-                            {
-                                signatures.Add(
-                                    "0x" +
-                                    wrapper.Address.ToString("X") +
-                                    "@" + path +
-                                    ":inv=" + inventory.Rows + "x" +
-                                    inventory.Columns +
-                                    ":items=" +
-                                    (inventory.Items == null
-                                        ? -1
-                                        : inventory.Items.Count) +
-                                    ":slot=" +
-                                    (slotUsable
-                                        ? (int)slot.Width + "x" +
-                                          (int)slot.Height
-                                        : "invalid"));
-                            }
-                            if (slotUsable && storageShape &&
-                                addresses.Add(wrapper.Address))
-                            {
-                                Vector2i center =
-                                    slot.CenterClickLocation();
-                                float left =
-                                    center.X - slot.Width / 2f;
-                                float aspect =
-                                    slot.Width /
-                                    Math.Max(1f, slot.Height);
-                                bool expectedGeometry =
-                                    slot.Width >= 380f &&
-                                    slot.Width <= 1100f &&
-                                    slot.Height >= 140f &&
-                                    slot.Height <= 600f &&
-                                    aspect >= 1.7f &&
-                                    aspect <= 3.4f;
-                                int chartItems =
-                                    inventory.Items == null
-                                        ? 0
-                                        : inventory.Items.Count(
-                                            AllflameContext.IsChartItem);
-                                candidates.Add(
-                                    new StorageGridCandidate
-                                    {
-                                        Left = left,
-                                        Control = wrapper,
-                                        Slot = slot,
-                                        Path = path,
-                                        Score =
-                                            (expectedGeometry ? 1000 : 0) +
-                                            chartItems * 20 +
-                                            (inventory.Rows == 5 &&
-                                             inventory.Columns == 12
-                                                ? 100
-                                                : 0)
-                                    });
-                            }
+                            signatures.Add(
+                                "0x" + rawSlot.Address.ToString("X") +
+                                "@" + path +
+                                ":size=" + size.X + "x" + size.Y +
+                                ":pixels=" + (int)rawSlot.Width + "x" +
+                                (int)rawSlot.Height +
+                                ":items=" + rawItems.Count);
+                        }
+                        if (storageShape &&
+                            rawSlot.DictionaryIdElements != null &&
+                            addresses.Add(rawSlot.Address))
+                        {
+                            Vector2i center =
+                                rawSlot.CenterClickLocation();
+                            float left =
+                                center.X - rawSlot.Width / 2f;
+                            float aspect =
+                                rawSlot.Width /
+                                Math.Max(1f, rawSlot.Height);
+                            bool expectedGeometry =
+                                rawSlot.Width >= 380f &&
+                                rawSlot.Width <= 1100f &&
+                                rawSlot.Height >= 140f &&
+                                rawSlot.Height <= 600f &&
+                                aspect >= 1.7f &&
+                                aspect <= 3.4f;
+                            var wrapper = new InventoryControlWrapper();
+                            wrapper.SetInventorySlotUi(
+                                rawSlot,
+                                StashType.NormalStash);
+                            candidates.Add(
+                                new StorageGridCandidate
+                                {
+                                    Left = left,
+                                    Control = wrapper,
+                                    Slot = rawSlot,
+                                    Path = path,
+                                    RawItems = rawItems.Count,
+                                    RawKeys = new HashSet<int>(
+                                        rawItems.Select(pair => pair.Key)),
+                                    Score =
+                                        (expectedGeometry ? 1000 : 0) +
+                                        (center.Y <= rootCenter.Y ? 100 : 0) +
+                                        rawItems.Count * 20 +
+                                        (size.X == 12 && size.Y == 5
+                                            ? 200
+                                            : 0)
+                                });
                         }
                     }
                 }
@@ -14637,10 +14850,10 @@ namespace AllflameBot
                     candidates,
                     addresses,
                     signatures,
+                    rootCenter,
                     ref visited,
-                    ref wrapperAttempts,
-                    ref validWrappers,
-                    ref validInventories);
+                    ref rawSlotAttempts,
+                    ref validRawSlots);
                 if (visited >= MaximumVisitedElements)
                 {
                     return;
@@ -14650,18 +14863,16 @@ namespace AllflameBot
 
         private static bool IsUsable(
             InventoryControlWrapper control,
-            Element slot)
+            InventorySlotUiElement slot)
         {
             try
             {
                 return control != null &&
                        slot != null &&
-                       control.IsValid &&
                        slot.IsValid &&
                        slot.IsVisible &&
-                       control.Inventory != null &&
-                       control.Inventory.IsValid &&
-                       IsStorageInventoryShape(control.Inventory);
+                       ((slot.Size.X == 12 && slot.Size.Y == 5) ||
+                        (slot.Size.X == 5 && slot.Size.Y == 12));
             }
             catch
             {
@@ -14669,7 +14880,166 @@ namespace AllflameBot
             }
         }
 
-        private static bool IsStorageInventoryShape(Inventory inventory)
+        private static bool TryBindServerInventory(
+            InventoryControlWrapper control,
+            ISet<int> rawKeys,
+            out Inventory inventory)
+        {
+            inventory = null;
+            int rawItemCount = rawKeys == null ? 0 : rawKeys.Count;
+            if (control == null)
+            {
+                return false;
+            }
+
+            if (_cachedServerInventoryId >= 0)
+            {
+                Inventory cached = GetPlayerInventoryById(
+                    _cachedServerInventoryId);
+                if (MatchesRawGrid(cached, rawKeys))
+                {
+                    control.SetInventory(cached);
+                    inventory = cached;
+                    return true;
+                }
+            }
+
+            bool gainedUsefulRawData = rawItemCount > 0 &&
+                _lastServerProbeRawItems <= 0;
+            if (!gainedUsefulRawData &&
+                DateTime.UtcNow < _nextServerInventoryProbeUtc)
+            {
+                return false;
+            }
+            _nextServerInventoryProbeUtc = DateTime.UtcNow.AddSeconds(2);
+            _lastServerProbeRawItems = rawItemCount;
+
+            int playerInventoryId = -1;
+            try
+            {
+                InventoryControlWrapper playerControl =
+                    LokiPoe.InGameState.InventoryUi.InventoryControl_Main;
+                if (playerControl != null &&
+                    playerControl.Inventory != null)
+                {
+                    playerInventoryId = playerControl.Inventory.Id;
+                }
+            }
+            catch
+            {
+                playerInventoryId = -1;
+            }
+
+            Inventory best = null;
+            int bestScore = Int32.MinValue;
+            for (int id = 0; id <= 255; id++)
+            {
+                Inventory candidate = GetPlayerInventoryById(id);
+                if (candidate == null ||
+                    !candidate.IsValid ||
+                    candidate.Id == playerInventoryId ||
+                    !IsStorageInventoryShape(candidate))
+                {
+                    continue;
+                }
+
+                List<Item> items = candidate.Items ?? new List<Item>();
+                int charts = items.Count(AllflameContext.IsChartItem);
+                int keyMatches = CountRawKeyMatches(items, rawKeys);
+                AllflameLog.Info(
+                    "CHART_STORAGE_SERVER_INVENTORY_PROBE" +
+                    "|Id=" + candidate.Id +
+                    "|Requested=" + candidate.IsRequested +
+                    "|Rows=" + candidate.Rows +
+                    "|Columns=" + candidate.Columns +
+                    "|Items=" + items.Count +
+                    "|Charts=" + charts +
+                    "|KeyMatches=" + keyMatches +
+                    "|RawItems=" + rawItemCount);
+
+                if (rawItemCount <= 0 ||
+                    items.Count != rawItemCount ||
+                    charts != items.Count ||
+                    keyMatches <= 0)
+                {
+                    continue;
+                }
+                int score =
+                    (candidate.IsRequested ? 1000 : 0) +
+                    keyMatches * 100 +
+                    charts * 20 +
+                    (candidate.Rows == 5 && candidate.Columns == 12
+                        ? 100
+                        : 0);
+                if (score > bestScore)
+                {
+                    best = candidate;
+                    bestScore = score;
+                }
+            }
+
+            if (best == null)
+            {
+                return false;
+            }
+            _cachedServerInventoryId = best.Id;
+            control.SetInventory(best);
+            inventory = best;
+            return true;
+        }
+
+        private static Inventory GetPlayerInventoryById(int id)
+        {
+            try
+            {
+                return LokiPoe.InstanceInfo.GetPlayerInventoryById(id);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool MatchesRawGrid(
+            Inventory inventory,
+            ISet<int> rawKeys)
+        {
+            try
+            {
+                int rawItemCount = rawKeys == null ? 0 : rawKeys.Count;
+                if (inventory == null ||
+                    !inventory.IsValid ||
+                    !IsStorageInventoryShape(inventory) ||
+                    inventory.Items == null ||
+                    inventory.Items.Count != rawItemCount)
+                {
+                    return false;
+                }
+                return rawItemCount == 0 ||
+                    (inventory.Items.All(AllflameContext.IsChartItem) &&
+                     CountRawKeyMatches(inventory.Items, rawKeys) > 0);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static int CountRawKeyMatches(
+            IEnumerable<Item> items,
+            ISet<int> rawKeys)
+        {
+            if (items == null || rawKeys == null || rawKeys.Count == 0)
+            {
+                return 0;
+            }
+            return items.Count(item =>
+                item != null &&
+                (rawKeys.Contains(item.LocalId) ||
+                 rawKeys.Contains(item.Id)));
+        }
+
+        public static bool IsStorageInventoryShape(Inventory inventory)
         {
             return inventory != null &&
                 ((inventory.Rows == 5 &&
