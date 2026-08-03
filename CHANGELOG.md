@@ -2,6 +2,16 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.116 - 2026-08-03
+
+- Remember the confirmed remaining Chart count for every main/sub storage page
+  throughout the bot session and skip pages already depleted to zero.
+- Skip an entire main tab when all five of its pages are depleted, and avoid
+  reopening Chart Storage after all 15 cached pages have been exhausted.
+- Preserve unknown pages after UI failures, update cached counts only from
+  stable reads or confirmed transfers, and reset the cache only with the bot
+  session.
+
 ## 0.23.115 - 2026-08-03
 
 - Stop raw Chart Storage withdrawal immediately when the configured inventory

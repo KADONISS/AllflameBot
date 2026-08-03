@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.115";
+        public const string Current = "0.23.116";
     }
 
     public sealed class AllflameBot : IBot
@@ -12370,6 +12370,9 @@ namespace AllflameBot
         private int _activeSubTab = -1;
         private readonly int[] _lastUsedSubTab = { -1, -1, -1 };
         private readonly int[,] _pageCounts = new int[3, 5];
+        private readonly int[,] _sessionPageObserved = new int[3, 5];
+        private readonly int[,] _sessionPageRemaining = new int[3, 5];
+        private readonly int[,] _sessionPageWithdrawn = new int[3, 5];
         private readonly HashSet<string> _seenChartKeys =
             new HashSet<string>(StringComparer.Ordinal);
         private readonly HashSet<string> _mappedChartKeys =
@@ -12416,16 +12419,21 @@ namespace AllflameBot
         }
 
         public OpenChartStorageTask()
-            : base("OpenChartStorageTask", "Probes and withdraws Chart Storage pages in forward order.") { }
+            : base("OpenChartStorageTask", "Probes and withdraws Chart Storage pages in forward order.")
+        {
+            ResetSessionPageCache();
+        }
 
         public override void Start()
         {
+            ResetSessionPageCache();
             ResetScan();
         }
 
         public override void Stop()
         {
             ResetScan();
+            ResetSessionPageCache();
         }
 
         public override async Task<bool> Run()
@@ -12489,6 +12497,11 @@ namespace AllflameBot
                 AllflameRunState.MarkStorageChecked();
                 ResetScan();
                 return false;
+            }
+
+            if (_stage == 0 && AllSessionPagesDepleted())
+            {
+                return await CompleteSessionEmpty();
             }
 
             if (DateTime.UtcNow < _retryAfterUtc)
@@ -12602,8 +12615,8 @@ namespace AllflameBot
 
         private void BeginScan()
         {
-            _mainTab = 0;
-            _subTab = 0;
+            _mainTab = -1;
+            _subTab = -1;
             _withdrawMainTab = -1;
             _withdrawSubTab = -1;
             _activeMainTab = -1;
@@ -12627,6 +12640,7 @@ namespace AllflameBot
                     _pageCounts[main, sub] = -1;
                 }
             }
+            MoveToNextSessionPage(0);
             _stage = 2;
             AllflameLog.Info(
                 "CHART_SUPPLY_START" +
@@ -12639,11 +12653,20 @@ namespace AllflameBot
             AllflameLog.Info(
                 "CHART_STORAGE_PROBE_BEGIN|Direction=1_TO_5|FullPage=" +
                 FullPageChartCount + "|TargetInventory=" + TargetInventoryCharts +
-                "|InventoryCharts=" + AllflameContext.InventoryChartCount);
+                "|InventoryCharts=" + AllflameContext.InventoryChartCount +
+                "|SessionRemaining=" + GetSessionRemainingCharts() +
+                "|SessionDepletedPages=" + CountSessionDepletedPages());
         }
 
         private async Task ProbeCurrentPage()
         {
+            if (_mainTab < 0 || _mainTab >= 3 ||
+                _subTab < 0 || _subTab >= 5)
+            {
+                await FinishScan();
+                return;
+            }
+
             if (!await SelectStorageTab(_mainTab, _subTab))
             {
                 _tabFailures++;
@@ -12680,16 +12703,8 @@ namespace AllflameBot
                 return;
             }
 
-            if (_subTab < 4)
-            {
-                _subTab++;
-                return;
-            }
-
-            _lastUsedSubTab[_mainTab] = _subTab;
-            _mainTab++;
-            _subTab = 0;
-            if (_mainTab < 3)
+            int nextPage = _mainTab * 5 + _subTab + 1;
+            if (MoveToNextSessionPage(nextPage))
             {
                 return;
             }
@@ -12749,6 +12764,12 @@ namespace AllflameBot
                     ChartStorageUi.GetRawItemElements(_storageSlot);
                 if (rawItems.Count == 0)
                 {
+                    UpdateSessionPageCache(
+                        _mainTab,
+                        _subTab,
+                        0,
+                        false,
+                        "ConfirmedEmpty");
                     AllflameLog.Info(
                         "CHART_STORAGE_RAW_PAGE_EMPTY" +
                         "|Main=" + (_mainTab + 1) +
@@ -12793,6 +12814,12 @@ namespace AllflameBot
                 if (moved)
                 {
                     _withdrawnCharts++;
+                    UpdateSessionPageCache(
+                        _mainTab,
+                        _subTab,
+                        afterItems.Count,
+                        true,
+                        "ConfirmedWithdraw");
                     failedAttempts = 0;
                     AllflameProgressWatchdog.MarkProgress(
                         "ChartStorageRawChartTransferred");
@@ -12899,6 +12926,12 @@ namespace AllflameBot
                     if (transferred)
                     {
                         _withdrawnCharts++;
+                        UpdateSessionPageCache(
+                            _withdrawMainTab,
+                            _withdrawSubTab,
+                            ReadCurrentStorageCharts().Count,
+                            true,
+                            "ConfirmedFastMove");
                         break;
                     }
                 }
@@ -12932,6 +12965,12 @@ namespace AllflameBot
                 ? new List<StorageChartEntry>()
                 : charts.ToList();
             _pageCounts[mainTab, subTab] = page.Count;
+            UpdateSessionPageCache(
+                mainTab,
+                subTab,
+                page.Count,
+                false,
+                "StablePageRead");
             foreach (StorageChartEntry chart in page)
             {
                 _seenChartKeys.Add(
@@ -13347,12 +13386,12 @@ namespace AllflameBot
             {
                 for (int sub = 0; sub < 5; sub++)
                 {
-                    if (_pageCounts[main, sub] >= 0)
+                    if (_sessionPageRemaining[main, sub] >= 0)
                     {
                         output.Add(
                             "M" + (main + 1) +
                             "S" + (sub + 1) +
-                            "=" + _pageCounts[main, sub]);
+                            "=" + _sessionPageRemaining[main, sub]);
                     }
                 }
             }
@@ -13363,7 +13402,7 @@ namespace AllflameBot
         {
             AllflameContext.Refresh(true);
             AllflameSettings settings = AllflameSettings.Instance;
-            settings.LastChartStorageTotal = _seenChartKeys.Count;
+            settings.LastChartStorageTotal = GetSessionRemainingCharts();
             settings.LastChartStorageScan = BuildStorageSnapshot();
             settings.Save();
 
@@ -13382,6 +13421,8 @@ namespace AllflameBot
                 "|NativeBindFailed=" + _nativeBindFailed +
                 "|RawWithdrawFailed=" + _rawWithdrawFailed +
                 "|InventoryFull=" + _inventoryFull +
+                "|SessionRemaining=" + GetSessionRemainingCharts() +
+                "|SessionDepletedPages=" + CountSessionDepletedPages() +
                 "|Mode=RawGridWithdrawForward" +
                 "|Tabs=" + settings.LastChartStorageScan);
 
@@ -13499,6 +13540,170 @@ namespace AllflameBot
                 }
             }
             return count;
+        }
+
+        private bool MoveToNextSessionPage(int startPage)
+        {
+            int firstPage = Math.Max(0, startPage);
+            for (int main = firstPage / 5; main < 3; main++)
+            {
+                int firstSub = main == firstPage / 5
+                    ? firstPage % 5
+                    : 0;
+                if (firstSub == 0 && IsSessionMainDepleted(main))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_MAIN_SKIPPED" +
+                        "|Reason=AllPagesDepleted" +
+                        "|Main=" + (main + 1));
+                    continue;
+                }
+
+                for (int sub = firstSub; sub < 5; sub++)
+                {
+                    if (_sessionPageRemaining[main, sub] == 0)
+                    {
+                        AllflameLog.Info(
+                            "CHART_STORAGE_PAGE_SKIPPED" +
+                            "|Reason=Depleted" +
+                            "|Main=" + (main + 1) +
+                            "|Sub=" + (sub + 1));
+                        continue;
+                    }
+                    _mainTab = main;
+                    _subTab = sub;
+                    return true;
+                }
+            }
+
+            _mainTab = 3;
+            _subTab = 0;
+            return false;
+        }
+
+        private void UpdateSessionPageCache(
+            int mainTab,
+            int subTab,
+            int remaining,
+            bool withdrewChart,
+            string source)
+        {
+            if (mainTab < 0 || mainTab >= 3 ||
+                subTab < 0 || subTab >= 5)
+            {
+                return;
+            }
+
+            int previous = _sessionPageRemaining[mainTab, subTab];
+            int confirmedRemaining = Math.Max(0, remaining);
+            if (withdrewChart)
+            {
+                _sessionPageWithdrawn[mainTab, subTab]++;
+            }
+            _sessionPageObserved[mainTab, subTab] = Math.Max(
+                _sessionPageObserved[mainTab, subTab],
+                confirmedRemaining +
+                _sessionPageWithdrawn[mainTab, subTab]);
+            _sessionPageRemaining[mainTab, subTab] = confirmedRemaining;
+
+            AllflameLog.Info(
+                "CHART_STORAGE_PAGE_CACHE_UPDATE" +
+                "|Main=" + (mainTab + 1) +
+                "|Sub=" + (subTab + 1) +
+                "|Source=" + source +
+                "|Previous=" + previous +
+                "|Observed=" + _sessionPageObserved[mainTab, subTab] +
+                "|Withdrawn=" + _sessionPageWithdrawn[mainTab, subTab] +
+                "|Remaining=" + confirmedRemaining +
+                "|State=" + (confirmedRemaining == 0
+                    ? "Depleted"
+                    : "Available"));
+        }
+
+        private bool IsSessionMainDepleted(int mainTab)
+        {
+            for (int sub = 0; sub < 5; sub++)
+            {
+                if (_sessionPageRemaining[mainTab, sub] != 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private bool AllSessionPagesDepleted()
+        {
+            return CountSessionDepletedPages() == 15;
+        }
+
+        private int CountSessionDepletedPages()
+        {
+            int depleted = 0;
+            for (int main = 0; main < 3; main++)
+            {
+                for (int sub = 0; sub < 5; sub++)
+                {
+                    if (_sessionPageRemaining[main, sub] == 0)
+                    {
+                        depleted++;
+                    }
+                }
+            }
+            return depleted;
+        }
+
+        private int GetSessionRemainingCharts()
+        {
+            int remaining = 0;
+            for (int main = 0; main < 3; main++)
+            {
+                for (int sub = 0; sub < 5; sub++)
+                {
+                    remaining += Math.Max(
+                        0,
+                        _sessionPageRemaining[main, sub]);
+                }
+            }
+            return remaining;
+        }
+
+        private async Task<bool> CompleteSessionEmpty()
+        {
+            AllflameSettings settings = AllflameSettings.Instance;
+            settings.LastChartStorageTotal = 0;
+            settings.LastChartStorageScan = BuildStorageSnapshot();
+            settings.Save();
+            AllflameRunState.MarkChartStorageProbeCompleted();
+            AllflameLog.Info(
+                "CHART_STORAGE_SESSION_EMPTY" +
+                "|DepletedPages=15/15" +
+                "|Action=" + (settings.CheckVoyageStashFirst
+                    ? "UseVoyageStash"
+                    : "NoStorageRecheck"));
+            AllflameLog.Info(
+                "CHART_STORAGE_SOURCE_RESULT" +
+                "|Result=SessionCacheEmpty" +
+                "|Withdrawn=0" +
+                "|NextSource=" + (settings.CheckVoyageStashFirst
+                    ? "VoyageStash"
+                    : "None"));
+            ResetScan();
+            await Task.CompletedTask;
+            return false;
+        }
+
+        private void ResetSessionPageCache()
+        {
+            for (int main = 0; main < 3; main++)
+            {
+                for (int sub = 0; sub < 5; sub++)
+                {
+                    _sessionPageObserved[main, sub] = -1;
+                    _sessionPageRemaining[main, sub] = -1;
+                    _sessionPageWithdrawn[main, sub] = 0;
+                }
+            }
         }
 
         private async Task<bool> CompleteSourceFailure(string reason)
