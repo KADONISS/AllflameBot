@@ -2,6 +2,38 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.132 - 2026-08-04
+
+- Rebuild Voyage Planner placement as a cooperative state machine: each task
+  cycle submits at most one Chart move or Begin Voyage click, then reacquires
+  a fresh stable DPB UI snapshot on the following cycle for confirmation.
+- Apply the same incremental flow to the DPB inventory and visual fallback;
+  remove the previous nine-click batches, nested polling loops and retained UI
+  elements across placement actions.
+- Rebuild Chart Storage withdrawal so each cycle transfers one raw Chart,
+  returns to TaskManager, then confirms the item disappeared from a freshly
+  resolved page before selecting the next Chart or storage page.
+- Select Chart Storage main/sub tabs and stabilize each page incrementally;
+  never click both tabs or poll a page to completion inside one task cycle.
+- Evaluate one Voyage short-escape or obstacle-detour candidate per cycle,
+  returning immediately after any movement submission or candidate rejection.
+- Submit one Capsule inventory FastMove per cycle and confirm source removal
+  from a fresh inventory snapshot instead of polling and falling through to a
+  second Ctrl-click action in the same cycle.
+- Make Chart Device load, Descend, portal entry and capacity recovery return
+  immediately after input; deferred UI closure now runs on the next cycle.
+- Make utility flasks and Enduring Cry own the cycle when they submit input,
+  use at most one utility flask per cycle, and suppress nonessential utility
+  actions during mandatory zero-Lantern Capsule extraction.
+- Scan live Capsule objects in one bounded manual pass without LINQ sorting,
+  keep a locked target through 3.5 seconds of transient ObjectManager loss,
+  and require a tighter 20-25 unit final interaction range.
+- Preserve the mandatory live-Capsule lock within 150 units and extend its
+  reacquire grace so a transient object snapshot cannot rotate immediately to
+  a distant registry anchor.
+- Add `VOYAGE_RUNNER_STATE`, incremental Chart move, Chart Storage issue and
+  confirmation markers with `OneActionPerCycle=True` diagnostics.
+
 ## 0.23.131 - 2026-08-03
 
 - Separate new-Capsule acquisition from locked-target maintenance and fresh

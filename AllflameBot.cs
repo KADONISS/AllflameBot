@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.131";
+        public const string Current = "0.23.132";
     }
 
     public sealed class AllflameBot : IBot
@@ -6490,6 +6490,9 @@ namespace AllflameBot
         private DateTime _nextLifeUseUtc = DateTime.MinValue;
         private DateTime _nextUtilityUseUtc = DateTime.MinValue;
         private uint _lastUtilityAreaHash;
+        private readonly List<int> _utilityCycleSlots =
+            new List<int>();
+        private int _utilityCycleCursor;
 
         public UseLifeFlaskTask()
             : base(
@@ -6548,6 +6551,7 @@ namespace AllflameBot
                             "|Threshold=" +
                             settings.LifeFlaskUseThreshold +
                             "|Success=" + used);
+                        return true;
                     }
                 }
                 catch (Exception ex)
@@ -6568,8 +6572,15 @@ namespace AllflameBot
                 settings.EnableUtilityFlasks &&
                 (inEncounterArea ||
                  (onBoat && !settings.DisableUtilityFlasksOnBoat));
+            if (VoyageRunState.Active &&
+                VoyageRunState.LanternsExhausted)
+            {
+                utilityAllowed = false;
+            }
             if (!utilityAllowed)
             {
+                _utilityCycleSlots.Clear();
+                _utilityCycleCursor = 0;
                 return false;
             }
 
@@ -6580,20 +6591,29 @@ namespace AllflameBot
                 _nextUtilityUseUtc = DateTime.MinValue;
             }
 
-            if (DateTime.UtcNow < _nextUtilityUseUtc)
+            if (_utilityCycleCursor >= _utilityCycleSlots.Count &&
+                DateTime.UtcNow < _nextUtilityUseUtc)
             {
                 return false;
             }
 
             try
             {
+                if (_utilityCycleCursor >= _utilityCycleSlots.Count)
+                {
+                    _utilityCycleSlots.Clear();
+                    _utilityCycleSlots.AddRange(
+                        ParseFlaskSlots(settings.UtilityFlaskSlots));
+                    _utilityCycleCursor = 0;
+                }
                 List<Item> flasks =
                     LokiPoe.InGameState.QuickFlaskHud
                         .InventoryControl.Inventory.Items;
-                int usedCount = 0;
-                foreach (int slot in ParseFlaskSlots(
-                    settings.UtilityFlaskSlots))
+                while (_utilityCycleCursor <
+                    _utilityCycleSlots.Count)
                 {
+                    int slot =
+                        _utilityCycleSlots[_utilityCycleCursor++];
                     Item flask = flasks.FirstOrDefault(item =>
                         item != null &&
                         item.IsValid &&
@@ -6606,22 +6626,30 @@ namespace AllflameBot
                     bool used =
                         LokiPoe.InGameState.QuickFlaskHud
                             .UseFlaskInSlot(slot);
-                    if (used)
+                    bool cycleComplete =
+                        _utilityCycleCursor >=
+                        _utilityCycleSlots.Count;
+                    if (cycleComplete)
                     {
-                        usedCount++;
+                        _nextUtilityUseUtc = DateTime.UtcNow.AddSeconds(
+                            Math.Max(
+                                1,
+                                settings.UtilityFlaskIntervalSeconds));
                     }
-                    await LokiCoroutine.Sleep(45);
+                    AllflameLog.Info(
+                        "UTILITY_FLASKS|Action=UseOne" +
+                        "|Slot=" + slot +
+                        "|Success=" + used +
+                        "|Cycle=" + _utilityCycleCursor + "/" +
+                        _utilityCycleSlots.Count +
+                        "|CycleComplete=" + cycleComplete +
+                        "|Phase=" + AllflameContext.Phase +
+                        "|OneActionPerCycle=True");
+                    return true;
                 }
 
                 _nextUtilityUseUtc = DateTime.UtcNow.AddSeconds(
                     Math.Max(1, settings.UtilityFlaskIntervalSeconds));
-                AllflameLog.Info(
-                    "UTILITY_FLASKS|Action=Cycle" +
-                    "|Slots=" + settings.UtilityFlaskSlots +
-                    "|Used=" + usedCount +
-                    "|IntervalSeconds=" +
-                    settings.UtilityFlaskIntervalSeconds +
-                    "|Phase=" + AllflameContext.Phase);
             }
             catch (Exception ex)
             {
@@ -6629,7 +6657,6 @@ namespace AllflameBot
                 AllflameLog.Error("UTILITY_FLASKS_FAILED", ex);
             }
 
-            // Flask use never owns the tick, so movement and chest tasks continue.
             return false;
         }
 
@@ -6669,6 +6696,8 @@ namespace AllflameBot
                  AllflameContext.Phase == AllflamePhase.Voyage);
             if (!settings.EnableEnduringCry ||
                 !inEncounterArea ||
+                (VoyageRunState.Active &&
+                 VoyageRunState.LanternsExhausted) ||
                 !LokiPoe.IsInGame ||
                 LokiPoe.Me == null ||
                 LokiPoe.Me.IsDead ||
@@ -6748,6 +6777,7 @@ namespace AllflameBot
                     "|InternalName=" +
                     SafeSkillText(enduringCry.InternalName) +
                     "|Result=" + result);
+                return Task.FromResult(true);
             }
             catch (Exception ex)
             {
@@ -6755,7 +6785,6 @@ namespace AllflameBot
                 AllflameLog.Error("ENDURING_CRY_FAILED", ex);
             }
 
-            // Buff maintenance never owns the tick.
             return Task.FromResult(false);
         }
 
@@ -8875,6 +8904,14 @@ namespace AllflameBot
         private int _chartDetectionAttempts;
         private int _lastInsufficientChartCount = -1;
         private int _stableInsufficientChartSnapshots;
+        private bool _stablePlacementActive;
+        private bool _stablePlacementAwaitingVerification;
+        private int _stablePlacementBaselineAvailable;
+        private int _stablePlacementBeforeAvailable;
+        private int _stablePlacementBeforeBoard;
+        private int _stablePlacementConfirmed;
+        private int _stablePlacementFailures;
+        private DateTime _stablePlacementIssuedUtc = DateTime.MinValue;
 
         public PrepareVoyageTask()
             : base(
@@ -8883,6 +8920,7 @@ namespace AllflameBot
 
         public override void Start()
         {
+            ResetStablePlacement();
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
             _voyageUiExpectedUntilUtc = DateTime.MinValue;
@@ -8897,6 +8935,7 @@ namespace AllflameBot
 
         public override void Stop()
         {
+            ResetStablePlacement();
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
             _voyageUiExpectedUntilUtc = DateTime.MinValue;
@@ -9212,6 +9251,7 @@ namespace AllflameBot
             // safely from an interrupted previous planning attempt.
             if (_stage == 0)
             {
+                ResetStablePlacement();
                 _lastInsufficientChartCount = -1;
                 _stableInsufficientChartSnapshots = 0;
                 // Latch readiness before Clear Board. The visual inventory
@@ -9634,652 +9674,434 @@ namespace AllflameBot
             _chartDetectionAttempts = 0;
             _lastInsufficientChartCount = -1;
             _stableInsufficientChartSnapshots = 0;
-            int placed = 0;
-            int expectedAvailable = availableCount;
-            if (dpbInventoryAvailable)
-            {
-                for (int placement = 0; placement < 9; placement++)
-                {
-                    InventoryControlWrapper currentControl;
-                    List<Item> currentCharts;
-                    if (!VoyagePlanningUi.TryGetDpbAvailableCharts(
-                            out currentControl,
-                            out currentCharts) ||
-                        currentCharts.Count == 0)
-                    {
-                        break;
-                    }
-
-                    Item chart = currentCharts[0];
-                    var result = currentControl.FastMove(chart.LocalId);
-                    bool moved = false;
-                    int afterCount = expectedAvailable;
-                    for (int poll = 0; poll < 5; poll++)
-                    {
-                        await LokiCoroutine.Sleep(60);
-                        InventoryControlWrapper refreshedControl;
-                        List<Item> refreshedCharts;
-                        if (VoyagePlanningUi.TryGetDpbAvailableCharts(
-                                out refreshedControl,
-                                out refreshedCharts))
-                        {
-                            afterCount = refreshedCharts.Count;
-                            if (afterCount < expectedAvailable)
-                            {
-                                moved = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    AllflameLog.Info(
-                        "VOYAGE_CHART_FAST_MOVE_VERIFY" +
-                        "|LocalId=" + chart.LocalId +
-                        "|Result=" + result +
-                        "|Before=" + expectedAvailable +
-                        "|After=" + afterCount +
-                        "|Moved=" + moved +
-                        "|Action=" +
-                        (moved
-                            ? "Continue"
-                            : "StopPlacementAndFallback"));
-                    if (!moved)
-                    {
-                        break;
-                    }
-                    expectedAvailable = afterCount;
-                    placed++;
-                }
-            }
-            else
-            {
-                // Refresh visual locations after every successful click. This
-                // prevents a transient false/missing marker from making the
-                // remaining actions reuse an invalid coordinate set.
-                List<Vector2i> currentLocations =
-                    chartLocations.ToList();
-                for (int placement = 0; placement < 9; placement++)
-                {
-                    if (currentLocations.Count == 0)
-                    {
-                        break;
-                    }
-
-                    Vector2i chartLocation = currentLocations[0];
-                    bool moved = false;
-                    for (int clickAttempt = 1;
-                         clickAttempt <= 2 && !moved;
-                         clickAttempt++)
-                    {
-                        bool clicked =
-                            await VoyagePlanningUi.CtrlClickClient(
-                                chartLocation);
-                        if (!clicked)
-                        {
-                            break;
-                        }
-                        await LokiCoroutine.Sleep(180);
-
-                        VoyagePlanningUi.VoyageVisualSnapshot
-                            afterClick;
-                        bool afterClickDetected =
-                            VoyagePlanningUi.TryAnalyze(
-                                out afterClick,
-                                true);
-                        moved =
-                            afterClickDetected &&
-                            afterClick.AvailableChartCount <
-                                expectedAvailable;
-                        AllflameLog.Info(
-                            "VOYAGE_CHART_CTRL_CLICK_VERIFY" +
-                            "|Client=" + chartLocation +
-                            "|Attempt=" + clickAttempt +
-                            "|Before=" + expectedAvailable +
-                            "|After=" +
-                            (afterClickDetected
-                                ? afterClick.AvailableChartCount
-                                    .ToString()
-                                : "n/a") +
-                            "|Moved=" + moved +
-                            "|Action=" +
-                            (moved
-                                ? "Continue"
-                                : "RetrySameChart"));
-                        if (moved)
-                        {
-                            expectedAvailable =
-                                afterClick.AvailableChartCount;
-                            currentLocations =
-                                afterClick.ChartLocations.ToList();
-                        }
-                    }
-
-                    if (!moved)
-                    {
-                        AllflameLog.Info(
-                            "VOYAGE_CHART_CTRL_CLICK_VERIFY" +
-                            "|Client=" + chartLocation +
-                            "|Result=Failed" +
-                            "|Action=StopPlacementAndRetry");
-                        break;
-                    }
-
-                    placed++;
-                }
-            }
-
-            await LokiCoroutine.Sleep(450);
-            VoyagePlanningUi.VoyageVisualSnapshot afterPlacement;
-            bool afterDetected =
-                VoyagePlanningUi.TryAnalyze(
-                    out afterPlacement,
-                    true);
-            double beginAnchorDrift = afterDetected
-                ? Math.Sqrt(
-                    Math.Pow(
-                        afterPlacement.BeginVoyageLocation.X -
-                            snapshot.BeginVoyageLocation.X,
-                        2) +
-                    Math.Pow(
-                        afterPlacement.BeginVoyageLocation.Y -
-                            snapshot.BeginVoyageLocation.Y,
-                        2))
-                : Double.MaxValue;
-            bool freshDetectionStable =
-                afterDetected &&
-                beginAnchorDrift <= 80;
-            bool trustedAnchorEnabled =
-                placed == 9 &&
-                VoyagePlanningUi.IsBeginVoyageEnabledAt(
-                    snapshot.BeginVoyageLocation,
-                    snapshot.Scale);
-            for (int anchorAttempt = 1;
-                 placed == 9 &&
-                 !trustedAnchorEnabled &&
-                 anchorAttempt < 3;
-                 anchorAttempt++)
-            {
-                await LokiCoroutine.Sleep(250);
-                trustedAnchorEnabled =
-                    VoyagePlanningUi.IsBeginVoyageEnabledAt(
-                        snapshot.BeginVoyageLocation,
-                        snapshot.Scale);
-            }
-
-            int remaining = freshDetectionStable
-                ? afterPlacement.AvailableChartCount
-                : Math.Max(0, availableCount - placed);
-            bool freshBeginEnabled =
-                freshDetectionStable &&
-                afterPlacement.BeginVoyageEnabled;
-            bool placementConfirmed =
-                placed == 9 &&
-                (freshBeginEnabled || trustedAnchorEnabled);
-            Vector2i confirmedBeginLocation =
-                freshBeginEnabled
-                    ? afterPlacement.BeginVoyageLocation
-                    : snapshot.BeginVoyageLocation;
-            AllflameLog.Info(
-                "VOYAGE_PLACE_CHARTS|Attempted=" + placed +
-                "|Before=" + availableCount +
-                "|After=" + remaining +
-                "|Confirmed=" + placementConfirmed +
-                "|Confirmation=" +
-                (freshBeginEnabled
-                    ? "NineClicksAndStableFreshDetection"
-                    : (trustedAnchorEnabled
-                        ? "NineClicksAndTrustedAnchorEnabled"
-                        : "NotConfirmed")) +
-                "|BeginEnabled=" +
-                (freshBeginEnabled || trustedAnchorEnabled) +
-                "|FreshDetected=" + afterDetected +
-                "|FreshAnchorDrift=" +
-                (afterDetected
-                    ? beginAnchorDrift.ToString("0.0")
-                    : "n/a") +
-                "|FreshCorrelation=" +
-                (afterDetected
-                    ? afterPlacement.ButtonCorrelation.ToString("0.000")
-                    : "n/a") +
-                "|ShapePolicy=UnclassifiedInputGuaranteedCrossing" +
-                "|Rotation=None");
-
-            if (!placementConfirmed)
-            {
-                _stage = 0;
-                _retryAfterUtc =
-                    DateTime.UtcNow.AddSeconds(2);
-                AllflameLog.Info(
-                    "VOYAGE_PLAN_RETRY|Reason=BoardPlacementNotConfirmed");
-                return true;
-            }
-
-            if (!settings.StartVoyageWhenReady)
-            {
-                _manualReady = true;
-                AllflameLog.Info(
-                    "VOYAGE_READY|BoardCharts=9" +
-                    "|AutoStart=False|Action=WaitForManualBegin");
-                return true;
-            }
-
-            bool beginClicked =
-                VoyagePlanningUi.ClickClient(
-                    confirmedBeginLocation);
-            AllflameLog.Info(
-                "VOYAGE_BEGIN|Found=True" +
-                "|Enabled=VisualBoardConfirmed" +
-                "|Clicked=" + beginClicked +
-                "|BoardCharts=9" +
-                "|Client=" +
-                confirmedBeginLocation);
-            if (beginClicked)
-            {
-                AllflameRunState.MarkVoyageStarted();
-                _stage = 0;
-                _planningReadyAtOpen = false;
-                await LokiCoroutine.Sleep(750);
-                return true;
-            }
-
-            _stage = 1;
-            _retryAfterUtc =
-                DateTime.UtcNow.AddSeconds(1);
-            return true;
+            return await RunIncrementalVisualVoyagePlanner(
+                settings,
+                snapshot,
+                dpbInventoryAvailable,
+                dpbChartControl,
+                dpbCharts);
         }
 
-        private async Task<bool> RunStableVoyagePlanner(
+        private Task<bool> RunStableVoyagePlanner(
             AllflameSettings settings,
             VoyagePlanningUi.StableVoyageSnapshot snapshot)
         {
-            int availableCount = snapshot.AvailableChartSlots.Count;
+            return RunIncrementalStableVoyagePlanner(
+                settings,
+                snapshot);
+        }
+
+        private async Task<bool> RunIncrementalStableVoyagePlanner(
+            AllflameSettings settings,
+            VoyagePlanningUi.StableVoyageSnapshot snapshot)
+        {
+            int available = snapshot.AvailableChartSlots.Count;
+            int board = snapshot.BoardChartCount;
+            int totalCharts = available + board;
             int configuredTarget = Math.Max(
                 0,
-                Math.Min(
-                    60,
-                    settings.ChartsRequiredForVoyage));
-            int effectiveTarget =
-                AllflameRunState.VoyageChainActive
-                    ? 9
-                    : Math.Max(9, configuredTarget);
-            bool reconciliation =
-                AllflameRunState.VoyageReconcileRequired;
+                Math.Min(60, settings.ChartsRequiredForVoyage));
+            int effectiveTarget = AllflameRunState.VoyageChainActive
+                ? 9
+                : Math.Max(9, configuredTarget);
 
-            AllflameLog.Info(
-                "VOYAGE_CHART_COUNT" +
-                "|Available=" + availableCount +
-                "|ConfiguredRequired=" + configuredTarget +
-                "|EffectiveRequired=" + effectiveTarget +
-                "|Mode=" +
-                (AllflameRunState.VoyageChainActive
-                    ? "ContinueVoyageChain"
-                    : "BuildToConfiguredRequirement") +
-                "|Reconciliation=" + reconciliation +
-                "|Detection=StableVoyageSlots" +
-                "|InventorySlots=" + snapshot.InventorySlotCount +
-                "|BoardCharts=" + snapshot.BoardChartCount +
-                "|ClickSource=StableElementCtrlClick");
+            AllflameLog.Throttled(
+                "voyage_incremental_state",
+                TimeSpan.FromMilliseconds(500),
+                "VOYAGE_RUNNER_STATE" +
+                "|State=" + (_stablePlacementAwaitingVerification
+                    ? "VerifyChartMove"
+                    : (board >= 9 ? "BeginVoyage" : "PlaceNextChart")) +
+                "|Available=" + available +
+                "|Board=" + board +
+                "|Confirmed=" + _stablePlacementConfirmed + "/9" +
+                "|OneActionPerCycle=True" +
+                "|Snapshot=FreshStableElements");
 
-            if (snapshot.BoardChartCount > 0)
+            if (!_stablePlacementActive)
             {
-                _stage = 0;
-                _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(500);
-                AllflameLog.Info(
-                    "VOYAGE_CLEAR_BOARD_WAIT" +
-                    "|BoardCharts=" + snapshot.BoardChartCount +
-                    "|AvailableCharts=" + availableCount +
-                    "|Action=ClearAgainBeforeCounting");
-                return true;
-            }
-
-            if (availableCount == 0)
-            {
-                _chartDetectionAttempts++;
-                if (_chartDetectionAttempts < 2)
+                if (totalCharts == 0)
                 {
-                    _retryAfterUtc =
-                        DateTime.UtcNow.AddMilliseconds(500);
+                    _chartDetectionAttempts++;
+                    if (_chartDetectionAttempts < 2)
+                    {
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(300);
+                        return true;
+                    }
+                    AllflameRunState.MarkVoyagePlanChecked(0);
+                    _stage = 0;
+                    _planningReadyAtOpen = false;
+                    _chartDetectionAttempts = 0;
+                    await Coroutines.CloseBlockingWindows();
                     AllflameLog.Info(
-                        "VOYAGE_EMPTY_CONFIRM" +
+                        "VOYAGE_PLAN_EMPTY|Available=0" +
                         "|Detection=StableVoyageSlots" +
-                        "|Snapshot=1/2" +
-                        "|PreviousEstimate=" +
-                        AllflameRunState.VoyageAvailableCharts +
-                        "|Action=WaitForSecondRead");
-                    return true;
+                        "|ConfirmedSnapshots=2" +
+                        "|Action=ClosePlanAndContinueChartAreas");
+                    return false;
                 }
 
-                int previousEstimate =
-                    AllflameRunState.VoyageAvailableCharts;
-                AllflameRunState.MarkVoyagePlanChecked(0);
-                _stage = 0;
-                _planningReadyAtOpen = false;
+                bool reconciliation =
+                    AllflameRunState.VoyageReconcileRequired;
+                bool ready = reconciliation
+                    ? totalCharts >= effectiveTarget
+                    : (_planningReadyAtOpen ||
+                       totalCharts >= effectiveTarget);
+                if (!ready)
+                {
+                    if (_lastInsufficientChartCount == totalCharts)
+                    {
+                        _stableInsufficientChartSnapshots++;
+                    }
+                    else
+                    {
+                        _lastInsufficientChartCount = totalCharts;
+                        _stableInsufficientChartSnapshots = 1;
+                    }
+                    if (_stableInsufficientChartSnapshots < 2)
+                    {
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(300);
+                        return true;
+                    }
+                    AllflameRunState.MarkVoyagePlanChecked(totalCharts);
+                    _stage = 0;
+                    _planningReadyAtOpen = false;
+                    await Coroutines.CloseBlockingWindows();
+                    AllflameLog.Info(
+                        "VOYAGE_NOT_READY|Available=" + totalCharts +
+                        "|Required=" + effectiveTarget +
+                        "|Detection=StableVoyageSlots" +
+                        "|Action=ContinueChartAreas");
+                    return false;
+                }
+
+                if (reconciliation)
+                {
+                    AllflameRunState.MarkVoyagePlanChecked(totalCharts);
+                }
+                _stablePlacementActive = true;
+                _stablePlacementBaselineAvailable = totalCharts;
+                _stablePlacementConfirmed = Math.Min(9, board);
+                _stablePlacementFailures = 0;
                 _chartDetectionAttempts = 0;
-                await Coroutines.CloseBlockingWindows();
+                _lastInsufficientChartCount = -1;
+                _stableInsufficientChartSnapshots = 0;
                 AllflameLog.Info(
-                    "VOYAGE_PLAN_EMPTY" +
-                    "|Available=0" +
-                    "|Detection=StableVoyageSlots" +
-                    "|ConfirmedSnapshots=2" +
-                    "|PreviousEstimate=" + previousEstimate +
-                    "|Action=ClosePlanAndContinueChartAreas");
-                return false;
+                    "VOYAGE_PLACEMENT_SESSION" +
+                    "|State=Started" +
+                    "|Available=" + available +
+                    "|Board=" + board +
+                    "|Target=9" +
+                    "|Mode=OneActionPerCycle");
             }
 
-            bool progressAllowsPlanning =
-                reconciliation
-                    ? availableCount >= effectiveTarget
-                    : (_planningReadyAtOpen ||
-                       availableCount >= effectiveTarget);
-            if (!progressAllowsPlanning)
+            if (_stablePlacementAwaitingVerification)
             {
-                if (_lastInsufficientChartCount == availableCount)
+                bool moved =
+                    available < _stablePlacementBeforeAvailable ||
+                    board > _stablePlacementBeforeBoard;
+                if (moved)
                 {
-                    _stableInsufficientChartSnapshots++;
+                    _stablePlacementConfirmed = Math.Min(
+                        9,
+                        Math.Max(
+                            board,
+                            _stablePlacementBaselineAvailable -
+                                available));
+                    _stablePlacementAwaitingVerification = false;
+                    _stablePlacementFailures = 0;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "VoyageChartPlaced");
+                    AllflameLog.Info(
+                        "VOYAGE_CHART_MOVE_CONFIRMED" +
+                        "|BeforeAvailable=" +
+                        _stablePlacementBeforeAvailable +
+                        "|AfterAvailable=" + available +
+                        "|BeforeBoard=" +
+                        _stablePlacementBeforeBoard +
+                        "|AfterBoard=" + board +
+                        "|Placed=" + _stablePlacementConfirmed + "/9");
+                }
+                else if (DateTime.UtcNow - _stablePlacementIssuedUtc <
+                    TimeSpan.FromMilliseconds(900))
+                {
+                    return true;
                 }
                 else
                 {
-                    _lastInsufficientChartCount = availableCount;
-                    _stableInsufficientChartSnapshots = 1;
-                }
-                if (_stableInsufficientChartSnapshots < 2)
-                {
-                    _retryAfterUtc =
-                        DateTime.UtcNow.AddMilliseconds(500);
+                    _stablePlacementAwaitingVerification = false;
+                    _stablePlacementFailures++;
                     AllflameLog.Info(
-                        "VOYAGE_CHART_WAIT" +
-                        "|Detection=StableVoyageSlots" +
-                        "|Available=" + availableCount +
-                        "|Required=" + effectiveTarget +
-                        "|Snapshot=" +
-                        _stableInsufficientChartSnapshots + "/2" +
-                        "|Action=ConfirmShortfall");
+                        "VOYAGE_CHART_MOVE_REJECTED" +
+                        "|Failure=" + _stablePlacementFailures + "/3" +
+                        "|Available=" + available +
+                        "|Board=" + board +
+                        "|Action=" + (_stablePlacementFailures >= 3
+                            ? "ClearAndRestart"
+                            : "RetryFreshSnapshot"));
+                    if (_stablePlacementFailures >= 3)
+                    {
+                        ResetStablePlacement();
+                        _stage = 0;
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(500);
+                    }
                     return true;
                 }
-
-                AllflameRunState.MarkVoyagePlanChecked(
-                    availableCount);
-                _stage = 0;
-                _planningReadyAtOpen = false;
-                _lastInsufficientChartCount = -1;
-                _stableInsufficientChartSnapshots = 0;
-                await Coroutines.CloseBlockingWindows();
-                AllflameLog.Info(
-                    "VOYAGE_NOT_READY" +
-                    "|Available=" + availableCount +
-                    "|Required=" + effectiveTarget +
-                    "|Detection=StableVoyageSlots" +
-                    "|Action=ContinueChartAreas");
-                return false;
             }
 
-            if (reconciliation)
+            if (board >= 9 || _stablePlacementConfirmed >= 9)
             {
-                AllflameRunState.MarkVoyagePlanChecked(
-                    availableCount);
-                AllflameLog.Info(
-                    "VOYAGE_CHAIN_RECONCILED" +
-                    "|Available=" + availableCount +
-                    "|Detection=StableVoyageSlots" +
-                    "|CanContinue=True" +
-                    "|NextConsumption=9");
-            }
-
-            _chartDetectionAttempts = 0;
-            _lastInsufficientChartCount = -1;
-            _stableInsufficientChartSnapshots = 0;
-            VoyagePlanningUi.StableChartBatchPlan batchPlan;
-            string batchRejection;
-            bool batchReady =
-                VoyagePlanningUi.TryCreateStableChartBatchPlan(
-                    snapshot,
-                    9,
-                    out batchPlan,
-                    out batchRejection) &&
-                batchPlan.Entries.Count == 9;
-            int batchInputs = 0;
-            if (batchReady)
-            {
-                int firstInputs =
-                    await VoyagePlanningUi.CtrlClickStableChartBatch(
-                        batchPlan,
-                        0,
-                        3);
-                batchInputs += firstInputs;
-                await LokiCoroutine.Sleep(160);
-                VoyagePlanningUi.StableVoyageSnapshot intermediate;
-                bool intermediateResolved =
-                    VoyagePlanningUi.TryResolveStable(out intermediate);
-                int intermediateMoved = intermediateResolved
-                    ? Math.Max(
-                        availableCount -
-                            intermediate.AvailableChartSlots.Count,
-                        intermediate.BoardChartCount)
-                    : 0;
-                bool intermediateValid =
-                    intermediateResolved &&
-                    VoyagePlanningUi.StableSnapshotMatchesBatch(
-                        intermediate,
-                        batchPlan) &&
-                    intermediateMoved >= firstInputs;
-                AllflameLog.Info(
-                    "VOYAGE_CHART_BATCH_VERIFY" +
-                    "|Stage=Intermediate" +
-                    "|Inputs=" + firstInputs +
-                    "|Moved=" + intermediateMoved +
-                    "|Resolved=" + intermediateResolved +
-                    "|ContextValid=" + intermediateValid +
-                    "|Action=" +
-                    (intermediateValid
-                        ? "ContinueCachedBatch"
-                        : "UseVerifiedFallback"));
-                if (intermediateValid)
+                if (!settings.StartVoyageWhenReady)
                 {
-                    batchInputs +=
-                        await VoyagePlanningUi.CtrlClickStableChartBatch(
-                            batchPlan,
-                            3,
-                            6);
+                    _manualReady = true;
+                    return true;
                 }
-            }
-            else
-            {
-                AllflameLog.Info(
-                    "VOYAGE_CHART_BATCH_FALLBACK" +
-                    "|Reason=" +
-                    (String.IsNullOrEmpty(batchRejection)
-                        ? "FewerThanNineCachedCharts"
-                        : batchRejection) +
-                    "|Action=UseVerifiedClicks");
-            }
-
-            await LokiCoroutine.Sleep(batchInputs > 0 ? 220 : 20);
-            VoyagePlanningUi.StableVoyageSnapshot finalSnapshot;
-            bool finalResolved =
-                VoyagePlanningUi.TryResolveStable(
-                    out finalSnapshot);
-            int finalAvailable = finalResolved
-                ? finalSnapshot.AvailableChartSlots.Count
-                : availableCount;
-            int finalBoard = finalResolved
-                ? finalSnapshot.BoardChartCount
-                : 0;
-            int placed = finalResolved
-                ? Math.Min(
-                    9,
-                    Math.Max(
-                        availableCount - finalAvailable,
-                        finalBoard))
-                : 0;
-            AllflameLog.Info(
-                "VOYAGE_CHART_BATCH_VERIFY" +
-                "|Stage=Final" +
-                "|Inputs=" + batchInputs +
-                "|Moved=" + placed +
-                "|Available=" + finalAvailable +
-                "|Board=" + finalBoard +
-                "|Resolved=" + finalResolved);
-
-            if (placed < 9)
-            {
-                int fallbackRequired = 9 - placed;
-                AllflameLog.Info(
-                    "VOYAGE_CHART_BATCH_FALLBACK" +
-                    "|Reason=BatchConvergenceIncomplete" +
-                    "|Placed=" + placed +
-                    "|Remaining=" + fallbackRequired +
-                    "|Action=RetryMissingIndividually");
-                int fallbackPlaced =
-                    await PlaceStableChartsIndividually(
-                        fallbackRequired,
-                        placed);
-                placed += fallbackPlaced;
-                await LokiCoroutine.Sleep(160);
-                finalResolved =
-                    VoyagePlanningUi.TryResolveStable(
-                        out finalSnapshot);
-                finalAvailable = finalResolved
-                    ? finalSnapshot.AvailableChartSlots.Count
-                    : Math.Max(0, availableCount - placed);
-                finalBoard = finalResolved
-                    ? finalSnapshot.BoardChartCount
-                    : placed;
-                placed = finalResolved
-                    ? Math.Min(
-                        9,
-                        Math.Max(
-                            availableCount - finalAvailable,
-                            finalBoard))
-                    : placed;
-            }
-            bool placementConfirmed =
-                placed >= 9 &&
-                (finalBoard >= 9 ||
-                 finalAvailable <= availableCount - 9);
-            AllflameLog.Info(
-                "VOYAGE_PLACE_CHARTS" +
-                "|Mode=StableVoyageSlots" +
-                "|Attempted=" + placed +
-                "|Before=" + availableCount +
-                "|After=" + finalAvailable +
-                "|BoardCharts=" + finalBoard +
-                "|Confirmed=" + placementConfirmed);
-
-            if (!placementConfirmed)
-            {
-                _stage = 0;
-                _retryAfterUtc =
-                    DateTime.UtcNow.AddSeconds(1);
-                AllflameLog.Info(
-                    "VOYAGE_PLAN_RETRY" +
-                    "|Reason=StableBoardPlacementNotConfirmed" +
-                    "|Placed=" + placed +
-                    "|Action=ClearAndRetry");
-                return true;
-            }
-
-            if (!settings.StartVoyageWhenReady)
-            {
-                _manualReady = true;
-                AllflameLog.Info(
-                    "VOYAGE_READY|BoardCharts=9" +
-                    "|Mode=StableVoyageSlots" +
-                    "|AutoStart=False|Action=WaitForManualBegin");
-                return true;
-            }
-
-            bool beginClicked =
-                finalResolved &&
-                VoyagePlanningUi.ClickStableElement(
-                    finalSnapshot.BeginVoyageButton,
+                bool clicked = VoyagePlanningUi.ClickStableElement(
+                    snapshot.BeginVoyageButton,
                     "BeginVoyage");
-            AllflameLog.Info(
-                "VOYAGE_BEGIN" +
-                "|Mode=StableElement" +
-                "|Found=" + finalResolved +
-                "|Clicked=" + beginClicked +
-                "|BoardCharts=" + finalBoard);
-            if (beginClicked)
-            {
-                AllflameRunState.MarkVoyageStarted();
-                _stage = 0;
-                _planningReadyAtOpen = false;
-                await LokiCoroutine.Sleep(750);
+                AllflameLog.Info(
+                    "VOYAGE_BEGIN|Mode=StableElementIncremental" +
+                    "|Clicked=" + clicked +
+                    "|BoardCharts=" + board +
+                    "|OneActionPerCycle=True");
+                if (clicked)
+                {
+                    AllflameRunState.MarkVoyageStarted();
+                    ResetStablePlacement();
+                    _stage = 0;
+                    _planningReadyAtOpen = false;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(500);
+                }
+                else
+                {
+                    _stablePlacementFailures++;
+                    if (_stablePlacementFailures >= 3)
+                    {
+                        ResetStablePlacement();
+                        _stage = 0;
+                    }
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(350);
+                }
                 return true;
             }
 
-            _stage = 1;
-            _retryAfterUtc =
-                DateTime.UtcNow.AddSeconds(1);
+            if (snapshot.AvailableChartSlots.Count == 0)
+            {
+                _stablePlacementFailures++;
+                if (_stablePlacementFailures >= 3)
+                {
+                    ResetStablePlacement();
+                    _stage = 0;
+                }
+                _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(300);
+                return true;
+            }
+
+            _stablePlacementBeforeAvailable = available;
+            _stablePlacementBeforeBoard = board;
+            bool inputSent =
+                await VoyagePlanningUi.CtrlClickStableChartSlot(
+                    snapshot,
+                    snapshot.AvailableChartSlots[0],
+                    _stablePlacementConfirmed);
+            _stablePlacementIssuedUtc = DateTime.UtcNow;
+            _stablePlacementAwaitingVerification = inputSent;
+            _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(90);
+            AllflameLog.Info(
+                "VOYAGE_CHART_MOVE_ISSUED" +
+                "|Placement=" +
+                (_stablePlacementConfirmed + 1) + "/9" +
+                "|BeforeAvailable=" + available +
+                "|BeforeBoard=" + board +
+                "|InputSent=" + inputSent +
+                "|Action=ReturnToTaskManager");
+            if (!inputSent)
+            {
+                _stablePlacementFailures++;
+            }
             return true;
         }
 
-        private static async Task<int> PlaceStableChartsIndividually(
-            int required,
-            int alreadyPlaced)
+        private void ResetStablePlacement()
         {
-            int confirmed = 0;
-            for (int attempt = 0;
-                 attempt < required;
-                 attempt++)
+            _stablePlacementActive = false;
+            _stablePlacementAwaitingVerification = false;
+            _stablePlacementBaselineAvailable = 0;
+            _stablePlacementBeforeAvailable = 0;
+            _stablePlacementBeforeBoard = 0;
+            _stablePlacementConfirmed = 0;
+            _stablePlacementFailures = 0;
+            _stablePlacementIssuedUtc = DateTime.MinValue;
+        }
+
+        private async Task<bool> RunIncrementalVisualVoyagePlanner(
+            AllflameSettings settings,
+            VoyagePlanningUi.VoyageVisualSnapshot snapshot,
+            bool dpbInventoryAvailable,
+            InventoryControlWrapper dpbChartControl,
+            List<Item> dpbCharts)
+        {
+            int available = dpbInventoryAvailable
+                ? dpbCharts.Count
+                : snapshot.AvailableChartCount;
+            if (!_stablePlacementActive)
             {
-                VoyagePlanningUi.StableVoyageSnapshot current;
-                if (!VoyagePlanningUi.TryResolveStable(out current) ||
-                    current.AvailableChartSlots.Count == 0)
-                {
-                    break;
-                }
-                int beforeAvailable =
-                    current.AvailableChartSlots.Count;
-                int beforeBoard = current.BoardChartCount;
-                bool inputSent =
-                    await VoyagePlanningUi.CtrlClickStableChartSlot(
-                        current,
-                        current.AvailableChartSlots[0],
-                        alreadyPlaced + confirmed);
-                bool moved = false;
-                int afterAvailable = beforeAvailable;
-                int afterBoard = beforeBoard;
-                for (int poll = 0;
-                     inputSent && poll < 6;
-                     poll++)
-                {
-                    await LokiCoroutine.Sleep(80);
-                    VoyagePlanningUi.StableVoyageSnapshot refreshed;
-                    if (!VoyagePlanningUi.TryResolveStable(
-                            out refreshed))
-                    {
-                        continue;
-                    }
-                    afterAvailable =
-                        refreshed.AvailableChartSlots.Count;
-                    afterBoard = refreshed.BoardChartCount;
-                    if (afterAvailable < beforeAvailable ||
-                        afterBoard > beforeBoard)
-                    {
-                        moved = true;
-                        break;
-                    }
-                }
+                _stablePlacementActive = true;
+                _stablePlacementBaselineAvailable = available;
+                _stablePlacementConfirmed = 0;
+                _stablePlacementFailures = 0;
                 AllflameLog.Info(
-                    "VOYAGE_CHART_STABLE_MOVE_VERIFY" +
-                    "|Placement=" +
-                    (alreadyPlaced + confirmed + 1) + "/9" +
-                    "|BeforeAvailable=" + beforeAvailable +
-                    "|AfterAvailable=" + afterAvailable +
-                    "|BeforeBoard=" + beforeBoard +
-                    "|AfterBoard=" + afterBoard +
-                    "|InputSent=" + inputSent +
-                    "|Moved=" + moved +
-                    "|Mode=BatchFallback");
-                if (!moved)
-                {
-                    break;
-                }
-                confirmed++;
+                    "VOYAGE_PLACEMENT_SESSION" +
+                    "|State=Started" +
+                    "|Available=" + available +
+                    "|Board=Unknown" +
+                    "|Target=9" +
+                    "|Mode=OneActionPerCycle" +
+                    "|Detection=" + (dpbInventoryAvailable
+                        ? "DpbDeepwaterInventory"
+                        : "VisualFallback"));
             }
-            return confirmed;
+
+            if (_stablePlacementAwaitingVerification)
+            {
+                bool moved =
+                    available < _stablePlacementBeforeAvailable;
+                if (moved)
+                {
+                    _stablePlacementConfirmed = Math.Min(
+                        9,
+                        _stablePlacementBaselineAvailable - available);
+                    _stablePlacementAwaitingVerification = false;
+                    _stablePlacementFailures = 0;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "VoyageChartPlaced");
+                    AllflameLog.Info(
+                        "VOYAGE_CHART_MOVE_CONFIRMED" +
+                        "|BeforeAvailable=" +
+                        _stablePlacementBeforeAvailable +
+                        "|AfterAvailable=" + available +
+                        "|Placed=" + _stablePlacementConfirmed + "/9" +
+                        "|Detection=" + (dpbInventoryAvailable
+                            ? "DpbDeepwaterInventory"
+                            : "VisualFallback"));
+                }
+                else if (DateTime.UtcNow - _stablePlacementIssuedUtc <
+                    TimeSpan.FromMilliseconds(900))
+                {
+                    return true;
+                }
+                else
+                {
+                    _stablePlacementAwaitingVerification = false;
+                    _stablePlacementFailures++;
+                    if (_stablePlacementFailures >= 3)
+                    {
+                        ResetStablePlacement();
+                        _stage = 0;
+                    }
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(250);
+                    return true;
+                }
+            }
+
+            if (_stablePlacementConfirmed >= 9)
+            {
+                bool enabled = snapshot.BeginVoyageEnabled ||
+                    VoyagePlanningUi.IsBeginVoyageEnabledAt(
+                        snapshot.BeginVoyageLocation,
+                        snapshot.Scale);
+                if (!enabled)
+                {
+                    _stablePlacementFailures++;
+                    if (_stablePlacementFailures >= 3)
+                    {
+                        ResetStablePlacement();
+                        _stage = 0;
+                    }
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(250);
+                    return true;
+                }
+                if (!settings.StartVoyageWhenReady)
+                {
+                    _manualReady = true;
+                    return true;
+                }
+                bool beginClicked = VoyagePlanningUi.ClickClient(
+                    snapshot.BeginVoyageLocation);
+                AllflameLog.Info(
+                    "VOYAGE_BEGIN|Mode=IncrementalFallback" +
+                    "|Clicked=" + beginClicked +
+                    "|BoardCharts=9" +
+                    "|OneActionPerCycle=True");
+                if (beginClicked)
+                {
+                    AllflameRunState.MarkVoyageStarted();
+                    ResetStablePlacement();
+                    _stage = 0;
+                    _planningReadyAtOpen = false;
+                }
+                else
+                {
+                    _stablePlacementFailures++;
+                    if (_stablePlacementFailures >= 3)
+                    {
+                        ResetStablePlacement();
+                        _stage = 0;
+                    }
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(350);
+                }
+                return true;
+            }
+
+            bool inputSent = false;
+            int localId = 0;
+            Vector2i location = new Vector2i();
+            _stablePlacementBeforeAvailable = available;
+            if (dpbInventoryAvailable &&
+                dpbChartControl != null &&
+                dpbCharts.Count > 0)
+            {
+                Item chart = dpbCharts[0];
+                localId = chart.LocalId;
+                FastMoveResult fastMoveResult =
+                    dpbChartControl.FastMove(chart.LocalId);
+                inputSent = fastMoveResult == FastMoveResult.None;
+            }
+            else if (snapshot.ChartLocations.Count > 0)
+            {
+                location = snapshot.ChartLocations[0];
+                inputSent = await VoyagePlanningUi.CtrlClickClient(
+                    location);
+            }
+
+            _stablePlacementIssuedUtc = DateTime.UtcNow;
+            _stablePlacementAwaitingVerification = inputSent;
+            _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(100);
+            AllflameLog.Info(
+                "VOYAGE_CHART_MOVE_ISSUED" +
+                "|Placement=" +
+                (_stablePlacementConfirmed + 1) + "/9" +
+                "|BeforeAvailable=" + available +
+                "|LocalId=" + localId +
+                "|Client=" + location +
+                "|InputSent=" + inputSent +
+                "|Detection=" + (dpbInventoryAvailable
+                    ? "DpbDeepwaterInventory"
+                    : "VisualFallback") +
+                "|Action=ReturnToTaskManager");
+            if (!inputSent)
+            {
+                _stablePlacementFailures++;
+            }
+            return true;
         }
 
         private static string FindVoyageDialogOption()
@@ -14245,8 +14067,6 @@ namespace AllflameBot
         private int _stage;
         private int _mainTab;
         private int _subTab;
-        private int _withdrawMainTab;
-        private int _withdrawSubTab;
         private DateTime _scanAfterUtc;
         private DateTime _retryAfterUtc = DateTime.MinValue;
         private int _openAttempts;
@@ -14254,6 +14074,13 @@ namespace AllflameBot
         private int _tabFailures;
         private int _activeMainTab = -1;
         private int _activeSubTab = -1;
+        private int _tabSelectionMain = -1;
+        private int _tabSelectionSub = -1;
+        private int _tabSelectionStage;
+        private int _tabSelectionStableReads;
+        private string _tabSelectionLastSignature;
+        private DateTime _tabSelectionDeadlineUtc = DateTime.MinValue;
+        private DateTime _tabSelectionEmptyConfirmUtc = DateTime.MinValue;
         private readonly int[] _lastUsedSubTab = { -1, -1, -1 };
         private readonly int[,] _pageCounts = new int[3, 5];
         private readonly int[,] _sessionPageObserved = new int[3, 5];
@@ -14273,6 +14100,11 @@ namespace AllflameBot
         private bool _nativeBindFailed;
         private bool _rawWithdrawFailed;
         private bool _inventoryFull;
+        private bool _rawWithdrawAwaitingVerification;
+        private int _rawWithdrawPendingKey;
+        private int _rawWithdrawBeforeCount;
+        private int _rawWithdrawFailures;
+        private DateTime _rawWithdrawIssuedUtc = DateTime.MinValue;
         private InventoryControlWrapper _storageControl;
         private InventorySlotUiElement _storageSlot;
         private int _observedDepositRevision;
@@ -14504,7 +14336,7 @@ namespace AllflameBot
 
             if (_stage == 3)
             {
-                await WithdrawCurrentPage();
+                await WithdrawRawChartCycle();
                 return true;
             }
 
@@ -14513,10 +14345,9 @@ namespace AllflameBot
 
         private void BeginScan()
         {
+            ResetTabSelection();
             _mainTab = -1;
             _subTab = -1;
-            _withdrawMainTab = -1;
-            _withdrawSubTab = -1;
             _activeMainTab = -1;
             _activeSubTab = -1;
             _seenChartKeys.Clear();
@@ -14565,7 +14396,13 @@ namespace AllflameBot
                 return;
             }
 
-            if (!await SelectStorageTab(_mainTab, _subTab))
+            StorageTabSelectionResult selection =
+                await SelectStorageTab(_mainTab, _subTab);
+            if (selection == StorageTabSelectionResult.Pending)
+            {
+                return;
+            }
+            if (selection == StorageTabSelectionResult.Failed)
             {
                 _tabFailures++;
                 if (_tabFailures >= 3)
@@ -14595,263 +14432,158 @@ namespace AllflameBot
                 "|Sequence=" + (_mainTab * 5 + _subTab + 1) +
                 "/15");
 
-            if (!await WithdrawRawChartsFromCurrentPage())
+            ResetRawWithdrawCycle();
+            _stage = 3;
+        }
+
+        private async Task WithdrawRawChartCycle()
+        {
+            AllflameContext.Refresh(true);
+            if (AllflameContext.InventoryChartCount >=
+                TargetInventoryCharts)
             {
                 await FinishScan();
                 return;
             }
-
-            int nextPage = _mainTab * 5 + _subTab + 1;
-            if (MoveToNextSessionPage(nextPage))
+            if (AllflameContext.InventoryFreeSquares <= 0)
             {
+                _inventoryFull = true;
+                await FinishScan();
                 return;
             }
 
-            await FinishScan();
-        }
-
-        private async Task<bool> WithdrawRawChartsFromCurrentPage()
-        {
-            int failedAttempts = 0;
-            while (true)
+            if (!TryResolveStorageUi(_mainTab, _subTab))
             {
-                AllflameContext.Refresh(true);
-                if (AllflameContext.InventoryChartCount >=
-                    TargetInventoryCharts)
+                _rawWithdrawFailures++;
+                if (_rawWithdrawFailures >= 3)
                 {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_RAW_WITHDRAW_STOP" +
-                        "|Reason=TargetReached" +
-                        "|Target=" + TargetInventoryCharts +
-                        "|InventoryCharts=" +
-                        AllflameContext.InventoryChartCount +
-                        "|Withdrawn=" + _withdrawnCharts);
-                    return false;
+                    _rawWithdrawFailed = true;
+                    await FinishScan();
                 }
-                if (AllflameContext.InventoryFreeSquares <= 0)
+                else
                 {
-                    _inventoryFull = true;
-                    AllflameLog.Info(
-                        "CHART_STORAGE_RAW_WITHDRAW_STOP" +
-                        "|Reason=InventoryFull" +
-                        "|Main=" + (_mainTab + 1) +
-                        "|Sub=" + (_subTab + 1) +
-                        "|Withdrawn=" + _withdrawnCharts);
-                    return false;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(150);
                 }
+                return;
+            }
+            if (_rawWithdrawFailures >= 3)
+            {
+                _rawWithdrawFailed = true;
+                await FinishScan();
+                return;
+            }
 
-                if (!TryResolveStorageUi(_mainTab, _subTab))
-                {
-                    failedAttempts++;
-                    if (failedAttempts >= 3)
-                    {
-                        _rawWithdrawFailed = true;
-                        AllflameLog.Info(
-                            "CHART_STORAGE_RAW_WITHDRAW_STOP" +
-                            "|Reason=PageLayerResolveFailed" +
-                            "|Main=" + (_mainTab + 1) +
-                            "|Sub=" + (_subTab + 1) +
-                            "|Attempts=" + failedAttempts);
-                        return false;
-                    }
-                    await LokiCoroutine.Sleep(150);
-                    continue;
-                }
-
-                List<KeyValuePair<int, Element>> rawItems =
-                    ChartStorageUi.GetRawItemElements(_storageSlot);
-                if (rawItems.Count == 0)
-                {
-                    UpdateSessionPageCache(
-                        _mainTab,
-                        _subTab,
-                        0,
-                        false,
-                        "ConfirmedEmpty");
-                    AllflameLog.Info(
-                        "CHART_STORAGE_RAW_PAGE_EMPTY" +
-                        "|Main=" + (_mainTab + 1) +
-                        "|Sub=" + (_subTab + 1) +
-                        "|Withdrawn=" + _withdrawnCharts);
-                    return true;
-                }
-
-                KeyValuePair<int, Element> rawItem = rawItems[0];
-                int beforeCount = rawItems.Count;
-                bool clicked = await CtrlClickRawChart(rawItem.Value);
-                await LokiCoroutine.Sleep(250);
-
-                bool resolved = false;
-                var afterItems =
-                    new List<KeyValuePair<int, Element>>();
-                for (int poll = 0; poll < 5; poll++)
-                {
-                    resolved = TryResolveStorageUi(_mainTab, _subTab);
-                    if (resolved)
-                    {
-                        afterItems = ChartStorageUi.GetRawItemElements(
-                            _storageSlot);
-                        break;
-                    }
-                    await LokiCoroutine.Sleep(100);
-                }
-                bool moved = clicked && resolved &&
-                    (afterItems.Count < beforeCount ||
-                     !afterItems.Any(pair => pair.Key == rawItem.Key));
-                AllflameLog.Info(
-                    "CHART_STORAGE_RAW_WITHDRAW" +
-                    "|Main=" + (_mainTab + 1) +
-                    "|Sub=" + (_subTab + 1) +
-                    "|RawKey=" + rawItem.Key +
-                    "|Attempt=" + (failedAttempts + 1) +
-                    "|Before=" + beforeCount +
-                    "|After=" + afterItems.Count +
-                    "|Clicked=" + clicked +
-                    "|Resolved=" + resolved +
-                    "|Confirmed=" + moved);
+            List<KeyValuePair<int, Element>> rawItems =
+                ChartStorageUi.GetRawItemElements(_storageSlot);
+            if (_rawWithdrawAwaitingVerification)
+            {
+                bool moved =
+                    rawItems.Count < _rawWithdrawBeforeCount ||
+                    !rawItems.Any(pair =>
+                        pair.Key == _rawWithdrawPendingKey);
                 if (moved)
                 {
                     _withdrawnCharts++;
                     UpdateSessionPageCache(
                         _mainTab,
                         _subTab,
-                        afterItems.Count,
+                        rawItems.Count,
                         true,
                         "ConfirmedWithdraw");
-                    failedAttempts = 0;
                     AllflameProgressWatchdog.MarkProgress(
                         "ChartStorageRawChartTransferred");
-                    continue;
-                }
-
-                failedAttempts++;
-                if (failedAttempts >= 3)
-                {
-                    _rawWithdrawFailed = true;
                     AllflameLog.Info(
-                        "CHART_STORAGE_RAW_WITHDRAW_STOP" +
-                        "|Reason=RawClickRejectedThreeTimes" +
+                        "CHART_STORAGE_WITHDRAW_CONFIRMED" +
                         "|Main=" + (_mainTab + 1) +
                         "|Sub=" + (_subTab + 1) +
-                        "|RawKey=" + rawItem.Key);
-                    return false;
+                        "|RawKey=" + _rawWithdrawPendingKey +
+                        "|Before=" + _rawWithdrawBeforeCount +
+                        "|After=" + rawItems.Count +
+                        "|TotalWithdrawn=" + _withdrawnCharts +
+                        "|Action=ReturnToTaskManager");
+                    ResetRawWithdrawCycle();
+                    return;
                 }
-                await LokiCoroutine.Sleep(150);
+                if (DateTime.UtcNow - _rawWithdrawIssuedUtc <
+                    TimeSpan.FromMilliseconds(900))
+                {
+                    return;
+                }
+
+                _rawWithdrawAwaitingVerification = false;
+                _rawWithdrawFailures++;
+                AllflameLog.Info(
+                    "CHART_STORAGE_WITHDRAW_REJECTED" +
+                    "|Main=" + (_mainTab + 1) +
+                    "|Sub=" + (_subTab + 1) +
+                    "|RawKey=" + _rawWithdrawPendingKey +
+                    "|Failure=" + _rawWithdrawFailures + "/3" +
+                    "|Action=" + (_rawWithdrawFailures >= 3
+                        ? "StopSource"
+                        : "RetryFreshElement"));
+                if (_rawWithdrawFailures >= 3)
+                {
+                    _rawWithdrawFailed = true;
+                    await FinishScan();
+                }
+                return;
+            }
+
+            if (rawItems.Count == 0)
+            {
+                UpdateSessionPageCache(
+                    _mainTab,
+                    _subTab,
+                    0,
+                    false,
+                    "ConfirmedEmpty");
+                int nextPage = _mainTab * 5 + _subTab + 1;
+                if (MoveToNextSessionPage(nextPage))
+                {
+                    ResetRawWithdrawCycle();
+                    _stage = 2;
+                    return;
+                }
+                await FinishScan();
+                return;
+            }
+
+            KeyValuePair<int, Element> rawItem = rawItems[0];
+            bool clicked = await CtrlClickRawChart(rawItem.Value);
+            _rawWithdrawPendingKey = rawItem.Key;
+            _rawWithdrawBeforeCount = rawItems.Count;
+            _rawWithdrawIssuedUtc = DateTime.UtcNow;
+            _rawWithdrawAwaitingVerification = clicked;
+            _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(100);
+            AllflameLog.Info(
+                "CHART_STORAGE_WITHDRAW_ISSUED" +
+                "|Main=" + (_mainTab + 1) +
+                "|Sub=" + (_subTab + 1) +
+                "|RawKey=" + rawItem.Key +
+                "|Before=" + rawItems.Count +
+                "|Clicked=" + clicked +
+                "|Action=ReturnToTaskManager");
+            if (!clicked)
+            {
+                _rawWithdrawFailures++;
             }
         }
 
-        private async Task WithdrawCurrentPage()
+        private enum StorageTabSelectionResult
         {
-            if (_withdrawMainTab >= 3)
-            {
-                await FinishScan();
-                return;
-            }
+            Pending,
+            Ready,
+            Failed
+        }
 
-            if (!await SelectStorageTab(
-                    _withdrawMainTab,
-                    _withdrawSubTab))
-            {
-                _tabFailures++;
-                if (_tabFailures >= 3)
-                {
-                    await CompleteSourceFailure(
-                        "StorageWithdrawTabSelectionFailed");
-                }
-                return;
-            }
-            _tabFailures = 0;
-            if (!HasNativeStorageInventory() &&
-                !await WaitForNativeBinding())
-            {
-                _nativeBindFailed = true;
-                await FinishScan();
-                return;
-            }
-            List<StorageChartEntry> charts = ReadCurrentStorageCharts();
-            RememberPage(_withdrawMainTab, _withdrawSubTab, charts);
-
-            AllflameContext.Refresh(true);
-            int needed = Math.Max(0, TargetInventoryCharts - AllflameContext.InventoryChartCount);
-            foreach (StorageChartEntry chart in charts
-                .Where(entry => entry.Item != null)
-                .Take(needed)
-                .ToList())
-            {
-                string chartKey = chart.StableKey;
-                int beforeInventory = AllflameContext.InventoryChartCount;
-                bool transferred = false;
-                for (int attempt = 1; attempt <= 3; attempt++)
-                {
-                    string result;
-                    const string transferMode = "FastMove";
-                    try
-                    {
-                        result = _storageControl.FastMove(
-                            chart.Item.LocalId).ToString();
-                    }
-                    catch (Exception ex)
-                    {
-                        result = "Exception:" + ex.GetType().Name;
-                    }
-                    await LokiCoroutine.Sleep(220);
-                    AllflameContext.Refresh(true);
-                    transferred =
-                        AllflameContext.InventoryChartCount > beforeInventory ||
-                        !ReadCurrentStorageCharts().Any(item =>
-                            String.Equals(
-                                item.StableKey,
-                                chartKey,
-                                StringComparison.Ordinal));
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TRANSFER" +
-                        "|Main=" + (_withdrawMainTab + 1) +
-                        "|Sub=" + (_withdrawSubTab + 1) +
-                        "|Mode=" + transferMode +
-                        "|Id=" + (chart.Item == null
-                            ? chart.RawKey
-                            : chart.Item.Id) +
-                        "|LocalId=" + (chart.Item == null
-                            ? chart.RawKey
-                            : chart.Item.LocalId) +
-                        "|Name=" + (chart.Item == null
-                            ? "RawChartElement"
-                            : chart.Item.FullName) +
-                        "|Attempt=" + attempt +
-                        "|Maximum=3" +
-                        "|Result=" + result +
-                        "|Confirmed=" + transferred);
-                    if (transferred)
-                    {
-                        _withdrawnCharts++;
-                        UpdateSessionPageCache(
-                            _withdrawMainTab,
-                            _withdrawSubTab,
-                            ReadCurrentStorageCharts().Count,
-                            true,
-                            "ConfirmedFastMove");
-                        break;
-                    }
-                }
-                if (!transferred)
-                {
-                    await CompleteSourceFailure(
-                        "ChartTransferRejectedThreeTimes");
-                    return;
-                }
-                if (AllflameContext.InventoryChartCount >= TargetInventoryCharts)
-                {
-                    await FinishScan();
-                    return;
-                }
-            }
-
-            _withdrawSubTab++;
-            if (_withdrawSubTab >= 5)
-            {
-                _withdrawMainTab++;
-                _withdrawSubTab = 0;
-            }
+        private void ResetRawWithdrawCycle()
+        {
+            _rawWithdrawAwaitingVerification = false;
+            _rawWithdrawPendingKey = 0;
+            _rawWithdrawBeforeCount = 0;
+            _rawWithdrawFailures = 0;
+            _rawWithdrawIssuedUtc = DateTime.MinValue;
         }
 
         private void RememberPage(
@@ -14966,204 +14698,178 @@ namespace AllflameBot
             }
         }
 
-        private async Task<bool> SelectStorageTab(int mainTab, int subTab)
-        {
-            string previousSignature = _storageSlot == null
-                ? null
-                : CurrentStoragePageSignature();
-            bool selectionChanged = false;
-            if (_activeMainTab != mainTab ||
-                !ChartStorageUi.IsMainTabActive(mainTab))
-            {
-                if (!ChartStorageUi.TryClickMainTab(mainTab))
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TAB_FAILED" +
-                        "|Reason=MainTabMissing" +
-                        "|Main=" + (mainTab + 1));
-                    return false;
-                }
-                if (!await WaitForMainTab(mainTab))
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TAB_FAILED" +
-                        "|Reason=MainTabNotActive" +
-                        "|Main=" + (mainTab + 1));
-                    return false;
-                }
-                _activeMainTab = mainTab;
-                _activeSubTab = -1;
-                selectionChanged = true;
-            }
-
-            if (_activeSubTab != subTab ||
-                !ChartStorageUi.IsPageActive(mainTab, subTab))
-            {
-                if (!ChartStorageUi.TryClickSubTab(mainTab, subTab))
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TAB_FAILED" +
-                        "|Reason=SubTabMissing" +
-                        "|Main=" + (mainTab + 1) +
-                        "|Sub=" + (subTab + 1));
-                    return false;
-                }
-                if (!await WaitForStoragePage(mainTab, subTab))
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TAB_FAILED" +
-                        "|Reason=PageNotActive" +
-                        "|Main=" + (mainTab + 1) +
-                        "|Sub=" + (subTab + 1));
-                    return false;
-                }
-                _activeSubTab = subTab;
-                selectionChanged = true;
-            }
-
-            if (selectionChanged)
-            {
-                await LokiCoroutine.Sleep(350);
-            }
-
-            string signature = null;
-            string lastResolvedSignature = null;
-            int resolveAttempts = 0;
-            int stableReads = 0;
-            bool pageActive = false;
-            bool pageLayerResolved = false;
-            DateTime emptyConfirmAfter =
-                DateTime.UtcNow.AddMilliseconds(450);
-            DateTime deadline = DateTime.UtcNow.AddSeconds(3);
-            do
-            {
-                pageActive = ChartStorageUi.IsPageActive(
-                    mainTab,
-                    subTab);
-                if (!pageActive)
-                {
-                    await LokiCoroutine.Sleep(100);
-                    continue;
-                }
-
-                resolveAttempts++;
-                if (TryResolveStorageUi(mainTab, subTab))
-                {
-                    pageLayerResolved = _storageSlot != null;
-                    if (pageLayerResolved)
-                    {
-                        signature = CurrentStoragePageSignature();
-                        stableReads = String.Equals(
-                            signature,
-                            lastResolvedSignature,
-                            StringComparison.Ordinal)
-                                ? stableReads + 1
-                                : 1;
-                        lastResolvedSignature = signature;
-                        if (stableReads >= 2 &&
-                            (signature.Length > 0 ||
-                             DateTime.UtcNow >= emptyConfirmAfter))
-                        {
-                            break;
-                        }
-                    }
-                }
-
-                await LokiCoroutine.Sleep(150);
-            }
-            while (DateTime.UtcNow < deadline);
-
-            bool confirmed = pageActive &&
-                pageLayerResolved &&
-                stableReads >= 2 &&
-                (signature != null &&
-                 (signature.Length > 0 ||
-                  DateTime.UtcNow >= emptyConfirmAfter));
-            AllflameLog.Info(
-                "CHART_STORAGE_TAB_CONFIRMED|Main=" + (mainTab + 1) +
-                "|Sub=" + (subTab + 1) +
-                "|Mode=" + (HasNativeStorageInventory()
-                    ? "ServerInventory"
-                    : "RawGrid") +
-                "|Control=" +
-                (_storageControl == null ? "Missing" : "Resolved") +
-                "|PageActive=" + pageActive +
-                "|PageLayerResolved=" + pageLayerResolved +
-                "|ResolveAttempts=" + resolveAttempts +
-                "|StableReads=" + stableReads +
-                "|Signature=" + SanitizeStorageSignature(signature) +
-                "|PreviousSignature=" +
-                SanitizeStorageSignature(previousSignature) +
-                "|" + ChartStorageUi.GetSelectionDiagnostics(
-                    mainTab,
-                    subTab) +
-                "|SelectionRetained=" +
-                (_activeMainTab == mainTab &&
-                 _activeSubTab == subTab) +
-                "|Confirmed=" + confirmed);
-            return confirmed;
-        }
-
-        private static async Task<bool> WaitForMainTab(int mainTab)
-        {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
-            do
-            {
-                if (ChartStorageUi.IsMainTabActive(mainTab))
-                {
-                    return true;
-                }
-                await LokiCoroutine.Sleep(100);
-            }
-            while (DateTime.UtcNow < deadline);
-            return false;
-        }
-
-        private static async Task<bool> WaitForStoragePage(
+        private async Task<StorageTabSelectionResult> SelectStorageTab(
             int mainTab,
             int subTab)
         {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
-            do
+            await Task.CompletedTask;
+            DateTime now = DateTime.UtcNow;
+            if (_tabSelectionMain != mainTab ||
+                _tabSelectionSub != subTab)
+            {
+                ResetTabSelection();
+                _tabSelectionMain = mainTab;
+                _tabSelectionSub = subTab;
+                _tabSelectionStage = 0;
+            }
+
+            if (_tabSelectionStage == 0)
+            {
+                if (ChartStorageUi.IsMainTabActive(mainTab))
+                {
+                    _activeMainTab = mainTab;
+                    _activeSubTab = -1;
+                    _tabSelectionStage = 2;
+                    return StorageTabSelectionResult.Pending;
+                }
+                bool clicked = ChartStorageUi.TryClickMainTab(mainTab);
+                _tabSelectionDeadlineUtc =
+                    now.AddSeconds(2);
+                _tabSelectionStage = clicked ? 1 : 0;
+                AllflameLog.Info(
+                    "CHART_STORAGE_TAB_ACTION" +
+                    "|Action=SelectMain" +
+                    "|Main=" + (mainTab + 1) +
+                    "|Clicked=" + clicked +
+                    "|OneActionPerCycle=True");
+                return clicked
+                    ? StorageTabSelectionResult.Pending
+                    : FailTabSelection("MainTabMissing");
+            }
+
+            if (_tabSelectionStage == 1)
+            {
+                if (ChartStorageUi.IsMainTabActive(mainTab))
+                {
+                    _activeMainTab = mainTab;
+                    _activeSubTab = -1;
+                    _tabSelectionStage = 2;
+                    return StorageTabSelectionResult.Pending;
+                }
+                return now < _tabSelectionDeadlineUtc
+                    ? StorageTabSelectionResult.Pending
+                    : FailTabSelection("MainTabNotActive");
+            }
+
+            if (_tabSelectionStage == 2)
             {
                 if (ChartStorageUi.IsPageActive(mainTab, subTab))
                 {
-                    return true;
+                    _activeSubTab = subTab;
+                    BeginTabStabilityObservation(now);
+                    return StorageTabSelectionResult.Pending;
                 }
-                await LokiCoroutine.Sleep(100);
+                bool clicked = ChartStorageUi.TryClickSubTab(
+                    mainTab,
+                    subTab);
+                _tabSelectionDeadlineUtc =
+                    now.AddSeconds(2);
+                _tabSelectionStage = clicked ? 3 : 2;
+                AllflameLog.Info(
+                    "CHART_STORAGE_TAB_ACTION" +
+                    "|Action=SelectSub" +
+                    "|Main=" + (mainTab + 1) +
+                    "|Sub=" + (subTab + 1) +
+                    "|Clicked=" + clicked +
+                    "|OneActionPerCycle=True");
+                return clicked
+                    ? StorageTabSelectionResult.Pending
+                    : FailTabSelection("SubTabMissing");
             }
-            while (DateTime.UtcNow < deadline);
-            return false;
+
+            if (_tabSelectionStage == 3)
+            {
+                if (ChartStorageUi.IsPageActive(mainTab, subTab))
+                {
+                    _activeSubTab = subTab;
+                    BeginTabStabilityObservation(now);
+                    return StorageTabSelectionResult.Pending;
+                }
+                return now < _tabSelectionDeadlineUtc
+                    ? StorageTabSelectionResult.Pending
+                    : FailTabSelection("PageNotActive");
+            }
+
+            if (!ChartStorageUi.IsPageActive(mainTab, subTab))
+            {
+                return FailTabSelection("PageLostDuringStability");
+            }
+
+            string signature = null;
+            bool resolved = TryResolveStorageUi(mainTab, subTab) &&
+                _storageSlot != null;
+            if (resolved)
+            {
+                signature = CurrentStoragePageSignature();
+                _tabSelectionStableReads = String.Equals(
+                    signature,
+                    _tabSelectionLastSignature,
+                    StringComparison.Ordinal)
+                        ? _tabSelectionStableReads + 1
+                        : 1;
+                _tabSelectionLastSignature = signature;
+            }
+            bool emptyStable = signature != null &&
+                (signature.Length > 0 ||
+                 now >= _tabSelectionEmptyConfirmUtc);
+            bool confirmed = resolved &&
+                _tabSelectionStableReads >= 2 &&
+                emptyStable;
+            if (confirmed)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_TAB_CONFIRMED" +
+                    "|Main=" + (mainTab + 1) +
+                    "|Sub=" + (subTab + 1) +
+                    "|Mode=" + (HasNativeStorageInventory()
+                        ? "ServerInventory"
+                        : "RawGrid") +
+                    "|StableReads=" + _tabSelectionStableReads +
+                    "|Signature=" +
+                    SanitizeStorageSignature(signature) +
+                    "|OneActionPerCycle=True" +
+                    "|Confirmed=True");
+                return StorageTabSelectionResult.Ready;
+            }
+            if (now >= _tabSelectionDeadlineUtc)
+            {
+                return FailTabSelection("PageLayerNotStable");
+            }
+            return StorageTabSelectionResult.Pending;
         }
 
-        private async Task<bool> WaitForNativeBinding()
+        private void BeginTabStabilityObservation(DateTime now)
         {
-            DateTime deadline = DateTime.UtcNow.AddSeconds(3);
-            do
-            {
-                if (TryResolveStorageUi(
-                        _activeMainTab,
-                        _activeSubTab) &&
-                    HasNativeStorageInventory())
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_NATIVE_BOUND" +
-                        "|RequestedId=" + _nativeRequestedId +
-                        "|Items=" + _nativeItems +
-                        "|WaitCompleted=True");
-                    return true;
-                }
-                await LokiCoroutine.Sleep(200);
-            }
-            while (DateTime.UtcNow < deadline);
+            _tabSelectionStage = 4;
+            _tabSelectionStableReads = 0;
+            _tabSelectionLastSignature = null;
+            _tabSelectionEmptyConfirmUtc =
+                now.AddMilliseconds(450);
+            _tabSelectionDeadlineUtc = now.AddSeconds(3);
+        }
 
+        private StorageTabSelectionResult FailTabSelection(
+            string reason)
+        {
             AllflameLog.Info(
-                "CHART_STORAGE_NATIVE_BIND_TIMEOUT" +
-                "|WaitSeconds=3" +
-                "|PagesVisited=" + _visitedPages +
-                "|RawItemsSeen=" + _rawItemsSeen +
-                "|Action=FallbackWithoutClickingItems");
-            return false;
+                "CHART_STORAGE_TAB_FAILED" +
+                "|Reason=" + reason +
+                "|Main=" + (_tabSelectionMain + 1) +
+                "|Sub=" + (_tabSelectionSub + 1) +
+                "|Stage=" + _tabSelectionStage);
+            ResetTabSelection();
+            return StorageTabSelectionResult.Failed;
+        }
+
+        private void ResetTabSelection()
+        {
+            _tabSelectionMain = -1;
+            _tabSelectionSub = -1;
+            _tabSelectionStage = 0;
+            _tabSelectionStableReads = 0;
+            _tabSelectionLastSignature = null;
+            _tabSelectionDeadlineUtc = DateTime.MinValue;
+            _tabSelectionEmptyConfirmUtc = DateTime.MinValue;
         }
 
         private string CurrentStoragePageSignature()
@@ -15641,11 +15347,11 @@ namespace AllflameBot
 
         private void ResetScan()
         {
+            ResetRawWithdrawCycle();
+            ResetTabSelection();
             _stage = 0;
             _mainTab = 0;
             _subTab = 0;
-            _withdrawMainTab = -1;
-            _withdrawSubTab = -1;
             _seenChartKeys.Clear();
             _mappedChartKeys.Clear();
             _skippedChartKeys.Clear();
@@ -19371,8 +19077,7 @@ namespace AllflameBot
                 AllflameLog.Info(
                     "CHART_DEVICE_OPEN|Source=ValerieConversationAssumed|InventoryCharts=" +
                     AllflameContext.InventoryChartCount);
-                await LokiCoroutine.Sleep(400);
-                return false;
+                return true;
             }
 
             NetworkObject valerie = AllflameContext.ValerieObject;
@@ -19537,12 +19242,14 @@ namespace AllflameBot
         private DateTime _descendIssuedUtc = DateTime.MinValue;
         private DateTime _portalConfirmedUtc = DateTime.MinValue;
         private DateTime _portalWaitUntilUtc = DateTime.MinValue;
+        private bool _capacityRecoveryClosePending;
 
         public EnterBathysphereTask()
             : base("LoadChartDeviceTask", "Loads a Chart into the device and presses Descend.") { }
 
         public override void Start()
         {
+            _capacityRecoveryClosePending = false;
             _nextActivateUtc = DateTime.MinValue;
             _customLoadAttempted = false;
             _customChartLocalId = 0;
@@ -19558,6 +19265,7 @@ namespace AllflameBot
 
         public override void Stop()
         {
+            _capacityRecoveryClosePending = false;
             _nextActivateUtc = DateTime.MinValue;
             _customLoadAttempted = false;
             _customChartLocalId = 0;
@@ -19576,6 +19284,18 @@ namespace AllflameBot
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
                 AllflameContext.Phase == AllflamePhase.VoyagePlanning;
+            if (_capacityRecoveryClosePending)
+            {
+                _capacityRecoveryClosePending = false;
+                await Coroutines.CloseBlockingWindows();
+                _nextActivateUtc =
+                    DateTime.UtcNow.AddMilliseconds(750);
+                AllflameLog.Info(
+                    "CHART_DEVICE_CAPACITY_RECOVERY" +
+                    "|Action=CloseChartDeviceOnNextCycle" +
+                    "|OneActionPerCycle=True");
+                return true;
+            }
             if (!inHub ||
                 !AllflameRunState.ChartRequested)
             {
@@ -19707,7 +19427,6 @@ namespace AllflameBot
                         portal.Distance.ToString("0.0") +
                         "|Mode=DirectObjectInteraction" +
                         "|Success=" + entered);
-                    await LokiCoroutine.Sleep(500);
                     if (entered)
                     {
                         return true;
@@ -19829,7 +19548,6 @@ namespace AllflameBot
                     "|Metadata=" + chart.Metadata +
                     "|Mode=CtrlClick" +
                     "|Result=" + moveResult);
-                await LokiCoroutine.Sleep(500);
                 return true;
             }
 
@@ -19849,7 +19567,6 @@ namespace AllflameBot
                 "CHART_DEVICE_DESCEND|DeviceCharts=" +
                 deviceItems.Count(AllflameContext.IsChartItem) +
                 "|Result=" + activateResult);
-            await LokiCoroutine.Sleep(700);
             return true;
         }
 
@@ -19929,7 +19646,6 @@ namespace AllflameBot
                         "|Metadata=" + chart.Metadata +
                         "|Mode=CtrlClick" +
                         "|Result=" + moveResult);
-                    await LokiCoroutine.Sleep(500);
                     return true;
                 }
             }
@@ -20009,10 +19725,7 @@ namespace AllflameBot
                     _portalWaitUntilUtc = DateTime.MinValue;
                     _descendDisabledSinceUtc =
                         DateTime.MinValue;
-                    await LokiCoroutine.Sleep(250);
-                    await Coroutines.CloseBlockingWindows();
-                    _nextActivateUtc =
-                        DateTime.UtcNow.AddMilliseconds(750);
+                    _capacityRecoveryClosePending = true;
                     return true;
                 }
                 _nextActivateUtc =
@@ -20052,7 +19765,6 @@ namespace AllflameBot
                 _customChartLocalId + "|Clicked=" + clicked +
                 "|DeviceItems=" + nativeDeviceItems.Count +
                 "|Attempt=" + _descendAttempts);
-            await LokiCoroutine.Sleep(900);
             return true;
         }
 
@@ -21302,6 +21014,7 @@ namespace AllflameBot
         private DateTime _shortEscapeWaitUntilUtc = DateTime.MinValue;
         private Vector2i _shortEscapeRecoveryOrigin;
         private int _shortEscapeAttempts;
+        private int _shortEscapeRadiusIndex;
         private int _shortEscapeCycle;
         private int _shortEscapeRecoveries;
 
@@ -21786,125 +21499,133 @@ namespace AllflameBot
                     player);
             }
 
-            while (_shortEscapeAttempts <
-                   MaximumShortEscapeAttempts)
+            if (_shortEscapeAttempts <
+                MaximumShortEscapeAttempts)
             {
                 int direction =
                     (_preferredDirection + _shortEscapeAttempts +
                      _shortEscapeCycle - 1) %
                     ShortEscapeOffsets.Length;
-                _shortEscapeAttempts++;
-                AllflameProgressWatchdog.SetRetry(
-                    _shortEscapeAttempts);
-
-                for (int radiusIndex = 0;
-                    radiusIndex < ShortEscapeRadii.Length;
-                    radiusIndex++)
+                int radiusIndex = Math.Max(
+                    0,
+                    Math.Min(
+                        ShortEscapeRadii.Length - 1,
+                        _shortEscapeRadiusIndex));
+                int radius = radiusIndex == 0
+                    ? Math.Max(
+                        ShortEscapeRadii[0],
+                        AllflameSettings.Instance
+                            .VoyageFrontierSpacing + 35)
+                    : ShortEscapeRadii[radiusIndex];
+                int candidateNumber =
+                    _shortEscapeAttempts *
+                    ShortEscapeRadii.Length +
+                    radiusIndex + 1;
+                _shortEscapeRadiusIndex++;
+                if (_shortEscapeRadiusIndex >=
+                    ShortEscapeRadii.Length)
                 {
-                    int radius = radiusIndex == 0
-                        ? Math.Max(
-                            ShortEscapeRadii[0],
-                            AllflameSettings.Instance
-                                .VoyageFrontierSpacing + 35)
-                        : ShortEscapeRadii[radiusIndex];
-                    double angle =
-                        direction * Math.PI * 2.0 /
-                            ShortEscapeOffsets.Length +
-                        (_shortEscapeCycle - 1) * Math.PI / 12.0;
-                    Vector2i requested = new Vector2i(
-                        player.X +
-                        (int)Math.Round(Math.Cos(angle) * radius),
-                        player.Y +
-                        (int)Math.Round(Math.Sin(angle) * radius));
-                    Vector2i resolved;
-                    Vector2i raycastHit;
-                    bool clipped;
-                    bool raycastOk =
-                        VoyageRollingFrontierPlanner
-                            .TryResolveRaycastTarget(
-                                player,
-                                requested,
-                                out resolved,
-                                out raycastHit,
-                                out clipped);
-                    float distance = player.DistanceF(resolved);
-                    bool pathChecked = false;
-                    bool pathOk = false;
-                    string rejectReason = String.Empty;
-                    if (!raycastOk)
+                    _shortEscapeRadiusIndex = 0;
+                    _shortEscapeAttempts++;
+                }
+                AllflameProgressWatchdog.SetRetry(candidateNumber);
+
+                double angle =
+                    direction * Math.PI * 2.0 /
+                        ShortEscapeOffsets.Length +
+                    (_shortEscapeCycle - 1) * Math.PI / 12.0;
+                Vector2i requested = new Vector2i(
+                    player.X +
+                    (int)Math.Round(Math.Cos(angle) * radius),
+                    player.Y +
+                    (int)Math.Round(Math.Sin(angle) * radius));
+                Vector2i resolved;
+                Vector2i raycastHit;
+                bool clipped;
+                bool raycastOk =
+                    VoyageRollingFrontierPlanner
+                        .TryResolveRaycastTarget(
+                            player,
+                            requested,
+                            out resolved,
+                            out raycastHit,
+                            out clipped);
+                float distance = player.DistanceF(resolved);
+                bool pathChecked = false;
+                bool pathOk = false;
+                string rejectReason = String.Empty;
+                if (!raycastOk)
+                {
+                    rejectReason = "RaycastRejected";
+                }
+                else if (distance < 12f)
+                {
+                    rejectReason = "ResolvedStepTooShort";
+                }
+                else
+                {
+                    pathChecked = true;
+                    try
                     {
-                        rejectReason = "RaycastRejected";
-                    }
-                    else if (distance < 12f)
-                    {
-                        rejectReason = "ResolvedStepTooShort";
-                    }
-                    else
-                    {
-                        pathChecked = true;
-                        try
-                        {
-                            pathOk = ExilePather.PathExistsBetween(
-                                player,
-                                resolved,
-                                false);
-                        }
-                        catch
-                        {
-                            pathOk = false;
-                            rejectReason = "PathException";
-                        }
-                        if (!pathOk &&
-                            String.IsNullOrEmpty(rejectReason))
-                        {
-                            rejectReason = "PathRejected";
-                        }
-                    }
-                    bool moving = false;
-                    if (pathOk)
-                    {
-                        moving = PlayerMoverManager.MoveTowards(
+                        pathOk = ExilePather.PathExistsBetween(
+                            player,
                             resolved,
-                            Name + " short frontier escape");
-                        if (!moving)
-                        {
-                            rejectReason = "MoveRejected";
-                        }
+                            false);
                     }
-                    AllflameLog.Info(
-                        "VOYAGE_SHORT_ESCAPE_ATTEMPT" +
-                        "|Cycle=" + _shortEscapeCycle +
-                        "|Attempt=" + _shortEscapeAttempts + "/" +
-                        MaximumShortEscapeAttempts +
-                        "|Direction=" + direction +
-                        "|Radius=" + radius +
-                        "|Requested=" + requested +
-                        "|Resolved=" + resolved +
-                        "|Distance=" + distance.ToString("0.0") +
-                        "|Raycast=" +
-                        (raycastOk
-                            ? (clipped ? "Clipped" : "Clear")
-                            : "Rejected") +
-                        "|PathChecked=" + pathChecked +
-                        "|PathResult=" +
-                        (pathChecked ? pathOk.ToString() : "NotRun") +
-                        "|RejectReason=" +
-                        (String.IsNullOrEmpty(rejectReason)
-                            ? "None"
-                            : rejectReason) +
-                        "|Moving=" + moving);
+                    catch
+                    {
+                        rejectReason = "PathException";
+                    }
+                    if (!pathOk &&
+                        String.IsNullOrEmpty(rejectReason))
+                    {
+                        rejectReason = "PathRejected";
+                    }
+                }
+
+                bool moving = false;
+                if (pathOk)
+                {
+                    moving = PlayerMoverManager.MoveTowards(
+                        resolved,
+                        Name + " short frontier escape");
                     if (!moving)
                     {
-                        continue;
+                        rejectReason = "MoveRejected";
                     }
-
+                }
+                AllflameLog.Info(
+                    "VOYAGE_SHORT_ESCAPE_ATTEMPT" +
+                    "|Cycle=" + _shortEscapeCycle +
+                    "|Candidate=" + candidateNumber + "/" +
+                    (MaximumShortEscapeAttempts *
+                     ShortEscapeRadii.Length) +
+                    "|Direction=" + direction +
+                    "|Radius=" + radius +
+                    "|Requested=" + requested +
+                    "|Resolved=" + resolved +
+                    "|Distance=" + distance.ToString("0.0") +
+                    "|Raycast=" + (raycastOk
+                        ? (clipped ? "Clipped" : "Clear")
+                        : "Rejected") +
+                    "|PathChecked=" + pathChecked +
+                    "|PathResult=" +
+                    (pathChecked ? pathOk.ToString() : "NotRun") +
+                    "|RejectReason=" +
+                    (String.IsNullOrEmpty(rejectReason)
+                        ? "None"
+                        : rejectReason) +
+                    "|Moving=" + moving +
+                    "|OneCandidatePerCycle=True");
+                if (moving)
+                {
                     _shortEscapeActive = true;
                     _shortEscapeOrigin = player;
                     _shortEscapeTarget = resolved;
                     _shortEscapeStartedUtc = now;
                     _preferredDirection = direction;
-                    return true;
                 }
+                return true;
             }
 
             if (_shortEscapeCycle >= MaximumShortEscapeCycles ||
@@ -21939,6 +21660,7 @@ namespace AllflameBot
                 "|Action=ReloadPatherAndRotateCycle");
             _shortEscapeActive = false;
             _shortEscapeAttempts = 0;
+            _shortEscapeRadiusIndex = 0;
             _shortEscapeCycle++;
             _shortEscapeWaitUntilUtc = now.AddSeconds(1);
             return true;
@@ -21981,6 +21703,7 @@ namespace AllflameBot
             _shortEscapeWaitUntilUtc = DateTime.MinValue;
             _shortEscapeRecoveryOrigin = new Vector2i();
             _shortEscapeAttempts = 0;
+            _shortEscapeRadiusIndex = 0;
             _shortEscapeCycle = 0;
             _shortEscapeRecoveries = 0;
         }
@@ -22178,7 +21901,7 @@ namespace AllflameBot
             double sideY = forwardX;
             int[] sideOffsets = { 75, -75, 120, -120 };
 
-            while (_detourAttempt < sideOffsets.Length)
+            if (_detourAttempt < sideOffsets.Length)
             {
                 int sideOffset = sideOffsets[_detourAttempt++];
                 Vector2i candidate = new Vector2i(
@@ -22203,8 +21926,9 @@ namespace AllflameBot
                         "|Attempt=" + _detourAttempt +
                         "|Candidate=" + candidate +
                         "|Reason=RaycastBlocked" +
-                        "|Hit=" + raycastHit);
-                    continue;
+                        "|Hit=" + raycastHit +
+                        "|OneCandidatePerCycle=True");
+                    return true;
                 }
                 candidate = resolvedCandidate;
                 bool moving = PlayerMoverManager.MoveTowards(
@@ -22212,7 +21936,13 @@ namespace AllflameBot
                     Name + " obstacle detour");
                 if (!moving)
                 {
-                    continue;
+                    AllflameLog.Info(
+                        "VOYAGE_OBSTACLE_DETOUR_REJECTED" +
+                        "|Attempt=" + _detourAttempt +
+                        "|Candidate=" + candidate +
+                        "|Reason=MoveRejected" +
+                        "|OneCandidatePerCycle=True");
+                    return true;
                 }
 
                 _detouring = true;
@@ -25022,7 +24752,7 @@ namespace AllflameBot
         private const int MaximumRecoveryCycles = 3;
         private const int RegistryAnchorReacquireSeconds = 5;
         private const float RegistryAnchorReacquireDistance = 65f;
-        private const int LockedTargetReacquireMilliseconds = 1000;
+        private const int LockedTargetReacquireMilliseconds = 3500;
         private static readonly bool UseDirectDpbCallUi = false;
         private DateTime _surfaceTransferBackoffUtc =
             DateTime.MinValue;
@@ -25032,6 +24762,9 @@ namespace AllflameBot
         private bool _surfaceSentForRequest;
         private int _transferFailures;
         private int _transferRecoveryCycles;
+        private int _pendingTransferLocalId;
+        private int _pendingTransferBeforeStack;
+        private DateTime _pendingTransferIssuedUtc = DateTime.MinValue;
         private bool _hasRouteTarget;
         private Vector2i _routeTarget;
         private float _bestRouteDistance = Single.MaxValue;
@@ -25196,11 +24929,13 @@ namespace AllflameBot
 
         public override void Start()
         {
+            ClearPendingTransfer();
             ResetZeroLanternRescue("TaskStart");
         }
 
         public override void Stop()
         {
+            ClearPendingTransfer();
             ResetZeroLanternRescue("TaskStop");
             AllflameProgressWatchdog.Clear();
         }
@@ -26101,6 +25836,50 @@ namespace AllflameBot
                     "|InventoryFreeSquares=" +
                     AllflameContext.InventoryFreeSquares);
             }
+            if (transferEnabled && _pendingTransferLocalId != 0)
+            {
+                Item remaining = FindInventoryItemByLocalId(
+                    _pendingTransferLocalId);
+                bool confirmed = remaining == null ||
+                    Math.Max(1, remaining.StackCount) <
+                        _pendingTransferBeforeStack;
+                if (confirmed)
+                {
+                    _batchHadItems = true;
+                    _surfaceSentForRequest = false;
+                    _sendAttempts = 0;
+                    _transferFailures = 0;
+                    _transferRecoveryCycles = 0;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "CapsuleInventoryItemTransferred");
+                    AllflameLog.Info(
+                        "CAPSULE_TRANSFER_CONFIRMED" +
+                        "|LocalId=" + _pendingTransferLocalId +
+                        "|BeforeStack=" +
+                        _pendingTransferBeforeStack +
+                        "|Remaining=" + (remaining == null
+                            ? 0
+                            : Math.Max(1, remaining.StackCount)) +
+                        "|OneActionPerCycle=True");
+                    ClearPendingTransfer();
+                    return true;
+                }
+                if (DateTime.UtcNow - _pendingTransferIssuedUtc <
+                    TimeSpan.FromMilliseconds(900))
+                {
+                    return true;
+                }
+                _transferFailures++;
+                AllflameLog.Info(
+                    "CAPSULE_TRANSFER_REJECTED" +
+                    "|LocalId=" + _pendingTransferLocalId +
+                    "|FailureCount=" + _transferFailures +
+                    "|Reason=SourceItemUnchanged" +
+                    "|Action=RetryFreshSnapshot");
+                ClearPendingTransfer();
+                return true;
+            }
+
             transferable = transferEnabled
                 ? GetTransferableInventoryItem()
                 : null;
@@ -26109,18 +25888,16 @@ namespace AllflameBot
             {
                 _nextActionUtc =
                     DateTime.UtcNow.AddMilliseconds(180);
-                bool moved =
+                bool submitted =
                     await CtrlClickInventoryItem(transferable);
-                if (moved)
+                if (submitted)
                 {
-                    _batchHadItems = true;
-                    if (_surfaceSentForRequest)
-                    {
-                        _surfaceSentForRequest = false;
-                        _sendAttempts = 0;
-                    }
-                    _transferFailures = 0;
-                    _transferRecoveryCycles = 0;
+                    _pendingTransferLocalId =
+                        transferable.LocalId;
+                    _pendingTransferBeforeStack = Math.Max(
+                        1,
+                        transferable.StackCount);
+                    _pendingTransferIssuedUtc = DateTime.UtcNow;
                 }
                 else
                 {
@@ -26130,9 +25907,10 @@ namespace AllflameBot
                     "CAPSULE_TRANSFER_ITEM|Id=" + transferable.Id +
                     "|Name=" +
                     (transferable.FullName ?? transferable.Name) +
-                    "|Success=" + moved +
-                    "|FailureCount=" + _transferFailures);
-                if (!moved && _transferFailures >= 3)
+                    "|Submitted=" + submitted +
+                    "|FailureCount=" + _transferFailures +
+                    "|Action=ReturnToTaskManager");
+                if (!submitted && _transferFailures >= 3)
                 {
                     _transferFailures = 0;
                     _transferRecoveryCycles++;
@@ -27755,7 +27533,9 @@ namespace AllflameBot
         private static float RescueInteractionThreshold(
             AllflameSettings settings)
         {
-            return Math.Max(35f, settings.InteractDistance + 12f);
+            return Math.Min(
+                25f,
+                Math.Max(20f, settings.InteractDistance));
         }
 
         private NetworkObject FindLiveRescueCapsule(
@@ -27767,121 +27547,151 @@ namespace AllflameBot
             bool maintainLocked = searchMode !=
                 CapsuleRescueSearchMode.AcquireNewTarget;
             bool filteredAsTried = false;
+            NetworkObject found = null;
             NetworkObject rejectedLocked = null;
+            float bestDistance = Single.MaxValue;
+            int scanned = 0;
+            var details = new StringBuilder();
             try
             {
-                List<NetworkObject> scanned = LokiPoe.ObjectManager.Objects
-                    .Where(IsRescueCapsuleObject)
-                    .ToList();
-                NetworkObject found;
-                if (maintainLocked)
+                IEnumerable<NetworkObject> objects =
+                    LokiPoe.ObjectManager.Objects;
+                if (objects != null)
                 {
-                    rejectedLocked = scanned.FirstOrDefault(obj =>
-                        obj != null && obj.Id == _rescueTargetId);
-                    found = scanned
-                        .Where(IsLockedRescueTargetUsable)
-                        .OrderBy(obj => obj.Distance)
-                        .FirstOrDefault();
-                }
-                else
-                {
-                    IEnumerable<NetworkObject> usable = scanned
-                        .Where(obj => IsRescueCapsuleUsable(obj))
-                        .Where(obj =>
-                            anchor == default(Vector2i) ||
-                            obj.Position.DistanceF(anchor) <= 25f);
-                    filteredAsTried = !includeTried &&
-                        _rescueStrategy ==
-                            CapsuleRescueStrategy.LiveObservedCapsule &&
-                        usable.Any(obj => _rescueTargetsThisCycle.Contains(
-                            RescueTargetKey(obj.Position)));
-                    found = usable
-                        .Where(obj =>
-                            includeTried ||
-                            _rescueStrategy !=
-                                CapsuleRescueStrategy.LiveObservedCapsule ||
-                            !_rescueTargetsThisCycle.Contains(
-                                RescueTargetKey(obj.Position)))
-                        .OrderBy(obj => obj.Distance)
-                        .FirstOrDefault();
-                }
-                string scanDetails = String.Join(",",
-                    scanned.Take(8).Select(obj =>
-                        obj.Id + ":" + obj.IsValid + ":" +
-                        obj.IsTargetable + ":" + obj.Position + ":" +
-                        (anchor == default(Vector2i)
-                            ? "Any"
-                            : obj.Position.DistanceF(anchor).ToString("0.0"))));
-                AllflameLog.Throttled(
-                    "capsule_rescue_live_scan_" + _rescueCycle + "_" +
-                    RescueTargetKey(anchor) + "_" + searchMode,
-                    TimeSpan.FromMilliseconds(500),
-                    "CAPSULE_RESCUE_LIVE_SCAN" +
-                    "|Task=" + Name +
-                    "|AreaHash=" + AllflameContext.AreaHash +
-                    "|Cycle=" + _rescueCycle +
-                    "|Strategy=" + _rescueStrategy +
-                    "|RoutePlan=" + _rescueRoutePlan +
-                    "|SearchMode=" + searchMode +
-                    "|TargetId=" + _rescueTargetId +
-                    "|Anchor=" + anchor +
-                    "|RegistryOnly=" + _rescueTargetRegistryOnly +
-                    "|LiveObserved=" + (found != null) +
-                    "|FilteredAsTried=" + filteredAsTried +
-                    "|Proven=" + _rescueTargetProven +
-                    "|Scanned=" + scanned.Count +
-                    "|Objects=" + scanDetails +
-                    "|UiVisible=" + RescueUiVisible() +
-                    "|NextAction=" + (found == null ? "ContinueReacquire" : "UseLiveTarget"));
-                if (found != null)
-                {
-                    if (maintainLocked)
+                    foreach (NetworkObject obj in objects)
                     {
-                        LogLockedTargetRetained(found, searchMode);
+                        if (!IsRescueCapsuleObject(obj))
+                        {
+                            continue;
+                        }
+                        scanned++;
+                        if (scanned <= 8)
+                        {
+                            if (details.Length > 0)
+                            {
+                                details.Append(',');
+                            }
+                            details.Append(obj.Id).Append(':')
+                                .Append(obj.IsValid).Append(':')
+                                .Append(obj.IsTargetable).Append(':')
+                                .Append(obj.Position).Append(':')
+                                .Append(anchor == default(Vector2i)
+                                    ? "Any"
+                                    : obj.Position.DistanceF(anchor)
+                                        .ToString("0.0"));
+                        }
+
+                        if (maintainLocked)
+                        {
+                            if (obj.Id == _rescueTargetId)
+                            {
+                                rejectedLocked = obj;
+                            }
+                            if (!IsLockedRescueTargetUsable(obj))
+                            {
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            if (!IsRescueCapsuleUsable(obj) ||
+                                (anchor != default(Vector2i) &&
+                                 obj.Position.DistanceF(anchor) > 25f))
+                            {
+                                continue;
+                            }
+                            bool tried =
+                                _rescueStrategy ==
+                                    CapsuleRescueStrategy
+                                        .LiveObservedCapsule &&
+                                _rescueTargetsThisCycle.Contains(
+                                    RescueTargetKey(obj.Position));
+                            if (!includeTried && tried)
+                            {
+                                filteredAsTried = true;
+                                continue;
+                            }
+                        }
+
+                        float distance = obj.Distance;
+                        if (found == null || distance < bestDistance)
+                        {
+                            found = obj;
+                            bestDistance = distance;
+                        }
                     }
-                    return found;
                 }
             }
             catch
             {
             }
-            NetworkObject fallback = AllflameContext.CapsuleObject;
+
+            if (found == null)
+            {
+                NetworkObject fallback = AllflameContext.CapsuleObject;
+                if (maintainLocked)
+                {
+                    if (IsLockedRescueTargetUsable(fallback))
+                    {
+                        found = fallback;
+                    }
+                    else if (rejectedLocked == null && fallback != null)
+                    {
+                        rejectedLocked = fallback;
+                    }
+                }
+                else if (IsRescueCapsuleUsable(fallback) &&
+                    (anchor == default(Vector2i) ||
+                     fallback.Position.DistanceF(anchor) <= 25f) &&
+                    (includeTried ||
+                     _rescueStrategy !=
+                        CapsuleRescueStrategy.LiveObservedCapsule ||
+                     !_rescueTargetsThisCycle.Contains(
+                        RescueTargetKey(fallback.Position))))
+                {
+                    found = fallback;
+                }
+            }
+
+            AllflameLog.Throttled(
+                "capsule_rescue_live_scan_" + _rescueCycle + "_" +
+                RescueTargetKey(anchor) + "_" + searchMode,
+                TimeSpan.FromMilliseconds(500),
+                "CAPSULE_RESCUE_LIVE_SCAN" +
+                "|Task=" + Name +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|Cycle=" + _rescueCycle +
+                "|Strategy=" + _rescueStrategy +
+                "|RoutePlan=" + _rescueRoutePlan +
+                "|SearchMode=" + searchMode +
+                "|TargetId=" + _rescueTargetId +
+                "|Anchor=" + anchor +
+                "|RegistryOnly=" + _rescueTargetRegistryOnly +
+                "|LiveObserved=" + (found != null) +
+                "|FilteredAsTried=" + filteredAsTried +
+                "|Proven=" + _rescueTargetProven +
+                "|Scanned=" + scanned +
+                "|Objects=" + details +
+                "|ObjectScan=SinglePass" +
+                "|UiVisible=" + RescueUiVisible() +
+                "|NextAction=" +
+                (found == null ? "ContinueReacquire" : "UseLiveTarget"));
+            if (found != null)
+            {
+                if (maintainLocked)
+                {
+                    LogLockedTargetRetained(found, searchMode);
+                }
+                return found;
+            }
             if (maintainLocked)
             {
-                if (IsLockedRescueTargetUsable(fallback))
-                {
-                    LogLockedTargetRetained(fallback, searchMode);
-                    return fallback;
-                }
-                if (rejectedLocked == null && fallback != null)
-                {
-                    try
-                    {
-                        if (fallback.Id == _rescueTargetId)
-                        {
-                            rejectedLocked = fallback;
-                        }
-                    }
-                    catch
-                    {
-                    }
-                }
                 LogLockedTargetRejected(
                     rejectedLocked,
                     searchMode,
                     LockedTargetRejectionReason(rejectedLocked));
-                return null;
             }
-            return IsRescueCapsuleUsable(fallback) &&
-                (anchor == default(Vector2i) ||
-                 fallback.Position.DistanceF(anchor) <= 25f) &&
-                (includeTried ||
-                 _rescueStrategy !=
-                    CapsuleRescueStrategy.LiveObservedCapsule ||
-                 !_rescueTargetsThisCycle.Contains(
-                    RescueTargetKey(fallback.Position)))
-                    ? fallback
-                    : null;
+            return null;
         }
 
         private bool IsLockedRescueTargetUsable(NetworkObject capsule)
@@ -28108,9 +27918,8 @@ namespace AllflameBot
             _rescueBestDistance = Single.MaxValue;
             if (stage == ZeroLanternExtractionStage.ApproachInteractionRing)
             {
-                _rescueInteractionRange = Math.Max(
-                    35f,
-                    AllflameSettings.Instance.InteractDistance + 12f);
+                _rescueInteractionRange = RescueInteractionThreshold(
+                    AllflameSettings.Instance);
                 _rescueCandidate = null;
                 _rescueApproachCandidates.Clear();
                 _rescueCandidateCursor = 0;
@@ -29965,174 +29774,87 @@ namespace AllflameBot
             }
         }
 
-        private static async Task<bool> CtrlClickInventoryItem(Item item)
+        private static async Task<bool> CtrlClickInventoryItem(
+            Item item)
         {
+            await Task.CompletedTask;
+            if (item == null || item.LocalId <= 0)
+            {
+                return false;
+            }
             try
             {
-                var control = LokiPoe.InGameState.InventoryUi
-                    .InventoryControl_Main;
+                InventoryControlWrapper control =
+                    LokiPoe.InGameState.InventoryUi
+                        .InventoryControl_Main;
                 if (control == null ||
                     control.Inventory == null)
                 {
                     return false;
                 }
-                var slotUi = control.InventorySlotUiElement;
-                if (slotUi == null)
-                {
-                    return false;
-                }
-
-                int itemKey = item.LocalId != 0
-                    ? item.LocalId
-                    : item.Id;
-                int beforeStack = Math.Max(1, item.StackCount);
-                try
-                {
-                    var fastMoveResult =
-                        control.FastMove(item.LocalId);
-                    AllflameLog.Info(
-                        "CAPSULE_TRANSFER_INPUT" +
-                        "|Strategy=InventoryFastMove" +
-                        "|LocalId=" + item.LocalId +
-                        "|Result=" + fastMoveResult);
-                    for (int poll = 0; poll < 6; poll++)
-                    {
-                        await LokiCoroutine.Sleep(90);
-                        AllflameContext.Refresh(true);
-                        Inventory refreshedInventory =
-                            LokiPoe.InGameState.InventoryUi
-                                .InventoryControl_Main
-                                .Inventory;
-                        Item remaining = FindInventoryItem(
-                            refreshedInventory,
-                            itemKey,
-                            item);
-                        if (remaining == null ||
-                            Math.Max(1, remaining.StackCount) <
-                                beforeStack)
-                        {
-                            return true;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AllflameLog.Info(
-                        "CAPSULE_TRANSFER_INPUT" +
-                        "|Strategy=InventoryFastMove" +
-                        "|Result=Exception" +
-                        "|Error=" + ex.GetType().Name +
-                        ":" + ex.Message +
-                        "|Fallback=CtrlClick");
-                }
-
-                Element itemElement = null;
-                var elements = slotUi.DictionaryIdElements;
-                if (elements != null &&
-                    !elements.TryGetValue(item.LocalId, out itemElement))
-                {
-                    elements.TryGetValue(item.Id, out itemElement);
-                }
-                Vector2i location =
-                    itemElement != null &&
-                    itemElement.IsValid &&
-                    itemElement.IsVisible
-                        ? itemElement.CenterClickLocation()
-                        : slotUi.SlotClickLocation(
-                            new Vector2i(
-                                item.LocationTopLeft.X + 1,
-                                item.LocationTopLeft.Y + 1));
-                bool controlDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(location, true);
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    controlDown = true;
-                    await LokiCoroutine.Sleep(25);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    for (int poll = 0; poll < 8; poll++)
-                    {
-                        await LokiCoroutine.Sleep(100);
-                        AllflameContext.Refresh(true);
-                        Inventory refreshedInventory =
-                            LokiPoe.InGameState.InventoryUi
-                                .InventoryControl_Main
-                                .Inventory;
-                        Item remaining = FindInventoryItem(
-                            refreshedInventory,
-                            itemKey,
-                            item);
-                        if (remaining == null ||
-                            Math.Max(1, remaining.StackCount) <
-                                beforeStack)
-                        {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-                finally
-                {
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                }
+                FastMoveResult result =
+                    control.FastMove(item.LocalId);
+                AllflameLog.Info(
+                    "CAPSULE_TRANSFER_INPUT" +
+                    "|Strategy=InventoryFastMove" +
+                    "|LocalId=" + item.LocalId +
+                    "|Result=" + result +
+                    "|Action=ReturnToTaskManager");
+                return result == FastMoveResult.None;
             }
             catch (Exception ex)
             {
                 AllflameLog.Info(
-                    "CAPSULE_TRANSFER_FAILED|" +
-                    ex.GetType().Name + "|" + ex.Message);
+                    "CAPSULE_TRANSFER_INPUT" +
+                    "|Strategy=InventoryFastMove" +
+                    "|Result=Exception" +
+                    "|Error=" + ex.GetType().Name +
+                    ":" + ex.Message);
                 return false;
             }
         }
 
-        private static Item FindInventoryItem(
-            Inventory inventory,
-            int itemKey,
-            Item original)
+        private static Item FindInventoryItemByLocalId(
+            int localId)
         {
+            if (localId <= 0)
+            {
+                return null;
+            }
             try
             {
-                if (inventory == null ||
-                    inventory.Items == null)
+                List<Item> items = LokiPoe.InGameState.InventoryUi
+                    .InventoryControl_Main.Inventory.Items;
+                if (items == null)
                 {
                     return null;
                 }
-
-                return inventory.Items.FirstOrDefault(candidate =>
-                    candidate != null &&
-                    candidate.IsValid &&
-                    ((candidate.LocalId != 0 &&
-                      candidate.LocalId == itemKey) ||
-                     candidate.Id == itemKey ||
-                     (original != null &&
-                      candidate.LocationTopLeft ==
-                          original.LocationTopLeft &&
-                      String.Equals(
-                          candidate.Metadata,
-                          original.Metadata,
-                          StringComparison.OrdinalIgnoreCase))));
+                foreach (Item item in items)
+                {
+                    if (item != null &&
+                        item.IsValid &&
+                        item.LocalId == localId)
+                    {
+                        return item;
+                    }
+                }
             }
             catch
             {
-                return original != null && original.IsValid
-                    ? original
-                    : null;
             }
+            return null;
+        }
+
+        private void ClearPendingTransfer()
+        {
+            _pendingTransferLocalId = 0;
+            _pendingTransferBeforeStack = 0;
+            _pendingTransferIssuedUtc = DateTime.MinValue;
         }
 
         private void ResetRequest()
         {
+            ClearPendingTransfer();
             ResetZeroLanternRescue("RequestReset");
             _nextActionUtc = DateTime.MinValue;
             _requestActive = false;
