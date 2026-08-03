@@ -996,6 +996,11 @@ namespace AllflameBot
             bool valuableNotification =
                 settings.NotifyValuableItems &&
                 valuableValue >= settings.ValuableItemMinDivines;
+            bool tagEveryone =
+                valuableNotification &&
+                settings.TagEveryoneForValuableItems;
+            bool immediateNotification =
+                bottleNotification || valuableNotification;
 
             AllflameLog.Info(
                 "SECRET_BOTTLE_NOTIFICATION" +
@@ -1007,10 +1012,15 @@ namespace AllflameBot
                 valuableValue.ToString("0.####", CultureInfo.InvariantCulture) +
                 "|BottleNotification=" + bottleNotification +
                 "|ValuableNotification=" + valuableNotification +
+                "|TagEveryone=" + tagEveryone +
+                "|Delivery=" +
+                (immediateNotification
+                    ? "ImmediateWebhook"
+                    : "Disabled") +
                 "|Decision=" + (decision ?? String.Empty).Replace("|", "/") +
                 "|Placement=" + (placement ?? String.Empty).Replace("|", "/"));
 
-            if (bottleNotification)
+            if (immediateNotification)
             {
                 string valueText = quote.IsPriced
                     ? FormatDivines(quote.TotalDivines)
@@ -1019,7 +1029,9 @@ namespace AllflameBot
                         ? "up to " + FormatDivines(valuableValue)
                         : "Unpriced";
                 var embed = NewEmbed(
-                    "Bottle reward added to inventory",
+                    valuableNotification
+                        ? "Valuable bottle reward added to inventory"
+                        : "Bottle reward added to inventory",
                     BuildTable(new[]
                     {
                         Pair("Item", quote.Name ?? "Unknown"),
@@ -1033,12 +1045,21 @@ namespace AllflameBot
                 {
                     Text = PriceFooter()
                 };
-                Send(embed);
+                Send(
+                    new List<DiscordEmbed> { embed },
+                    tagEveryone ? "@everyone" : null,
+                    tagEveryone);
             }
 
             if (valuableNotification)
             {
-                SendValuableItem(quote, "Message in a Bottle");
+                lock (Sync)
+                {
+                    _lastEvent =
+                        "Valuable bottle reward: " + quote.Name +
+                        " x" + quantity +
+                        " | " + FormatDivines(valuableValue);
+                }
             }
         }
 
@@ -1683,7 +1704,10 @@ namespace AllflameBot
                             return;
                         }
                     }
-                    AllflameLog.Info("DISCORD_SEND|Embeds=" + embeds.Count + "|Result=Success");
+                    AllflameLog.Info(
+                        "DISCORD_SEND|Embeds=" + embeds.Count +
+                        "|MentionEveryone=" + allowEveryone +
+                        "|Result=Success");
                 }
                 catch (Exception ex)
                 {

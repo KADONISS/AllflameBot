@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.127";
+        public const string Current = "0.23.129";
     }
 
     public sealed class AllflameBot : IBot
@@ -5357,7 +5357,7 @@ namespace AllflameBot
 
                     bool moving = MoveTowardsInteraction(
                         obj.Position,
-                        Name);
+                        Name + " " + label);
                     if (_moveFailureObjectId != obj.Id)
                     {
                         _moveFailureObjectId = obj.Id;
@@ -5440,7 +5440,7 @@ namespace AllflameBot
             AllflameMover mover =
                 PlayerMoverManager.Current as AllflameMover;
             return mover != null
-                ? mover.MoveTowardsPrecise(position, context)
+                ? mover.MoveTowardsInteraction(position, context)
                 : PlayerMoverManager.MoveTowards(position, context);
         }
 
@@ -5454,11 +5454,20 @@ namespace AllflameBot
                 // Release a held Move input before waiting for DPB's current
                 // action. Otherwise a nearby target can be crossed while
                 // FinishCurrentAction is waiting for movement to end.
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                AllflameMover mover =
+                    PlayerMoverManager.Current as AllflameMover;
+                bool heldMovement = mover != null
+                    ? mover.ReleaseMovementInput()
+                    : false;
+                if (mover == null)
+                {
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                }
                 // Preserve DPB's FinishCurrentAction(true) synchronization,
                 // but never let a long MoveTowards action hold the complete
                 // bot task loop while an interaction target is already near.
-                Coroutines.FinishCurrentActionTimeout = 750;
+                Coroutines.FinishCurrentActionTimeout =
+                    heldMovement ? 750 : 350;
                 await Coroutines.FinishCurrentAction(true);
                 LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 AllflameLog.Throttled(
@@ -5467,6 +5476,7 @@ namespace AllflameBot
                     "ACTION_SYNC|Task=" + Name +
                     "|Target=" + target +
                     "|FinishCurrentAction=True" +
+                    "|HeldMovement=" + heldMovement +
                     "|ResetInput=True");
             }
             catch (Exception ex)
@@ -10019,81 +10029,132 @@ namespace AllflameBot
             _chartDetectionAttempts = 0;
             _lastInsufficientChartCount = -1;
             _stableInsufficientChartSnapshots = 0;
-            int placed = 0;
-            int expectedAvailable = availableCount;
-            for (int placement = 0; placement < 9; placement++)
+            VoyagePlanningUi.StableChartBatchPlan batchPlan;
+            string batchRejection;
+            bool batchReady =
+                VoyagePlanningUi.TryCreateStableChartBatchPlan(
+                    snapshot,
+                    9,
+                    out batchPlan,
+                    out batchRejection) &&
+                batchPlan.Entries.Count == 9;
+            int batchInputs = 0;
+            if (batchReady)
             {
-                VoyagePlanningUi.StableVoyageSnapshot current;
-                if (!VoyagePlanningUi.TryResolveStable(out current) ||
-                    current.AvailableChartSlots.Count == 0)
-                {
-                    break;
-                }
-
-                int beforeAvailable =
-                    current.AvailableChartSlots.Count;
-                int beforeBoard = current.BoardChartCount;
-                VoyagePlanningUi.StableChartSlot chartSlot =
-                    current.AvailableChartSlots[0];
-                bool inputSent =
-                    await VoyagePlanningUi.CtrlClickStableChartSlot(
-                        current,
-                        chartSlot,
-                        placement);
-                bool moved = false;
-                int afterAvailable = beforeAvailable;
-                int afterBoard = beforeBoard;
-                for (int poll = 0;
-                     inputSent && poll < 8;
-                     poll++)
-                {
-                    await LokiCoroutine.Sleep(80);
-                    VoyagePlanningUi.StableVoyageSnapshot refreshed;
-                    if (VoyagePlanningUi.TryResolveStable(
-                            out refreshed))
-                    {
-                        afterAvailable =
-                            refreshed.AvailableChartSlots.Count;
-                        afterBoard = refreshed.BoardChartCount;
-                        if (afterAvailable < beforeAvailable ||
-                            afterBoard > beforeBoard)
-                        {
-                            moved = true;
-                            break;
-                        }
-                    }
-                }
-
+                int firstInputs =
+                    await VoyagePlanningUi.CtrlClickStableChartBatch(
+                        batchPlan,
+                        0,
+                        3);
+                batchInputs += firstInputs;
+                await LokiCoroutine.Sleep(160);
+                VoyagePlanningUi.StableVoyageSnapshot intermediate;
+                bool intermediateResolved =
+                    VoyagePlanningUi.TryResolveStable(out intermediate);
+                int intermediateMoved = intermediateResolved
+                    ? Math.Max(
+                        availableCount -
+                            intermediate.AvailableChartSlots.Count,
+                        intermediate.BoardChartCount)
+                    : 0;
+                bool intermediateValid =
+                    intermediateResolved &&
+                    VoyagePlanningUi.StableSnapshotMatchesBatch(
+                        intermediate,
+                        batchPlan) &&
+                    intermediateMoved >= firstInputs;
                 AllflameLog.Info(
-                    "VOYAGE_CHART_STABLE_MOVE_VERIFY" +
-                    "|Placement=" + (placement + 1) + "/9" +
-                    "|BeforeAvailable=" + beforeAvailable +
-                    "|AfterAvailable=" + afterAvailable +
-                    "|BeforeBoard=" + beforeBoard +
-                    "|AfterBoard=" + afterBoard +
-                    "|InputSent=" + inputSent +
-                    "|Moved=" + moved);
-                if (!moved)
+                    "VOYAGE_CHART_BATCH_VERIFY" +
+                    "|Stage=Intermediate" +
+                    "|Inputs=" + firstInputs +
+                    "|Moved=" + intermediateMoved +
+                    "|Resolved=" + intermediateResolved +
+                    "|ContextValid=" + intermediateValid +
+                    "|Action=" +
+                    (intermediateValid
+                        ? "ContinueCachedBatch"
+                        : "UseVerifiedFallback"));
+                if (intermediateValid)
                 {
-                    break;
+                    batchInputs +=
+                        await VoyagePlanningUi.CtrlClickStableChartBatch(
+                            batchPlan,
+                            3,
+                            6);
                 }
-                expectedAvailable = afterAvailable;
-                placed++;
+            }
+            else
+            {
+                AllflameLog.Info(
+                    "VOYAGE_CHART_BATCH_FALLBACK" +
+                    "|Reason=" +
+                    (String.IsNullOrEmpty(batchRejection)
+                        ? "FewerThanNineCachedCharts"
+                        : batchRejection) +
+                    "|Action=UseVerifiedClicks");
             }
 
-            await LokiCoroutine.Sleep(350);
+            await LokiCoroutine.Sleep(batchInputs > 0 ? 220 : 20);
             VoyagePlanningUi.StableVoyageSnapshot finalSnapshot;
             bool finalResolved =
                 VoyagePlanningUi.TryResolveStable(
                     out finalSnapshot);
             int finalAvailable = finalResolved
                 ? finalSnapshot.AvailableChartSlots.Count
-                : expectedAvailable;
+                : availableCount;
             int finalBoard = finalResolved
                 ? finalSnapshot.BoardChartCount
-                : placed;
+                : 0;
+            int placed = finalResolved
+                ? Math.Min(
+                    9,
+                    Math.Max(
+                        availableCount - finalAvailable,
+                        finalBoard))
+                : 0;
+            AllflameLog.Info(
+                "VOYAGE_CHART_BATCH_VERIFY" +
+                "|Stage=Final" +
+                "|Inputs=" + batchInputs +
+                "|Moved=" + placed +
+                "|Available=" + finalAvailable +
+                "|Board=" + finalBoard +
+                "|Resolved=" + finalResolved);
+
+            if (placed < 9)
+            {
+                int fallbackRequired = 9 - placed;
+                AllflameLog.Info(
+                    "VOYAGE_CHART_BATCH_FALLBACK" +
+                    "|Reason=BatchConvergenceIncomplete" +
+                    "|Placed=" + placed +
+                    "|Remaining=" + fallbackRequired +
+                    "|Action=RetryMissingIndividually");
+                int fallbackPlaced =
+                    await PlaceStableChartsIndividually(
+                        fallbackRequired,
+                        placed);
+                placed += fallbackPlaced;
+                await LokiCoroutine.Sleep(160);
+                finalResolved =
+                    VoyagePlanningUi.TryResolveStable(
+                        out finalSnapshot);
+                finalAvailable = finalResolved
+                    ? finalSnapshot.AvailableChartSlots.Count
+                    : Math.Max(0, availableCount - placed);
+                finalBoard = finalResolved
+                    ? finalSnapshot.BoardChartCount
+                    : placed;
+                placed = finalResolved
+                    ? Math.Min(
+                        9,
+                        Math.Max(
+                            availableCount - finalAvailable,
+                            finalBoard))
+                    : placed;
+            }
             bool placementConfirmed =
-                placed == 9 &&
+                placed >= 9 &&
                 (finalBoard >= 9 ||
                  finalAvailable <= availableCount - 9);
             AllflameLog.Info(
@@ -10152,6 +10213,73 @@ namespace AllflameBot
             _retryAfterUtc =
                 DateTime.UtcNow.AddSeconds(1);
             return true;
+        }
+
+        private static async Task<int> PlaceStableChartsIndividually(
+            int required,
+            int alreadyPlaced)
+        {
+            int confirmed = 0;
+            for (int attempt = 0;
+                 attempt < required;
+                 attempt++)
+            {
+                VoyagePlanningUi.StableVoyageSnapshot current;
+                if (!VoyagePlanningUi.TryResolveStable(out current) ||
+                    current.AvailableChartSlots.Count == 0)
+                {
+                    break;
+                }
+                int beforeAvailable =
+                    current.AvailableChartSlots.Count;
+                int beforeBoard = current.BoardChartCount;
+                bool inputSent =
+                    await VoyagePlanningUi.CtrlClickStableChartSlot(
+                        current,
+                        current.AvailableChartSlots[0],
+                        alreadyPlaced + confirmed);
+                bool moved = false;
+                int afterAvailable = beforeAvailable;
+                int afterBoard = beforeBoard;
+                for (int poll = 0;
+                     inputSent && poll < 6;
+                     poll++)
+                {
+                    await LokiCoroutine.Sleep(80);
+                    VoyagePlanningUi.StableVoyageSnapshot refreshed;
+                    if (!VoyagePlanningUi.TryResolveStable(
+                            out refreshed))
+                    {
+                        continue;
+                    }
+                    afterAvailable =
+                        refreshed.AvailableChartSlots.Count;
+                    afterBoard = refreshed.BoardChartCount;
+                    if (afterAvailable < beforeAvailable ||
+                        afterBoard > beforeBoard)
+                    {
+                        moved = true;
+                        break;
+                    }
+                }
+                AllflameLog.Info(
+                    "VOYAGE_CHART_STABLE_MOVE_VERIFY" +
+                    "|Placement=" +
+                    (alreadyPlaced + confirmed + 1) + "/9" +
+                    "|BeforeAvailable=" + beforeAvailable +
+                    "|AfterAvailable=" + afterAvailable +
+                    "|BeforeBoard=" + beforeBoard +
+                    "|AfterBoard=" + afterBoard +
+                    "|InputSent=" + inputSent +
+                    "|Moved=" + moved +
+                    "|Mode=BatchFallback");
+                if (!moved)
+                {
+                    break;
+                }
+                confirmed++;
+            }
+            return confirmed;
         }
 
         private static string FindVoyageDialogOption()
@@ -10481,6 +10609,28 @@ namespace AllflameBot
             public int Index;
         }
 
+        internal sealed class StableChartBatchEntry
+        {
+            public int InventoryIndex;
+            public long ElementAddress;
+            public Vector2i ClientLocation;
+            public string CoordinateMode;
+        }
+
+        internal sealed class StableChartBatchPlan
+        {
+            public uint AreaHash;
+            public int RootIndex;
+            public Element Window;
+            public Element InventoryRegion;
+            public long WindowAddress;
+            public long InventoryAddress;
+            public int InitialAvailable;
+            public int InitialBoard;
+            public readonly List<StableChartBatchEntry> Entries =
+                new List<StableChartBatchEntry>();
+        }
+
         public static bool TryGetDpbAvailableCharts(
             out InventoryControlWrapper control,
             out List<Item> charts)
@@ -10767,6 +10917,198 @@ namespace AllflameBot
                 "|InputSent=" + inputSent +
                 "|Confirmed=False");
             return inputSent;
+        }
+
+        public static bool TryCreateStableChartBatchPlan(
+            StableVoyageSnapshot snapshot,
+            int maximumCharts,
+            out StableChartBatchPlan plan,
+            out string rejectionReason)
+        {
+            plan = null;
+            rejectionReason = String.Empty;
+            if (snapshot == null ||
+                snapshot.Window == null ||
+                snapshot.InventoryRegion == null ||
+                snapshot.AvailableChartSlots.Count == 0)
+            {
+                rejectionReason = "StableSnapshotUnavailable";
+                return false;
+            }
+
+            var candidate = new StableChartBatchPlan
+            {
+                AreaHash = AllflameContext.AreaHash,
+                RootIndex = snapshot.RootIndex,
+                Window = snapshot.Window,
+                InventoryRegion = snapshot.InventoryRegion,
+                WindowAddress = snapshot.Window.Address,
+                InventoryAddress = snapshot.InventoryRegion.Address,
+                InitialAvailable = snapshot.AvailableChartSlots.Count,
+                InitialBoard = snapshot.BoardChartCount
+            };
+            int count = Math.Min(
+                Math.Max(0, maximumCharts),
+                snapshot.AvailableChartSlots.Count);
+            for (int index = 0; index < count; index++)
+            {
+                StableChartSlot slot =
+                    snapshot.AvailableChartSlots[index];
+                Vector2i location;
+                string coordinateMode;
+                string slotRejection;
+                if (!TryResolveStableChartLocation(
+                        snapshot,
+                        slot.Index,
+                        out location,
+                        out coordinateMode,
+                        out slotRejection))
+                {
+                    rejectionReason =
+                        "Slot" + slot.Index + ":" + slotRejection;
+                    return false;
+                }
+                candidate.Entries.Add(
+                    new StableChartBatchEntry
+                    {
+                        InventoryIndex = slot.Index,
+                        ElementAddress = slot.Element.Address,
+                        ClientLocation = location,
+                        CoordinateMode = coordinateMode
+                    });
+            }
+            if (candidate.Entries.Count == 0)
+            {
+                rejectionReason = "NoBatchEntries";
+                return false;
+            }
+            plan = candidate;
+            AllflameLog.Info(
+                "VOYAGE_CHART_BATCH_PLAN" +
+                "|AreaHash=" + plan.AreaHash +
+                "|RootIndex=" + plan.RootIndex +
+                "|WindowAddress=0x" +
+                plan.WindowAddress.ToString("X") +
+                "|InventoryAddress=0x" +
+                plan.InventoryAddress.ToString("X") +
+                "|Available=" + plan.InitialAvailable +
+                "|Board=" + plan.InitialBoard +
+                "|Clicks=" + plan.Entries.Count);
+            return true;
+        }
+
+        public static async Task<int> CtrlClickStableChartBatch(
+            StableChartBatchPlan plan,
+            int startIndex,
+            int count)
+        {
+            if (plan == null ||
+                startIndex < 0 ||
+                startIndex >= plan.Entries.Count ||
+                count <= 0)
+            {
+                return 0;
+            }
+            int endIndex = Math.Min(
+                plan.Entries.Count,
+                startIndex + count);
+            int sent = 0;
+            bool controlDown = false;
+            try
+            {
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                LokiPoe.ProcessHookManager.SetKeyState(
+                    System.Windows.Forms.Keys.ControlKey,
+                    short.MinValue,
+                    System.Windows.Forms.Keys.None);
+                controlDown = true;
+                await LokiCoroutine.Sleep(20);
+                for (int index = startIndex;
+                     index < endIndex;
+                     index++)
+                {
+                    if (!IsStableBatchContextValid(plan))
+                    {
+                        AllflameLog.Info(
+                            "VOYAGE_CHART_BATCH_FALLBACK" +
+                            "|Reason=ContextChanged" +
+                            "|Sent=" + sent +
+                            "|Action=AbortCachedClicks");
+                        break;
+                    }
+                    StableChartBatchEntry entry = plan.Entries[index];
+                    DreamPoeBot.BotFramework.MouseManager
+                        .SetMousePosition(entry.ClientLocation, false);
+                    await LokiCoroutine.Sleep(12);
+                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                    sent++;
+                    AllflameLog.Info(
+                        "VOYAGE_CHART_BATCH_CLICK" +
+                        "|Placement=" + (index + 1) + "/" +
+                        plan.Entries.Count +
+                        "|InventoryIndex=" + entry.InventoryIndex +
+                        "|Address=0x" +
+                        entry.ElementAddress.ToString("X") +
+                        "|Client=" + entry.ClientLocation +
+                        "|CoordinateMode=" + entry.CoordinateMode +
+                        "|InputSent=True");
+                    await LokiCoroutine.Sleep(45);
+                }
+            }
+            catch (Exception exception)
+            {
+                AllflameLog.Info(
+                    "VOYAGE_CHART_BATCH_FALLBACK" +
+                    "|Reason=" + exception.GetType().Name +
+                    "|Message=" +
+                    (exception.Message ?? String.Empty).Replace("|", "/") +
+                    "|Sent=" + sent);
+            }
+            finally
+            {
+                if (controlDown)
+                {
+                    LokiPoe.ProcessHookManager.SetKeyState(
+                        System.Windows.Forms.Keys.ControlKey,
+                        (short)0,
+                        System.Windows.Forms.Keys.None);
+                }
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+            }
+            return sent;
+        }
+
+        public static bool StableSnapshotMatchesBatch(
+            StableVoyageSnapshot snapshot,
+            StableChartBatchPlan plan)
+        {
+            return snapshot != null &&
+                   plan != null &&
+                   AllflameContext.AreaHash == plan.AreaHash &&
+                   snapshot.RootIndex == plan.RootIndex &&
+                   snapshot.Window != null &&
+                   snapshot.Window.Address == plan.WindowAddress &&
+                   snapshot.InventoryRegion != null &&
+                   snapshot.InventoryRegion.Address == plan.InventoryAddress;
+        }
+
+        private static bool IsStableBatchContextValid(
+            StableChartBatchPlan plan)
+        {
+            try
+            {
+                return plan != null &&
+                       LokiPoe.IsInGame &&
+                       AllflameContext.AreaHash == plan.AreaHash &&
+                       IsStableVisible(plan.Window) &&
+                       plan.Window.Address == plan.WindowAddress &&
+                       IsStableVisible(plan.InventoryRegion) &&
+                       plan.InventoryRegion.Address == plan.InventoryAddress;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool TryResolveStableChartLocation(

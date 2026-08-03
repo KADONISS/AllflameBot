@@ -2,6 +2,29 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.129 - 2026-08-03
+
+- Send valuable Message in a Bottle rewards through an immediate Discord
+  webhook with `@everyone` and explicit allowed mentions when the configured
+  value threshold and tag option are enabled.
+- Avoid queuing a duplicate valuable-item dashboard alert for the same Bottle
+  reward, while retaining the reward embed and session last-event update.
+- Log Bottle delivery mode, mention eligibility and the actual mention flag
+  used by successful Discord sends.
+
+## 0.23.128 - 2026-08-03
+
+- Cache nine stable Voyage Planner Chart slot coordinates from one snapshot
+  and place them as a fast Ctrl-click batch with bounded intermediate/final
+  convergence checks.
+- Retry only missing Chart placements through the existing verified click
+  path when the UI changes or the batch is only partially accepted.
+- Add internal traversal, loot, chest, object and Capsule approach profiles;
+  ordinary interactions transition later to faster precision clicks while
+  Capsule keeps its conservative 130-unit single-click radius.
+- Reuse converging paths briefly, release held movement before interaction,
+  and log batch placement, approach phase and distance convergence markers.
+
 ## 0.23.127 - 2026-08-03
 
 - Normalize and compare the DPB vendor Accept button text without case
