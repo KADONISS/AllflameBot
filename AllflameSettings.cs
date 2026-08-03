@@ -192,6 +192,8 @@ namespace AllflameBot
         public string SecretBottleVendorName { get; set; }
         public bool SecretBottleUseGuildStash { get; set; }
         public string SecretBottleStashTab { get; set; }
+        public int SecretBottleRevealTimeoutSeconds { get; set; }
+        public int SecretBottleCursorPlacementRetries { get; set; }
 
         public bool DiscordNotificationsEnabled { get; set; }
         public string DiscordWebhookUrl { get; set; }
@@ -394,7 +396,12 @@ namespace AllflameBot
                 {
                     CloseGameOnStop = false;
                 }
-                SettingsSchemaVersion = 37;
+                if (oldSchema < 38)
+                {
+                    SecretBottleRevealTimeoutSeconds = 8;
+                    SecretBottleCursorPlacementRetries = 3;
+                }
+                SettingsSchemaVersion = 38;
                 Save();
             }
         }
@@ -778,7 +785,7 @@ namespace AllflameBot
             NotifyMapStarted = true;
             NotifyMapCompleted = true;
             NotifySulphurCollected = true;
-            SettingsSchemaVersion = 37;
+            SettingsSchemaVersion = 38;
         }
 
         private void ApplySecretBottleDefaults()
@@ -792,6 +799,8 @@ namespace AllflameBot
             SecretBottleVendorName = String.Empty;
             SecretBottleUseGuildStash = false;
             SecretBottleStashTab = "1";
+            SecretBottleRevealTimeoutSeconds = 8;
+            SecretBottleCursorPlacementRetries = 3;
         }
 
         private void ApplyPickitDefaults()

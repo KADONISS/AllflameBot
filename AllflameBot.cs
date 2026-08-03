@@ -28535,6 +28535,9 @@ namespace AllflameBot
 
     internal sealed class SecretBottleProcessingTask : ObserverTask
     {
+        private const string BottleRevealIdLabel =
+            "bottled_item_reveal_window";
+        private const int MaximumRevealUiElements = 5000;
         private const int AcceptTemplateWidth = 78;
         private const int AcceptTemplateHeight = 19;
         private const double MinimumAcceptCorrelation = 0.60;
@@ -28566,6 +28569,24 @@ namespace AllflameBot
             public string Metadata { get; set; }
         }
 
+        private sealed class RewardDecision
+        {
+            public bool Sell { get; set; }
+            public bool TrustedPrice { get; set; }
+            public bool PriceFresh { get; set; }
+            public bool FixedPrice { get; set; }
+            public AllflamePriceQuote Quote { get; set; }
+        }
+
+        private sealed class RewardPlacementResult
+        {
+            public string Status { get; set; }
+            public RewardDecision Decision { get; set; }
+            public Item PlacedItem { get; set; }
+            public int Column { get; set; }
+            public int Row { get; set; }
+        }
+
         private readonly HashSet<int> _sellLocalIds =
             new HashSet<int>();
         private readonly HashSet<int> _transferredLocalIds =
@@ -28584,14 +28605,32 @@ namespace AllflameBot
         private int _kept;
         private int _sold;
         private int _failed;
+        private int _vendorAcceptAttempts;
         private Npc _vendor;
         private DateTime _vendorStartedUtc = DateTime.MinValue;
         private DateTime _nextSessionUtc = DateTime.MinValue;
+        private uint _sessionAreaHash;
 
         public SecretBottleProcessingTask()
             : base(
                 "SecretBottleProcessingTask",
                 "Opens Message in a Bottle rewards and safely keeps or sells them by configured value.") { }
+
+        public override void Stop()
+        {
+            if (_active)
+            {
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_PROCESS_DONE" +
+                    "|Opened=" + _opened +
+                    "|Kept=" + _kept +
+                    "|Sold=" + _sold +
+                    "|Failed=" + _failed +
+                    "|Fallback=True" +
+                    "|Reason=TaskStopped");
+            }
+            ResetSessionState();
+        }
 
         public static bool IsBottleItem(Item item)
         {
@@ -28634,6 +28673,13 @@ namespace AllflameBot
                 {
                     FinishSession("ContextChanged", true, 15);
                 }
+                return false;
+            }
+            if (_active &&
+                _sessionAreaHash != 0 &&
+                _sessionAreaHash != AllflameContext.AreaHash)
+            {
+                FinishSession("AreaHashChanged", true, 15);
                 return false;
             }
 
@@ -28741,6 +28787,7 @@ namespace AllflameBot
             _kept = 0;
             _sold = 0;
             _failed = 0;
+            _vendorAcceptAttempts = 0;
             _vendor = null;
             _vendorStartedUtc = DateTime.MinValue;
             _sellLocalIds.Clear();
@@ -28749,7 +28796,7 @@ namespace AllflameBot
             _openAttempts.Clear();
             _transferAttempts.Clear();
             _withdrawAttempts.Clear();
-            _withdrawAttempts.Clear();
+            _sessionAreaHash = AllflameContext.AreaHash;
             AllflameLog.Info(
                 "SECRET_BOTTLE_SESSION_START" +
                 "|InventoryBottles=" + bottleCount +
@@ -28934,13 +28981,23 @@ namespace AllflameBot
             string useResult = await RightClickBottle(
                 inventoryControl,
                 bottle);
-            await LokiCoroutine.Sleep(450);
-
-            List<Item> afterItems = InventoryItems(inventoryControl);
-            Item remainingBottle = afterItems.FirstOrDefault(item =>
-                IsBottleItem(item) && ItemKey(item) == bottleKey);
-            bool consumed = remainingBottle == null ||
-                Math.Max(1, remainingBottle.StackCount) < beforeBottleStack;
+            DateTime consumeDeadline = DateTime.UtcNow.AddSeconds(3);
+            List<Item> afterItems = null;
+            bool consumed = false;
+            while (DateTime.UtcNow < consumeDeadline)
+            {
+                await LokiCoroutine.Sleep(150);
+                inventoryControl = MainInventory();
+                afterItems = InventoryItems(inventoryControl);
+                Item remainingBottle = afterItems.FirstOrDefault(item =>
+                    IsBottleItem(item) && ItemKey(item) == bottleKey);
+                consumed = remainingBottle == null ||
+                    Math.Max(1, remainingBottle.StackCount) < beforeBottleStack;
+                if (consumed)
+                {
+                    break;
+                }
+            }
             if (!consumed)
             {
                 int attempts;
@@ -28967,8 +29024,10 @@ namespace AllflameBot
 
             _openAttempts.Remove(bottleKey);
             _opened++;
-            string rewardResult = await AcceptAndPlaceReward(
-                inventoryControl);
+            RewardPlacementResult placement = await AcceptAndPlaceReward(
+                inventoryControl,
+                settings);
+            string rewardResult = placement.Status ?? String.Empty;
             afterItems = InventoryItems(MainInventory());
             List<Item> newItems = afterItems
                 .Where(item =>
@@ -29038,6 +29097,12 @@ namespace AllflameBot
                 increasedStacks.Count == 0)
             {
                 _failed++;
+                if (LokiPoe.InGameState.CursorItemOverlay.IsOpened)
+                {
+                    AllflameStopController.Stop(
+                        "SecretBottleCursorStuck",
+                        "Reward remained on cursor after " + rewardResult);
+                }
                 _stage = ProcessingStage.FindVendor;
                 AllflameLog.Info(
                     "SECRET_BOTTLE_REWARD" +
@@ -29047,7 +29112,24 @@ namespace AllflameBot
                 return;
             }
 
-            if (newItems.Count == 0)
+            Item decisionItem = placement.PlacedItem;
+            if (decisionItem == null &&
+                placement.Decision != null &&
+                newItems.Count == 1)
+            {
+                decisionItem = newItems[0];
+            }
+            if (decisionItem != null && placement.Decision != null)
+            {
+                ApplyRewardDecision(
+                    decisionItem,
+                    placement.Decision,
+                    "CursorBeforePlacement");
+                int decisionKey = ItemKey(decisionItem);
+                newItems.RemoveAll(item => ItemKey(item) == decisionKey);
+            }
+
+            if (newItems.Count == 0 && decisionItem == null)
             {
                 _kept += Math.Max(1, increasedStacks.Count);
                 AllflameLog.Info(
@@ -29056,6 +29138,16 @@ namespace AllflameBot
                     "|Decision=Keep" +
                     "|Reason=NoUniqueNewLocalId");
                 return;
+            }
+
+            if (placement.Decision != null && decisionItem == null)
+            {
+                _kept++;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_REWARD" +
+                    "|Detection=CursorPricedButPlacementAmbiguous" +
+                    "|Decision=Keep" +
+                    "|Reason=PlacedLocalIdNotResolved");
             }
 
             foreach (Item reward in newItems)
@@ -29074,12 +29166,29 @@ namespace AllflameBot
             }
         }
 
-        private static async Task<string> AcceptAndPlaceReward(
-            InventoryControlWrapper inventoryControl)
+        private async Task<RewardPlacementResult> AcceptAndPlaceReward(
+            InventoryControlWrapper inventoryControl,
+            AllflameSettings settings)
         {
-            bool cursorOpened = false;
-            for (int attempt = 1; attempt <= 5; attempt++)
+            var output = new RewardPlacementResult
             {
+                Status = "AcceptOrCursorNotDetected",
+                Column = -1,
+                Row = -1
+            };
+            int timeoutSeconds = Math.Max(
+                3,
+                Math.Min(30, settings.SecretBottleRevealTimeoutSeconds));
+            DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+            bool cursorOpened = false;
+            bool revealTopologyLogged = false;
+            bool previousAcceptFound = false;
+            string previousAcceptSource = String.Empty;
+            DateTime nextAcceptClickUtc = DateTime.MinValue;
+            int attempt = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                attempt++;
                 Item currentCursorItem =
                     LokiPoe.InGameState.CursorItemOverlay.Item;
                 Vector2i currentCursorSize =
@@ -29089,19 +29198,6 @@ namespace AllflameBot
                     currentCursorItem != null &&
                     currentCursorSize.X > 0 &&
                     currentCursorSize.Y > 0;
-                AllflameLog.Info(
-                    "SECRET_BOTTLE_CURSOR_STATE" +
-                    "|Attempt=" + attempt +
-                    "|IsOpened=" +
-                    LokiPoe.InGameState.CursorItemOverlay.IsOpened +
-                    "|ValidItem=" + validCursorItem +
-                    "|Size=" + currentCursorSize.X + "x" +
-                    currentCursorSize.Y +
-                    "|Name=" +
-                    (currentCursorItem == null
-                        ? String.Empty
-                        : (currentCursorItem.FullName ??
-                           currentCursorItem.Name ?? String.Empty)));
                 if (validCursorItem)
                 {
                     cursorOpened = true;
@@ -29109,31 +29205,69 @@ namespace AllflameBot
                 }
 
                 Vector2i acceptLocation;
-                double correlation;
-                bool found = TryFindAcceptButton(
+                long revealAddress;
+                int visited;
+                string topology;
+                bool foundByElement = TryFindBottleRevealAcceptButton(
                     out acceptLocation,
-                    out correlation);
-                AllflameLog.Info(
-                    "SECRET_BOTTLE_ACCEPT" +
-                    "|Attempt=" + attempt +
-                    "|Found=" + found +
-                    "|Correlation=" + correlation.ToString("0.000") +
-                    "|Required=" +
-                    MinimumAcceptCorrelation.ToString("0.00") +
-                    (found
-                        ? "|Location=" + acceptLocation.X + "," +
-                          acceptLocation.Y
-                        : String.Empty));
-                if (found)
+                    out revealAddress,
+                    out visited,
+                    out topology);
+                double correlation = -1d;
+                bool found = foundByElement;
+                string source = foundByElement ? "ElementTree" : "None";
+                if (!found)
                 {
+                    found = TryFindAcceptButton(
+                        out acceptLocation,
+                        out correlation);
+                    source = found ? "ImageFallback" : "None";
+                }
+
+                if (!revealTopologyLogged && revealAddress != 0)
+                {
+                    revealTopologyLogged = true;
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_REVEAL" +
+                        "|Found=True" +
+                        "|Address=0x" + revealAddress.ToString("X") +
+                        "|Visited=" + visited +
+                        "|Children=" + topology +
+                        "|RewardUi=" + DescribeBottleRewardUi());
+                }
+                if (attempt == 1 ||
+                    found != previousAcceptFound ||
+                    !String.Equals(
+                        source,
+                        previousAcceptSource,
+                        StringComparison.Ordinal) ||
+                    attempt % 5 == 0)
+                {
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_ACCEPT" +
+                        "|Attempt=" + attempt +
+                        "|Found=" + found +
+                        "|Source=" + source +
+                        "|Correlation=" + correlation.ToString("0.000") +
+                        (found
+                            ? "|Location=" + acceptLocation.X + "," +
+                              acceptLocation.Y
+                            : String.Empty));
+                }
+                previousAcceptFound = found;
+                previousAcceptSource = source;
+                if (found && DateTime.UtcNow >= nextAcceptClickUtc)
+                {
+                    nextAcceptClickUtc =
+                        DateTime.UtcNow.AddMilliseconds(600);
                     LokiPoe.ProcessHookManager.ClearAllKeyStates();
                     DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
                         acceptLocation,
-                        false);
+                        foundByElement);
                     await LokiCoroutine.Sleep(25);
                     DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
                 }
-                await LokiCoroutine.Sleep(300);
+                await LokiCoroutine.Sleep(400);
             }
 
             Item finalCursorItem =
@@ -29147,56 +29281,374 @@ namespace AllflameBot
                  finalCursorSize.Y > 0);
             if (!cursorOpened)
             {
-                return "AcceptOrCursorNotDetected";
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_TIMEOUT" +
+                    "|Stage=RevealOrAccept" +
+                    "|ElapsedSeconds=" + timeoutSeconds +
+                    "|RewardUi=" + DescribeBottleRewardUi() +
+                    "|NextAction=ControlledStop");
+                AllflameStopController.Stop(
+                    "SecretBottleRevealStuck",
+                    "Bottle consumed but reward cursor did not appear within " +
+                    timeoutSeconds + " seconds.");
+                return output;
             }
 
-            inventoryControl = MainInventory();
-            if (inventoryControl == null ||
-                inventoryControl.Inventory == null ||
-                inventoryControl.InventorySlotUiElement == null)
+            output.Decision = EvaluateReward(finalCursorItem, settings);
+            int maximumPlacementAttempts = Math.Max(
+                1,
+                Math.Min(5, settings.SecretBottleCursorPlacementRetries));
+            for (int placementAttempt = 1;
+                 placementAttempt <= maximumPlacementAttempts;
+                 placementAttempt++)
             {
-                return "CursorHeld:InventoryUnavailable";
+                inventoryControl = MainInventory();
+                if (inventoryControl == null ||
+                    inventoryControl.Inventory == null ||
+                    inventoryControl.InventorySlotUiElement == null)
+                {
+                    output.Status = "CursorHeld:InventoryUnavailable";
+                    await LokiCoroutine.Sleep(250);
+                    continue;
+                }
+
+                int column;
+                int row;
+                if (!inventoryControl.Inventory.CanFitItem(
+                        finalCursorSize,
+                        out column,
+                        out row))
+                {
+                    output.Status = "CursorHeld:NoSpaceFor" +
+                        finalCursorSize.X + "x" + finalCursorSize.Y;
+                    break;
+                }
+
+                Vector2i slotLocation =
+                    inventoryControl.InventorySlotUiElement
+                        .SlotClickLocation(
+                            new Vector2i(column + 1, row + 1));
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
+                    slotLocation,
+                    true);
+                await LokiCoroutine.Sleep(25);
+                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                await LokiCoroutine.Sleep(350);
+                bool placed =
+                    !LokiPoe.InGameState.CursorItemOverlay.IsOpened;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_CURSOR_PLACE" +
+                    "|Attempt=" + placementAttempt +
+                    "|Maximum=" + maximumPlacementAttempts +
+                    "|Name=" +
+                    (finalCursorItem.FullName ??
+                     finalCursorItem.Name ?? String.Empty) +
+                    "|Size=" + finalCursorSize.X + "x" +
+                    finalCursorSize.Y +
+                    "|Slot=" + column + "," + row +
+                    "|Location=" + slotLocation.X + "," + slotLocation.Y +
+                    "|Confirmed=" + placed);
+                if (!placed)
+                {
+                    output.Status = "CursorHeld:PlacementRejected";
+                    continue;
+                }
+
+                output.Column = column;
+                output.Row = row;
+                output.Status = "Placed:" + column + "," + row;
+                DateTime itemDeadline = DateTime.UtcNow.AddSeconds(1);
+                while (DateTime.UtcNow < itemDeadline &&
+                       output.PlacedItem == null)
+                {
+                    output.PlacedItem = FindInventoryItemAt(column, row);
+                    if (output.PlacedItem == null)
+                    {
+                        await LokiCoroutine.Sleep(100);
+                    }
+                }
+                return output;
             }
 
-            Vector2i itemSize = finalCursorSize;
-            Item cursorItem = finalCursorItem;
-            int column;
-            int row;
-            if (!inventoryControl.Inventory.CanFitItem(
-                    itemSize,
-                    out column,
-                    out row))
-            {
-                return "CursorHeld:NoSpaceFor" +
-                    itemSize.X + "x" + itemSize.Y;
-            }
-
-            Vector2i slotLocation =
-                inventoryControl.InventorySlotUiElement
-                    .SlotClickLocation(
-                        new Vector2i(column + 1, row + 1));
-            LokiPoe.ProcessHookManager.ClearAllKeyStates();
-            DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                slotLocation,
-                true);
-            await LokiCoroutine.Sleep(25);
-            DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-            await LokiCoroutine.Sleep(350);
-            bool placed =
-                !LokiPoe.InGameState.CursorItemOverlay.IsOpened;
             AllflameLog.Info(
-                "SECRET_BOTTLE_CURSOR_PLACE" +
-                "|Name=" +
-                (cursorItem == null
-                    ? String.Empty
-                    : (cursorItem.FullName ?? cursorItem.Name ?? String.Empty)) +
-                "|Size=" + itemSize.X + "x" + itemSize.Y +
-                "|Slot=" + column + "," + row +
-                "|Location=" + slotLocation.X + "," + slotLocation.Y +
-                "|Confirmed=" + placed);
-            return placed
-                ? "Placed:" + column + "," + row
-                : "CursorHeld:PlacementRejected";
+                "SECRET_BOTTLE_FAILED" +
+                "|Reason=CursorPlacementExhausted" +
+                "|Result=" + output.Status +
+                "|NextAction=ControlledStop");
+            AllflameStopController.Stop(
+                "SecretBottleCursorStuck",
+                "Could not place bottle reward after " +
+                maximumPlacementAttempts + " attempts: " + output.Status);
+            return output;
+        }
+
+        private static bool TryFindBottleRevealAcceptButton(
+            out Vector2i clientLocation,
+            out long revealAddress,
+            out int visited,
+            out string topology)
+        {
+            clientLocation = new Vector2i();
+            revealAddress = 0;
+            visited = 0;
+            topology = "None";
+            try
+            {
+                List<Element> roots = LokiPoe.GetGuiElements();
+                if (roots == null)
+                {
+                    return false;
+                }
+
+                var queue = new Queue<Element>(roots.Where(root => root != null));
+                var addresses = new HashSet<long>();
+                Element reveal = null;
+                while (queue.Count > 0 &&
+                       visited < MaximumRevealUiElements)
+                {
+                    Element element = queue.Dequeue();
+                    long address;
+                    try
+                    {
+                        address = element.Address;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                    if (address == 0 || !addresses.Add(address))
+                    {
+                        continue;
+                    }
+                    visited++;
+                    string idLabel;
+                    try
+                    {
+                        idLabel = element.IdLabel ?? String.Empty;
+                    }
+                    catch
+                    {
+                        idLabel = String.Empty;
+                    }
+                    if (String.Equals(
+                            idLabel,
+                            BottleRevealIdLabel,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        reveal = element;
+                        revealAddress = address;
+                        break;
+                    }
+
+                    List<Element> children;
+                    try
+                    {
+                        children = element.Children;
+                    }
+                    catch
+                    {
+                        children = null;
+                    }
+                    if (children == null)
+                    {
+                        continue;
+                    }
+                    foreach (Element child in children)
+                    {
+                        if (child != null)
+                        {
+                            queue.Enqueue(child);
+                        }
+                    }
+                }
+
+                if (reveal == null || !reveal.IsValid || !reveal.IsVisible)
+                {
+                    return false;
+                }
+
+                topology = DescribeRevealChildren(reveal);
+                var revealQueue = new Queue<Element>();
+                var revealAddresses = new HashSet<long>();
+                revealQueue.Enqueue(reveal);
+                while (revealQueue.Count > 0 &&
+                       revealAddresses.Count < 256)
+                {
+                    Element element = revealQueue.Dequeue();
+                    long address;
+                    try
+                    {
+                        address = element.Address;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                    if (address == 0 || !revealAddresses.Add(address))
+                    {
+                        continue;
+                    }
+
+                    string text = element.Text ?? String.Empty;
+                    string idLabel = element.IdLabel ?? String.Empty;
+                    bool acceptCandidate =
+                        String.Equals(
+                            text.Trim(),
+                            "ACCEPT",
+                            StringComparison.OrdinalIgnoreCase) ||
+                        idLabel.IndexOf(
+                            "accept",
+                            StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (acceptCandidate)
+                    {
+                        Element clickable = ResolveClickableAcceptElement(
+                            element,
+                            revealAddress);
+                        if (clickable != null)
+                        {
+                            clientLocation = clickable.CenterClickLocation();
+                            return true;
+                        }
+                    }
+
+                    List<Element> children;
+                    try
+                    {
+                        children = element.Children;
+                    }
+                    catch
+                    {
+                        children = null;
+                    }
+                    if (children == null)
+                    {
+                        continue;
+                    }
+                    foreach (Element child in children)
+                    {
+                        if (child != null)
+                        {
+                            revealQueue.Enqueue(child);
+                        }
+                    }
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                topology = "Error:" + ex.GetType().Name;
+                return false;
+            }
+        }
+
+        private static Element ResolveClickableAcceptElement(
+            Element candidate,
+            long revealAddress)
+        {
+            Element current = candidate;
+            for (int depth = 0; current != null && depth < 5; depth++)
+            {
+                try
+                {
+                    if (current.IsValid &&
+                        current.IsVisible &&
+                        current.IsEnable &&
+                        current.Width >= 20f &&
+                        current.Height >= 8f)
+                    {
+                        return current;
+                    }
+                    if (current.Address == revealAddress)
+                    {
+                        break;
+                    }
+                    current = current.Parent;
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        private static string DescribeRevealChildren(Element reveal)
+        {
+            try
+            {
+                List<Element> children = reveal.Children;
+                if (children == null || children.Count == 0)
+                {
+                    return "0";
+                }
+                return String.Join(
+                    ";",
+                    children.Take(12).Select((child, index) =>
+                    {
+                        if (child == null)
+                        {
+                            return index + ":null";
+                        }
+                        try
+                        {
+                            return index + ":" +
+                                (child.IdLabel ?? String.Empty)
+                                    .Replace("|", "/") + "," +
+                                (child.Text ?? String.Empty)
+                                    .Replace("|", "/") + "," +
+                                child.ControlType + "," +
+                                child.Width.ToString("0") + "x" +
+                                child.Height.ToString("0") + "," +
+                                child.IsVisible + "," + child.IsEnable;
+                        }
+                        catch
+                        {
+                            return index + ":Transient";
+                        }
+                    }).ToArray());
+            }
+            catch (Exception ex)
+            {
+                return "Error:" + ex.GetType().Name;
+            }
+        }
+
+        private static string DescribeBottleRewardUi()
+        {
+            try
+            {
+                bool opened = LokiPoe.InGameState.RewardUi.IsOpened;
+                List<InventoryControlWrapper> controls = opened
+                    ? LokiPoe.InGameState.RewardUi.InventoryControls
+                    : null;
+                int itemCount = controls == null
+                    ? 0
+                    : controls.Sum(control =>
+                        control == null ||
+                        !control.IsValid ||
+                        control.Inventory == null ||
+                        control.Inventory.Items == null
+                            ? 0
+                            : control.Inventory.Items.Count(item =>
+                                item != null && item.IsValid));
+                return "Opened:" + opened +
+                    ",Controls:" + (controls == null ? 0 : controls.Count) +
+                    ",Items:" + itemCount;
+            }
+            catch (Exception ex)
+            {
+                return "Error:" + ex.GetType().Name;
+            }
+        }
+
+        private static Item FindInventoryItemAt(int column, int row)
+        {
+            return InventoryItems(MainInventory()).FirstOrDefault(item =>
+                item != null &&
+                item.IsValid &&
+                item.LocationTopLeft.X == column &&
+                item.LocationTopLeft.Y == row);
         }
 
         private static bool TryFindAcceptButton(
@@ -29491,6 +29943,16 @@ namespace AllflameBot
 
         private void ClassifyReward(Item reward, AllflameSettings settings)
         {
+            ApplyRewardDecision(
+                reward,
+                EvaluateReward(reward, settings),
+                "InventoryDiff");
+        }
+
+        private static RewardDecision EvaluateReward(
+            Item reward,
+            AllflameSettings settings)
+        {
             AllflamePriceQuote quote = AllflamePrices.Quote(reward);
             bool fixedPrice = HasFixedPrice(reward, settings.FixedPrices);
             bool priceFresh =
@@ -29504,7 +29966,39 @@ namespace AllflameBot
                 trustedPrice &&
                 quote.TotalDivines <
                     Math.Max(0d, settings.SecretBottleKeepMinDivines);
+            return new RewardDecision
+            {
+                Sell = sell,
+                TrustedPrice = trustedPrice,
+                PriceFresh = priceFresh,
+                FixedPrice = fixedPrice,
+                Quote = quote
+            };
+        }
+
+        private void ApplyRewardDecision(
+            Item reward,
+            RewardDecision decision,
+            string source)
+        {
+            if (reward == null || decision == null)
+            {
+                _kept++;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_PRICE" +
+                    "|Source=" + source +
+                    "|Decision=Keep" +
+                    "|Reason=RewardOrDecisionMissing");
+                return;
+            }
+            AllflamePriceQuote quote = decision.Quote ??
+                new AllflamePriceQuote
+                {
+                    Name = reward.FullName ?? reward.Name ?? "Unknown",
+                    Quantity = Math.Max(1, reward.StackCount)
+                };
             int key = ItemKey(reward);
+            bool sell = decision.Sell && key != 0;
             if (sell)
             {
                 _sellLocalIds.Add(key);
@@ -29515,6 +30009,7 @@ namespace AllflameBot
             }
             AllflameLog.Info(
                 "SECRET_BOTTLE_PRICE" +
+                "|Source=" + source +
                 "|LocalId=" + reward.LocalId +
                 "|Name=" + (reward.FullName ?? reward.Name ?? String.Empty) +
                 "|UnitDivines=" +
@@ -29526,12 +30021,14 @@ namespace AllflameBot
                     "0.####",
                     System.Globalization.CultureInfo.InvariantCulture) +
                 "|Priced=" + quote.IsPriced +
-                "|PriceFresh=" + priceFresh +
-                "|FixedOverride=" + fixedPrice +
+                "|PriceFresh=" + decision.PriceFresh +
+                "|FixedOverride=" + decision.FixedPrice +
                 "|Decision=" + (sell ? "Sell" : "Keep") +
-                (!trustedPrice
+                (!decision.TrustedPrice
                     ? "|Reason=UnpricedOrStale"
-                    : String.Empty));
+                    : (decision.Sell && key == 0
+                        ? "|Reason=MissingStableItemId"
+                        : String.Empty)));
         }
 
         private async Task<bool> FindAndOpenVendor(
@@ -29695,18 +30192,28 @@ namespace AllflameBot
                 result = "Exception:" + ex.GetType().Name;
             }
             await LokiCoroutine.Sleep(600);
+            _vendorAcceptAttempts++;
             bool accepted = String.Equals(
                 result,
                 "None",
-                StringComparison.OrdinalIgnoreCase);
+                StringComparison.OrdinalIgnoreCase) &&
+                _transferredLocalIds.Count > 0;
             AllflameLog.Info(
                 "SECRET_BOTTLE_VENDOR" +
                 "|Action=Accept" +
+                "|Attempt=" + _vendorAcceptAttempts +
+                "|Maximum=3" +
                 "|Items=" + _transferredLocalIds.Count +
                 "|Result=" + result +
                 "|Confirmed=" + accepted);
             if (!accepted)
             {
+                if (_vendorAcceptAttempts < 3 &&
+                    LokiPoe.InGameState.SellUi.IsOpened)
+                {
+                    await LokiCoroutine.Sleep(400);
+                    return true;
+                }
                 await FallbackToStash("VendorAcceptRejected");
                 return false;
             }
@@ -29753,15 +30260,25 @@ namespace AllflameBot
                 "|Failed=" + _failed +
                 "|Fallback=" + fallback +
                 "|Reason=" + reason);
+            ResetSessionState();
+            _nextSessionUtc = DateTime.UtcNow.AddSeconds(
+                Math.Max(1, cooldownSeconds));
+        }
+
+        private void ResetSessionState()
+        {
             _active = false;
+            _stage = ProcessingStage.Opening;
             _vendor = null;
+            _vendorStartedUtc = DateTime.MinValue;
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
             _openAttempts.Clear();
             _transferAttempts.Clear();
-            _nextSessionUtc = DateTime.UtcNow.AddSeconds(
-                Math.Max(1, cooldownSeconds));
+            _withdrawAttempts.Clear();
+            _vendorAcceptAttempts = 0;
+            _sessionAreaHash = 0;
         }
 
         private Npc FindVendorCandidate(string configuredName)

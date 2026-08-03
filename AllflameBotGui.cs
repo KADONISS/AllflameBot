@@ -400,7 +400,10 @@ namespace AllflameBot
             grid.Children.Add(Card("NPC SELL", Stack(
                 Text("Vendor NPC name (blank = auto detect)", "SecretBottleVendorName"),
                 Note("Selling only proceeds after DPB confirms SellUi and the exact low-value reward IDs."),
-                Note("If no valid vendor or UI is found, every reward remains in inventory and falls back to the normal stash task."))));
+                Note("If no valid vendor or UI is found, every reward remains in inventory and falls back to the normal stash task."),
+                Number("Reveal timeout (seconds)", "SecretBottleRevealTimeoutSeconds", 3, 30),
+                Number("Cursor placement retries", "SecretBottleCursorPlacementRetries", 1, 5),
+                Note("Bottle reveal detection prefers the DPB element tree and keeps image matching as a fallback."))));
             Grid.SetColumn(grid.Children[2], 2);
             return grid;
         }
