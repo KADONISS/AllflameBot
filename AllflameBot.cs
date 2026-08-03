@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.125";
+        public const string Current = "0.23.126";
     }
 
     public sealed class AllflameBot : IBot
@@ -5951,12 +5951,29 @@ namespace AllflameBot
         private bool _voyageDeath;
         private DateTime _nextBoatCommandUtc = DateTime.MinValue;
         private DateTime _deathObservedUtc = DateTime.MinValue;
+        private int _apiAttempts;
+        private bool _apiAwaitingConfirmation;
+        private bool _visualFallbackActive;
+        private DateTime _apiFirstAttemptUtc = DateTime.MinValue;
+        private DateTime _apiAttemptIssuedUtc = DateTime.MinValue;
+        private uint _apiAttemptAreaHash;
         private const int MaximumVisualClickAttempts = 6;
+        private const int MaximumApiAttempts = 3;
 
         public RespawnTask()
             : base(
                 "RespawnTask",
                 "Respawns and abandons a one-entry Chart after death.") { }
+
+        public override void Start()
+        {
+            ResetTaskState();
+        }
+
+        public override void Stop()
+        {
+            ResetTaskState();
+        }
 
         public override async Task<bool> Run()
         {
@@ -5969,6 +5986,27 @@ namespace AllflameBot
             {
                 if (_deathObserved)
                 {
+                    if (_apiAttempts > 0 && !_visualFallbackActive)
+                    {
+                        bool panelOpened = SafeResurrectPanelOpened();
+                        AllflameLog.Info(
+                            "RESPAWN_API_CONFIRMED" +
+                            "|Alive=True" +
+                            "|PanelOpened=" + panelOpened +
+                            "|AreaChanged=" +
+                            (_apiAttemptAreaHash != 0 &&
+                             _apiAttemptAreaHash != AllflameContext.AreaHash) +
+                            "|ElapsedMilliseconds=" +
+                            (_apiFirstAttemptUtc == DateTime.MinValue
+                                ? 0
+                                : Math.Max(
+                                    0,
+                                    (int)(DateTime.UtcNow -
+                                        _apiFirstAttemptUtc)
+                                        .TotalMilliseconds)) +
+                            "|Attempts=" + _apiAttempts);
+                        ResetApiRespawnState();
+                    }
                     bool stillInsideFailedEncounter =
                         (_chartDeath &&
                          AllflameContext.Phase ==
@@ -6006,6 +6044,7 @@ namespace AllflameBot
                     _nextAttemptUtc = DateTime.MinValue;
                     _nextBoatCommandUtc = DateTime.MinValue;
                     _deathObservedUtc = DateTime.MinValue;
+                    ResetApiRespawnState();
                     try
                     {
                         ExilePather.Reload(true);
@@ -6037,6 +6076,7 @@ namespace AllflameBot
                 _deathObservedUtc = DateTime.UtcNow;
                 _visualDetectionAttempts = 0;
                 _visualClickAttempts = 0;
+                ResetApiRespawnState();
                 _chartDeath =
                     AllflameContext.Phase ==
                         AllflamePhase.ChartArea;
@@ -6073,6 +6113,14 @@ namespace AllflameBot
                     TimeSpan.FromSeconds(2),
                     "RESPAWN_WAIT|Reason=DeathUiGracePeriod");
                 return true;
+            }
+
+            if (!_visualFallbackActive)
+            {
+                if (await TryRunApiRespawn(deadFor))
+                {
+                    return true;
+                }
             }
 
             if (_visualClickAttempts >=
@@ -6226,6 +6274,190 @@ namespace AllflameBot
                 "|VisualClicks=" + _visualClickAttempts +
                 "|Action=RetryVisualDetection");
             return true;
+        }
+
+        private async Task<bool> TryRunApiRespawn(TimeSpan deadFor)
+        {
+            bool panelOpened = SafeResurrectPanelOpened();
+            AllflameLog.Throttled(
+                "respawn_api_state",
+                TimeSpan.FromMilliseconds(500),
+                "RESPAWN_API_STATE" +
+                "|PanelOpened=" + panelOpened +
+                "|Dead=True" +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|DeadForMilliseconds=" +
+                Math.Max(0, (int)deadFor.TotalMilliseconds) +
+                "|Attempt=" + _apiAttempts +
+                "|AwaitingConfirmation=" +
+                _apiAwaitingConfirmation);
+
+            if (_apiAwaitingConfirmation)
+            {
+                int elapsed = Math.Max(
+                    0,
+                    (int)(DateTime.UtcNow - _apiAttemptIssuedUtc)
+                        .TotalMilliseconds);
+                if (elapsed < 3000)
+                {
+                    AllflameLog.Throttled(
+                        "respawn_api_confirmation_wait",
+                        TimeSpan.FromMilliseconds(500),
+                        "RESPAWN_API_WAIT" +
+                        "|Attempt=" + _apiAttempts +
+                        "|ElapsedMilliseconds=" + elapsed +
+                        "|Dead=True" +
+                        "|PanelOpened=" + panelOpened +
+                        "|AreaChanged=" +
+                        (_apiAttemptAreaHash != 0 &&
+                         _apiAttemptAreaHash != AllflameContext.AreaHash));
+                    _nextAttemptUtc =
+                        DateTime.UtcNow.AddMilliseconds(150);
+                    return true;
+                }
+
+                _apiAwaitingConfirmation = false;
+                AllflameLog.Info(
+                    "RESPAWN_API_REJECTED" +
+                    "|Attempt=" + _apiAttempts +
+                    "|Result=ConfirmationTimeout" +
+                    "|Dead=True" +
+                    "|PanelOpened=" + panelOpened +
+                    "|ElapsedMilliseconds=" + elapsed);
+            }
+
+            if (!panelOpened)
+            {
+                if (deadFor < TimeSpan.FromSeconds(2))
+                {
+                    _nextAttemptUtc =
+                        DateTime.UtcNow.AddMilliseconds(150);
+                    return true;
+                }
+                ActivateVisualRespawnFallback("PanelMissing");
+                return false;
+            }
+
+            if (_apiAttempts >= MaximumApiAttempts)
+            {
+                ActivateVisualRespawnFallback("ApiTimeout");
+                return false;
+            }
+
+            _apiAttempts++;
+            if (_apiFirstAttemptUtc == DateTime.MinValue)
+            {
+                _apiFirstAttemptUtc = DateTime.UtcNow;
+            }
+            _apiAttemptIssuedUtc = DateTime.UtcNow;
+            _apiAttemptAreaHash = AllflameContext.AreaHash;
+            string result;
+            try
+            {
+                result = LokiPoe.InGameState.ResurrectPanel
+                    .ResurrectToCheckPoint(true)
+                    .ToString();
+            }
+            catch (Exception exception)
+            {
+                result = "Exception:" + exception.GetType().Name;
+                AllflameLog.Info(
+                    "RESPAWN_API_REJECTED" +
+                    "|Attempt=" + _apiAttempts +
+                    "|Result=" + result +
+                    "|Message=" +
+                    (exception.Message ?? String.Empty)
+                        .Replace("|", "/") +
+                    "|Dead=True");
+                if (_apiAttempts >= MaximumApiAttempts)
+                {
+                    ActivateVisualRespawnFallback("Exception");
+                    return false;
+                }
+                _nextAttemptUtc = DateTime.UtcNow.AddMilliseconds(750);
+                return true;
+            }
+
+            AllflameLog.Info(
+                "RESPAWN_API_ATTEMPT" +
+                "|Destination=Checkpoint" +
+                "|Attempt=" + _apiAttempts +
+                "|Result=" + result +
+                "|AreaHash=" + _apiAttemptAreaHash);
+            if (String.Equals(
+                    result,
+                    "None",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _apiAwaitingConfirmation = true;
+                _nextAttemptUtc = DateTime.UtcNow.AddMilliseconds(150);
+                await LokiCoroutine.Sleep(100);
+                return true;
+            }
+
+            AllflameLog.Info(
+                "RESPAWN_API_REJECTED" +
+                "|Attempt=" + _apiAttempts +
+                "|Result=" + result +
+                "|Dead=True");
+            if (_apiAttempts >= MaximumApiAttempts)
+            {
+                ActivateVisualRespawnFallback("ApiRejected");
+                return false;
+            }
+            _nextAttemptUtc = DateTime.UtcNow.AddMilliseconds(750);
+            return true;
+        }
+
+        private void ActivateVisualRespawnFallback(string reason)
+        {
+            if (_visualFallbackActive)
+            {
+                return;
+            }
+            _visualFallbackActive = true;
+            _apiAwaitingConfirmation = false;
+            _nextAttemptUtc = DateTime.MinValue;
+            AllflameLog.Info(
+                "RESPAWN_FALLBACK" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|ApiAttempts=" + _apiAttempts +
+                "|Action=VisualCheckpointDetection");
+        }
+
+        private static bool SafeResurrectPanelOpened()
+        {
+            try
+            {
+                return LokiPoe.InGameState.ResurrectPanel.IsOpened;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void ResetApiRespawnState()
+        {
+            _apiAttempts = 0;
+            _apiAwaitingConfirmation = false;
+            _visualFallbackActive = false;
+            _apiFirstAttemptUtc = DateTime.MinValue;
+            _apiAttemptIssuedUtc = DateTime.MinValue;
+            _apiAttemptAreaHash = 0;
+        }
+
+        private void ResetTaskState()
+        {
+            _visualDetectionAttempts = 0;
+            _visualClickAttempts = 0;
+            _nextAttemptUtc = DateTime.MinValue;
+            _deathObserved = false;
+            _chartDeath = false;
+            _voyageDeath = false;
+            _nextBoatCommandUtc = DateTime.MinValue;
+            _deathObservedUtc = DateTime.MinValue;
+            ResetApiRespawnState();
         }
 
         private static double GetAdaptiveRespawnCorrelation(

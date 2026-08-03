@@ -2,6 +2,17 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.126 - 2026-08-03
+
+- Prefer DPB's native `ResurrectToCheckPoint` API after the death UI grace
+  period instead of immediately focusing the game and scanning the screen.
+- Confirm respawn from the actual player state, area transition and resurrect
+  panel state rather than treating a successful API return as completion.
+- Retry the native API up to three times and retain the existing two-frame
+  visual checkpoint detector only as a bounded fallback.
+- Add explicit API state, attempt, rejection, confirmation and fallback log
+  markers while preserving Chart/Voyage abandonment and post-death `/boat`.
+
 ## 0.23.125 - 2026-08-03
 
 - Make Capsule extraction exclusive and mandatory as soon as a Voyage reaches
