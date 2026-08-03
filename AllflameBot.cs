@@ -12555,12 +12555,14 @@ namespace AllflameBot
 
             bool isFull = charts.Count >= FullPageChartCount;
             AllflameLog.Info(
-                "CHART_STORAGE_PROBE|Main=" + (_mainTab + 1) +
+                "CHART_STORAGE_PAGE_SCAN|Main=" + (_mainTab + 1) +
                 "|Sub=" + (_subTab + 1) +
                 "|Charts=" + charts.Count +
-                "|Full=" + isFull);
+                "|Full=" + isFull +
+                "|Sequence=" + (_mainTab * 5 + _subTab + 1) +
+                "/15");
 
-            if (isFull && _subTab < 4)
+            if (_subTab < 4)
             {
                 _subTab++;
                 return;
@@ -12757,7 +12759,7 @@ namespace AllflameBot
             }
             bool confirmed = _storageControl != null && stableReads >= 2;
             AllflameLog.Info(
-                "CHART_STORAGE_TAB|Main=" + (mainTab + 1) +
+                "CHART_STORAGE_TAB_CONFIRMED|Main=" + (mainTab + 1) +
                 "|Sub=" + (subTab + 1) +
                 "|Mode=DirectUiElements|Control=" +
                 (_storageControl == null ? "Missing" : "Resolved") +
@@ -14061,6 +14063,15 @@ namespace AllflameBot
     {
         private const int MaximumVisitedElements = 600;
 
+        private sealed class StorageGridCandidate
+        {
+            public float Left;
+            public InventoryControlWrapper Control;
+            public Element Slot;
+            public string Path;
+            public int Score;
+        }
+
         public static bool TryResolve(
             InventoryControlWrapper cachedControl,
             Element cachedSlot,
@@ -14083,33 +14094,48 @@ namespace AllflameBot
                 return false;
             }
 
-            var candidates =
-                new List<Tuple<float, InventoryControlWrapper, Element>>();
+            var candidates = new List<StorageGridCandidate>();
+            var addresses = new HashSet<long>();
+            var signatures = new List<string>();
             int visited = 0;
+            int wrapperAttempts = 0;
+            int validWrappers = 0;
+            int validInventories = 0;
             CollectCandidates(
                 storageRoot,
-                Single.MaxValue,
+                "root",
                 candidates,
-                ref visited);
+                addresses,
+                signatures,
+                ref visited,
+                ref wrapperAttempts,
+                ref validWrappers,
+                ref validInventories);
 
             var best = candidates
                 .OrderByDescending(candidate =>
-                    candidate.Item2.Inventory.Items.Count(
-                        AllflameContext.IsChartItem))
-                .ThenBy(candidate => candidate.Item1)
+                    candidate.Score)
+                .ThenBy(candidate => candidate.Left)
                 .FirstOrDefault();
             if (best == null)
             {
                 AllflameLog.Throttled(
                     "chart_storage_control_missing",
                     TimeSpan.FromSeconds(3),
-                    "CHART_STORAGE_UI|Found=False|Visited=" + visited +
-                    "|Candidates=0|Window=ChartStorage");
+                    "CHART_STORAGE_GRID_RESOLVE_FAILED" +
+                    "|Visited=" + visited +
+                    "|WrapperAttempts=" + wrapperAttempts +
+                    "|ValidWrappers=" + validWrappers +
+                    "|ValidInventories=" + validInventories +
+                    "|Candidates=0" +
+                    "|Window=ChartStorage" +
+                    "|Signatures=" +
+                    String.Join(",", signatures.ToArray()));
                 return false;
             }
 
-            control = best.Item2;
-            slot = best.Item3;
+            control = best.Control;
+            slot = best.Slot;
             AllflameLog.Throttled(
                 "chart_storage_control_found",
                 TimeSpan.FromSeconds(3),
@@ -14118,7 +14144,10 @@ namespace AllflameBot
                 "|Rows=" + control.Inventory.Rows +
                 "|Cols=" + control.Inventory.Columns +
                 "|Items=" + control.Inventory.Items.Count +
-                "|Candidates=" + candidates.Count);
+                "|Candidates=" + candidates.Count +
+                "|Path=" + best.Path +
+                "|Slot=" + (int)slot.Width + "x" + (int)slot.Height +
+                "|Score=" + best.Score);
             return true;
         }
 
@@ -14135,10 +14164,33 @@ namespace AllflameBot
                 return false;
             }
 
-            Element button = SafeChild(
-                root,
-                2, 0, 0, 0, 0, mainTab);
-            return Click(button);
+            Element button;
+            string mode;
+            if (!TryFindNumericTabButton(
+                    root,
+                    3,
+                    mainTab,
+                    true,
+                    out button))
+            {
+                button = SafeChild(
+                    root,
+                    2, 0, 0, 0, 0, mainTab);
+                mode = "DirectPath";
+            }
+            else
+            {
+                mode = "NumericRow";
+            }
+            bool clicked = Click(button);
+            AllflameLog.Info(
+                "CHART_STORAGE_TAB_CLICK" +
+                "|Level=Main" +
+                "|Main=" + (mainTab + 1) +
+                "|Mode=" + mode +
+                "|Clicked=" + clicked +
+                "|Address=" + FormatAddress(button));
+            return clicked;
         }
 
         public static bool TryClickSubTab(int mainTab, int subTab)
@@ -14155,19 +14207,36 @@ namespace AllflameBot
                 return false;
             }
 
+            Element numericButton;
+            if (TryFindNumericTabButton(
+                    root,
+                    5,
+                    subTab,
+                    false,
+                    out numericButton))
+            {
+                bool numericClicked = Click(numericButton);
+                AllflameLog.Info(
+                    "CHART_STORAGE_TAB_CLICK" +
+                    "|Level=Sub" +
+                    "|Main=" + (mainTab + 1) +
+                    "|Sub=" + (subTab + 1) +
+                    "|Mode=NumericRow" +
+                    "|Clicked=" + numericClicked +
+                    "|Address=" + FormatAddress(numericButton));
+                return numericClicked;
+            }
+
             Element container = SafeChild(
                 root,
                 2, 0, 1, mainTab, 0, 0);
-            if (container == null)
-            {
-                return false;
-            }
-
             string wanted = (subTab + 1).ToString();
             List<Element> buttons;
             try
             {
-                buttons = container.Children;
+                buttons = container == null
+                    ? null
+                    : container.Children;
             }
             catch
             {
@@ -14187,6 +14256,14 @@ namespace AllflameBot
                         button.FindTextInElementChildrens(wanted);
                     if (label != null && Click(button))
                     {
+                        AllflameLog.Info(
+                            "CHART_STORAGE_TAB_CLICK" +
+                            "|Level=Sub" +
+                            "|Main=" + (mainTab + 1) +
+                            "|Sub=" + (subTab + 1) +
+                            "|Mode=DirectPath" +
+                            "|Clicked=True" +
+                            "|Address=" + FormatAddress(button));
                         return true;
                     }
                 }
@@ -14195,6 +14272,13 @@ namespace AllflameBot
                     // Ignore malformed button branches.
                 }
             }
+            AllflameLog.Info(
+                "CHART_STORAGE_TAB_CLICK" +
+                "|Level=Sub" +
+                "|Main=" + (mainTab + 1) +
+                "|Sub=" + (subTab + 1) +
+                "|Mode=Unresolved" +
+                "|Clicked=False|Address=0x0");
             return false;
         }
 
@@ -14260,6 +14344,130 @@ namespace AllflameBot
             return false;
         }
 
+        private static bool TryFindNumericTabButton(
+            Element root,
+            int expectedCount,
+            int selectedIndex,
+            bool upperRow,
+            out Element button)
+        {
+            button = null;
+            var labels = new List<Tuple<int, Element, Vector2i>>();
+            var queue = new Queue<Element>();
+            var addresses = new HashSet<long>();
+            queue.Enqueue(root);
+            int visited = 0;
+            while (queue.Count > 0 && visited < MaximumVisitedElements)
+            {
+                Element element = queue.Dequeue();
+                if (element == null)
+                {
+                    continue;
+                }
+                visited++;
+                try
+                {
+                    if (element.IsValid &&
+                        element.IsVisible &&
+                        addresses.Add(element.Address))
+                    {
+                        int number;
+                        string text =
+                            (element.Text ?? String.Empty).Trim();
+                        if (Int32.TryParse(text, out number) &&
+                            number >= 1 &&
+                            number <= expectedCount)
+                        {
+                            Vector2i center =
+                                element.CenterClickLocation();
+                            bool duplicate = labels.Any(candidate =>
+                                candidate.Item1 == number &&
+                                candidate.Item3.DistanceF(center) <= 4f);
+                            if (!duplicate)
+                            {
+                                labels.Add(
+                                    Tuple.Create(number, element, center));
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // Continue through malformed UI branches.
+                }
+
+                List<Element> children = null;
+                try
+                {
+                    children = element.Children;
+                }
+                catch
+                {
+                    children = null;
+                }
+                if (children != null)
+                {
+                    foreach (Element child in children)
+                    {
+                        queue.Enqueue(child);
+                    }
+                }
+            }
+
+            var rows = new List<List<Tuple<int, Element, Vector2i>>>();
+            foreach (Tuple<int, Element, Vector2i> label in
+                labels.OrderBy(candidate => candidate.Item3.Y))
+            {
+                List<Tuple<int, Element, Vector2i>> row =
+                    rows.FirstOrDefault(candidate =>
+                        Math.Abs(
+                            candidate.Average(item => item.Item3.Y) -
+                            label.Item3.Y) <= 24f);
+                if (row == null)
+                {
+                    row = new List<Tuple<int, Element, Vector2i>>();
+                    rows.Add(row);
+                }
+                row.Add(label);
+            }
+
+            List<Tuple<int, Element, Vector2i>> selectedRow = rows
+                .Where(row =>
+                    row.Select(candidate => candidate.Item1)
+                        .Distinct()
+                        .Count() == expectedCount)
+                .OrderBy(row => upperRow
+                    ? row.Average(candidate => candidate.Item3.Y)
+                    : -row.Average(candidate => candidate.Item3.Y))
+                .FirstOrDefault();
+            if (selectedRow == null)
+            {
+                return false;
+            }
+
+            int wanted = selectedIndex + 1;
+            Tuple<int, Element, Vector2i> selected = selectedRow
+                .Where(candidate => candidate.Item1 == wanted)
+                .OrderBy(candidate => candidate.Item3.X)
+                .FirstOrDefault();
+            button = selected == null ? null : selected.Item2;
+            return button != null;
+        }
+
+        private static string FormatAddress(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? "0x0"
+                    : "0x" + element.Address.ToString("X");
+            }
+            catch
+            {
+                return "0x0";
+            }
+        }
+
         private static Element SafeChild(
             Element root,
             params int[] indices)
@@ -14302,9 +14510,14 @@ namespace AllflameBot
 
         private static void CollectCandidates(
             Element element,
-            float playerGridLeft,
-            IList<Tuple<float, InventoryControlWrapper, Element>> candidates,
-            ref int visited)
+            string path,
+            IList<StorageGridCandidate> candidates,
+            ISet<long> addresses,
+            IList<string> signatures,
+            ref int visited,
+            ref int wrapperAttempts,
+            ref int validWrappers,
+            ref int validInventories)
         {
             if (element == null ||
                 visited >= MaximumVisitedElements)
@@ -14315,33 +14528,82 @@ namespace AllflameBot
             visited++;
             try
             {
-                if (element.IsValid && element.IsVisible)
+                if (element.IsValid)
                 {
-                    object rect = element.GetType()
-                        .GetMethod("GetClientRect", Type.EmptyTypes)
-                        .Invoke(element, null);
-                    float left = ReadFloatMember(rect, "Left");
-                    float width = ReadFloatMember(rect, "Width");
-                    float height = ReadFloatMember(rect, "Height");
-
-                    bool plausibleGrid =
-                        width >= 420f &&
-                        width <= 1000f &&
-                        height >= 160f &&
-                        height <= 520f &&
-                        left + 50f < playerGridLeft;
-                    if (plausibleGrid)
+                    wrapperAttempts++;
+                    var wrapper =
+                        new InventoryControlWrapper(element.Address);
+                    if (wrapper.IsValid)
                     {
-                        var wrapper =
-                            new InventoryControlWrapper(element.Address);
-                        if (wrapper.IsValid &&
-                            wrapper.Inventory != null &&
-                            wrapper.Inventory.IsValid &&
-                            wrapper.Inventory.Rows == 5 &&
-                            wrapper.Inventory.Columns == 12)
+                        validWrappers++;
+                        Inventory inventory = wrapper.Inventory;
+                        if (inventory != null && inventory.IsValid)
                         {
-                            candidates.Add(
-                                Tuple.Create(left, wrapper, element));
+                            validInventories++;
+                            Element slot =
+                                wrapper.InventorySlotUiElement;
+                            bool slotUsable =
+                                slot != null &&
+                                slot.IsValid &&
+                                slot.IsVisible;
+                            bool storageShape =
+                                IsStorageInventoryShape(inventory);
+                            if (signatures.Count < 10)
+                            {
+                                signatures.Add(
+                                    "0x" +
+                                    wrapper.Address.ToString("X") +
+                                    "@" + path +
+                                    ":inv=" + inventory.Rows + "x" +
+                                    inventory.Columns +
+                                    ":items=" +
+                                    (inventory.Items == null
+                                        ? -1
+                                        : inventory.Items.Count) +
+                                    ":slot=" +
+                                    (slotUsable
+                                        ? (int)slot.Width + "x" +
+                                          (int)slot.Height
+                                        : "invalid"));
+                            }
+                            if (slotUsable && storageShape &&
+                                addresses.Add(wrapper.Address))
+                            {
+                                Vector2i center =
+                                    slot.CenterClickLocation();
+                                float left =
+                                    center.X - slot.Width / 2f;
+                                float aspect =
+                                    slot.Width /
+                                    Math.Max(1f, slot.Height);
+                                bool expectedGeometry =
+                                    slot.Width >= 380f &&
+                                    slot.Width <= 1100f &&
+                                    slot.Height >= 140f &&
+                                    slot.Height <= 600f &&
+                                    aspect >= 1.7f &&
+                                    aspect <= 3.4f;
+                                int chartItems =
+                                    inventory.Items == null
+                                        ? 0
+                                        : inventory.Items.Count(
+                                            AllflameContext.IsChartItem);
+                                candidates.Add(
+                                    new StorageGridCandidate
+                                    {
+                                        Left = left,
+                                        Control = wrapper,
+                                        Slot = slot,
+                                        Path = path,
+                                        Score =
+                                            (expectedGeometry ? 1000 : 0) +
+                                            chartItems * 20 +
+                                            (inventory.Rows == 5 &&
+                                             inventory.Columns == 12
+                                                ? 100
+                                                : 0)
+                                    });
+                            }
                         }
                     }
                 }
@@ -14366,13 +14628,19 @@ namespace AllflameBot
                 return;
             }
 
-            foreach (Element child in children)
+            for (int index = 0; index < children.Count; index++)
             {
+                Element child = children[index];
                 CollectCandidates(
                     child,
-                    playerGridLeft,
+                    path + "/" + index,
                     candidates,
-                    ref visited);
+                    addresses,
+                    signatures,
+                    ref visited,
+                    ref wrapperAttempts,
+                    ref validWrappers,
+                    ref validInventories);
                 if (visited >= MaximumVisitedElements)
                 {
                     return;
@@ -14393,8 +14661,7 @@ namespace AllflameBot
                        slot.IsVisible &&
                        control.Inventory != null &&
                        control.Inventory.IsValid &&
-                       control.Inventory.Rows == 5 &&
-                       control.Inventory.Columns == 12;
+                       IsStorageInventoryShape(control.Inventory);
             }
             catch
             {
@@ -14402,25 +14669,15 @@ namespace AllflameBot
             }
         }
 
-        private static float ReadFloatMember(object instance, string name)
+        private static bool IsStorageInventoryShape(Inventory inventory)
         {
-            if (instance == null)
-            {
-                return 0f;
-            }
-
-            Type type = instance.GetType();
-            var property = type.GetProperty(name);
-            if (property != null)
-            {
-                return Convert.ToSingle(property.GetValue(instance, null));
-            }
-
-            var field = type.GetField(name);
-            return field == null
-                ? 0f
-                : Convert.ToSingle(field.GetValue(instance));
+            return inventory != null &&
+                ((inventory.Rows == 5 &&
+                  inventory.Columns == 12) ||
+                 (inventory.Rows == 12 &&
+                  inventory.Columns == 5));
         }
+
     }
 
     internal static class NativeDeepwaterChartDeviceUi
