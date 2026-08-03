@@ -8968,6 +8968,33 @@ namespace AllflameBot
                     AllflameRunState.VoyageReadyForPlanning ||
                     AllflameRunState.VoyageReconcileRequired;
                 _chartDetectionAttempts = 0;
+                VoyagePlanningUi.StableVoyageSnapshot stableClear;
+                if (VoyagePlanningUi.TryResolveStable(
+                        out stableClear))
+                {
+                    bool stableClicked =
+                        VoyagePlanningUi.ClickStableElement(
+                            stableClear.ClearBoardButton,
+                            "ClearBoard");
+                    if (stableClicked)
+                    {
+                        _stage = 1;
+                    }
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(
+                            stableClicked ? 900 : 300);
+                    AllflameLog.Info(
+                        "VOYAGE_CLEAR_BOARD" +
+                        "|Mode=StableElement" +
+                        "|RootIndex=" + stableClear.RootIndex +
+                        "|AvailableBefore=" +
+                        stableClear.AvailableChartSlots.Count +
+                        "|BoardBefore=" +
+                        stableClear.BoardChartCount +
+                        "|Clicked=" + stableClicked);
+                    return true;
+                }
+
                 VoyagePlanningUi.VoyageVisualSnapshot
                     firstClearSnapshot;
                 bool firstFound =
@@ -9091,6 +9118,15 @@ namespace AllflameBot
                                .ToString("0.000")
                          : String.Empty));
                 return true;
+            }
+
+            VoyagePlanningUi.StableVoyageSnapshot stableSnapshot;
+            if (VoyagePlanningUi.TryResolveStable(
+                    out stableSnapshot))
+            {
+                return await RunStableVoyagePlanner(
+                    settings,
+                    stableSnapshot);
             }
 
             VoyagePlanningUi.VoyageVisualSnapshot snapshot;
@@ -9598,6 +9634,280 @@ namespace AllflameBot
             return true;
         }
 
+        private async Task<bool> RunStableVoyagePlanner(
+            AllflameSettings settings,
+            VoyagePlanningUi.StableVoyageSnapshot snapshot)
+        {
+            int availableCount = snapshot.AvailableChartSlots.Count;
+            int configuredTarget = Math.Max(
+                0,
+                Math.Min(
+                    60,
+                    settings.ChartsRequiredForVoyage));
+            int effectiveTarget =
+                AllflameRunState.VoyageChainActive
+                    ? 9
+                    : Math.Max(9, configuredTarget);
+            bool reconciliation =
+                AllflameRunState.VoyageReconcileRequired;
+
+            AllflameLog.Info(
+                "VOYAGE_CHART_COUNT" +
+                "|Available=" + availableCount +
+                "|ConfiguredRequired=" + configuredTarget +
+                "|EffectiveRequired=" + effectiveTarget +
+                "|Mode=" +
+                (AllflameRunState.VoyageChainActive
+                    ? "ContinueVoyageChain"
+                    : "BuildToConfiguredRequirement") +
+                "|Reconciliation=" + reconciliation +
+                "|Detection=StableVoyageSlots" +
+                "|InventorySlots=" + snapshot.InventorySlotCount +
+                "|BoardCharts=" + snapshot.BoardChartCount +
+                "|ClickSource=StableElementCtrlClick");
+
+            if (snapshot.BoardChartCount > 0)
+            {
+                _stage = 0;
+                _retryAfterUtc =
+                    DateTime.UtcNow.AddMilliseconds(500);
+                AllflameLog.Info(
+                    "VOYAGE_CLEAR_BOARD_WAIT" +
+                    "|BoardCharts=" + snapshot.BoardChartCount +
+                    "|AvailableCharts=" + availableCount +
+                    "|Action=ClearAgainBeforeCounting");
+                return true;
+            }
+
+            if (availableCount == 0)
+            {
+                _chartDetectionAttempts++;
+                if (_chartDetectionAttempts < 2)
+                {
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(500);
+                    AllflameLog.Info(
+                        "VOYAGE_EMPTY_CONFIRM" +
+                        "|Detection=StableVoyageSlots" +
+                        "|Snapshot=1/2" +
+                        "|PreviousEstimate=" +
+                        AllflameRunState.VoyageAvailableCharts +
+                        "|Action=WaitForSecondRead");
+                    return true;
+                }
+
+                int previousEstimate =
+                    AllflameRunState.VoyageAvailableCharts;
+                AllflameRunState.MarkVoyagePlanChecked(0);
+                _stage = 0;
+                _planningReadyAtOpen = false;
+                _chartDetectionAttempts = 0;
+                await Coroutines.CloseBlockingWindows();
+                AllflameLog.Info(
+                    "VOYAGE_PLAN_EMPTY" +
+                    "|Available=0" +
+                    "|Detection=StableVoyageSlots" +
+                    "|ConfirmedSnapshots=2" +
+                    "|PreviousEstimate=" + previousEstimate +
+                    "|Action=ClosePlanAndContinueChartAreas");
+                return false;
+            }
+
+            bool progressAllowsPlanning =
+                reconciliation
+                    ? availableCount >= effectiveTarget
+                    : (_planningReadyAtOpen ||
+                       availableCount >= effectiveTarget);
+            if (!progressAllowsPlanning)
+            {
+                if (_lastInsufficientChartCount == availableCount)
+                {
+                    _stableInsufficientChartSnapshots++;
+                }
+                else
+                {
+                    _lastInsufficientChartCount = availableCount;
+                    _stableInsufficientChartSnapshots = 1;
+                }
+                if (_stableInsufficientChartSnapshots < 2)
+                {
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(500);
+                    AllflameLog.Info(
+                        "VOYAGE_CHART_WAIT" +
+                        "|Detection=StableVoyageSlots" +
+                        "|Available=" + availableCount +
+                        "|Required=" + effectiveTarget +
+                        "|Snapshot=" +
+                        _stableInsufficientChartSnapshots + "/2" +
+                        "|Action=ConfirmShortfall");
+                    return true;
+                }
+
+                AllflameRunState.MarkVoyagePlanChecked(
+                    availableCount);
+                _stage = 0;
+                _planningReadyAtOpen = false;
+                _lastInsufficientChartCount = -1;
+                _stableInsufficientChartSnapshots = 0;
+                await Coroutines.CloseBlockingWindows();
+                AllflameLog.Info(
+                    "VOYAGE_NOT_READY" +
+                    "|Available=" + availableCount +
+                    "|Required=" + effectiveTarget +
+                    "|Detection=StableVoyageSlots" +
+                    "|Action=ContinueChartAreas");
+                return false;
+            }
+
+            if (reconciliation)
+            {
+                AllflameRunState.MarkVoyagePlanChecked(
+                    availableCount);
+                AllflameLog.Info(
+                    "VOYAGE_CHAIN_RECONCILED" +
+                    "|Available=" + availableCount +
+                    "|Detection=StableVoyageSlots" +
+                    "|CanContinue=True" +
+                    "|NextConsumption=9");
+            }
+
+            _chartDetectionAttempts = 0;
+            _lastInsufficientChartCount = -1;
+            _stableInsufficientChartSnapshots = 0;
+            int placed = 0;
+            int expectedAvailable = availableCount;
+            for (int placement = 0; placement < 9; placement++)
+            {
+                VoyagePlanningUi.StableVoyageSnapshot current;
+                if (!VoyagePlanningUi.TryResolveStable(out current) ||
+                    current.AvailableChartSlots.Count == 0)
+                {
+                    break;
+                }
+
+                int beforeAvailable =
+                    current.AvailableChartSlots.Count;
+                int beforeBoard = current.BoardChartCount;
+                Element chartSlot = current.AvailableChartSlots[0];
+                bool inputSent =
+                    await VoyagePlanningUi.CtrlClickStableChartSlot(
+                        chartSlot,
+                        placement);
+                bool moved = false;
+                int afterAvailable = beforeAvailable;
+                int afterBoard = beforeBoard;
+                for (int poll = 0;
+                     inputSent && poll < 8;
+                     poll++)
+                {
+                    await LokiCoroutine.Sleep(80);
+                    VoyagePlanningUi.StableVoyageSnapshot refreshed;
+                    if (VoyagePlanningUi.TryResolveStable(
+                            out refreshed))
+                    {
+                        afterAvailable =
+                            refreshed.AvailableChartSlots.Count;
+                        afterBoard = refreshed.BoardChartCount;
+                        if (afterAvailable < beforeAvailable ||
+                            afterBoard > beforeBoard)
+                        {
+                            moved = true;
+                            break;
+                        }
+                    }
+                }
+
+                AllflameLog.Info(
+                    "VOYAGE_CHART_STABLE_MOVE_VERIFY" +
+                    "|Placement=" + (placement + 1) + "/9" +
+                    "|BeforeAvailable=" + beforeAvailable +
+                    "|AfterAvailable=" + afterAvailable +
+                    "|BeforeBoard=" + beforeBoard +
+                    "|AfterBoard=" + afterBoard +
+                    "|InputSent=" + inputSent +
+                    "|Moved=" + moved);
+                if (!moved)
+                {
+                    break;
+                }
+                expectedAvailable = afterAvailable;
+                placed++;
+            }
+
+            await LokiCoroutine.Sleep(350);
+            VoyagePlanningUi.StableVoyageSnapshot finalSnapshot;
+            bool finalResolved =
+                VoyagePlanningUi.TryResolveStable(
+                    out finalSnapshot);
+            int finalAvailable = finalResolved
+                ? finalSnapshot.AvailableChartSlots.Count
+                : expectedAvailable;
+            int finalBoard = finalResolved
+                ? finalSnapshot.BoardChartCount
+                : placed;
+            bool placementConfirmed =
+                placed == 9 &&
+                (finalBoard >= 9 ||
+                 finalAvailable <= availableCount - 9);
+            AllflameLog.Info(
+                "VOYAGE_PLACE_CHARTS" +
+                "|Mode=StableVoyageSlots" +
+                "|Attempted=" + placed +
+                "|Before=" + availableCount +
+                "|After=" + finalAvailable +
+                "|BoardCharts=" + finalBoard +
+                "|Confirmed=" + placementConfirmed);
+
+            if (!placementConfirmed)
+            {
+                _stage = 0;
+                _retryAfterUtc =
+                    DateTime.UtcNow.AddSeconds(1);
+                AllflameLog.Info(
+                    "VOYAGE_PLAN_RETRY" +
+                    "|Reason=StableBoardPlacementNotConfirmed" +
+                    "|Placed=" + placed +
+                    "|Action=ClearAndRetry");
+                return true;
+            }
+
+            if (!settings.StartVoyageWhenReady)
+            {
+                _manualReady = true;
+                AllflameLog.Info(
+                    "VOYAGE_READY|BoardCharts=9" +
+                    "|Mode=StableVoyageSlots" +
+                    "|AutoStart=False|Action=WaitForManualBegin");
+                return true;
+            }
+
+            bool beginClicked =
+                finalResolved &&
+                VoyagePlanningUi.ClickStableElement(
+                    finalSnapshot.BeginVoyageButton,
+                    "BeginVoyage");
+            AllflameLog.Info(
+                "VOYAGE_BEGIN" +
+                "|Mode=StableElement" +
+                "|Found=" + finalResolved +
+                "|Clicked=" + beginClicked +
+                "|BoardCharts=" + finalBoard);
+            if (beginClicked)
+            {
+                AllflameRunState.MarkVoyageStarted();
+                _stage = 0;
+                _planningReadyAtOpen = false;
+                await LokiCoroutine.Sleep(750);
+                return true;
+            }
+
+            _stage = 1;
+            _retryAfterUtc =
+                DateTime.UtcNow.AddSeconds(1);
+            return true;
+        }
+
         private static string FindVoyageDialogOption()
         {
             try
@@ -9749,6 +10059,8 @@ namespace AllflameBot
     internal static class VoyagePlanningUi
     {
         private const int MaximumVisited = 1800;
+        private const int MaximumStableWindowVisited = 450;
+        private const string StableWindowId = "deepwater_voyage_window";
         private const int BeginTemplateWidth = 49;
         private const int BeginTemplateHeight = 11;
         private const int BeginTemplateExpectedBytes =
@@ -9898,6 +10210,24 @@ namespace AllflameBot
                 new List<Vector2i>();
         }
 
+        internal sealed class StableVoyageSnapshot
+        {
+            public Element Window;
+            public Element BeginVoyageButton;
+            public Element ClearBoardButton;
+            public int RootIndex;
+            public int InventorySlotCount;
+            public int BoardSlotCount;
+            public int BoardChartCount;
+            public readonly List<Element> AvailableChartSlots =
+                new List<Element>();
+
+            public bool BeginVoyageEnabled
+            {
+                get { return SafeStableEnabled(BeginVoyageButton); }
+            }
+        }
+
         public static bool TryGetDpbAvailableCharts(
             out InventoryControlWrapper control,
             out List<Item> charts)
@@ -9949,8 +10279,397 @@ namespace AllflameBot
 
         public static bool IsOpen()
         {
+            StableVoyageSnapshot stable;
+            if (TryResolveStable(out stable))
+            {
+                return true;
+            }
             VoyageVisualSnapshot snapshot;
             return TryAnalyze(out snapshot, false);
+        }
+
+        public static bool TryResolveStable(
+            out StableVoyageSnapshot snapshot)
+        {
+            snapshot = null;
+            List<Element> roots;
+            try
+            {
+                roots = LokiPoe.GetGuiElements();
+            }
+            catch
+            {
+                return false;
+            }
+            if (roots == null)
+            {
+                return false;
+            }
+
+            for (int rootIndex = 0;
+                 rootIndex < roots.Count;
+                 rootIndex++)
+            {
+                Element window = roots[rootIndex];
+                if (!IsStableVisible(window) ||
+                    !String.Equals(
+                        SafeStableIdLabel(window),
+                        StableWindowId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Element content = GetStableChild(window, 3);
+                Element inventoryRegion = GetStableChild(content, 0);
+                Element boardRegion = GetStableChild(content, 1);
+                Element beginButton = FindStableButton(
+                    GetStableChild(content, 2),
+                    "begin voyage");
+                Element clearButton = FindStableButton(
+                    GetStableChild(content, 3),
+                    "clear board");
+
+                if (inventoryRegion == null ||
+                    SafeStableChildren(inventoryRegion).Count != 60)
+                {
+                    inventoryRegion =
+                        FindStableRegionByChildCount(window, 60);
+                }
+                if (boardRegion == null ||
+                    SafeStableChildren(boardRegion).Count != 9)
+                {
+                    boardRegion =
+                        FindStableRegionByChildCount(window, 9);
+                }
+                if (beginButton == null)
+                {
+                    beginButton =
+                        FindStableButton(window, "begin voyage");
+                }
+                if (clearButton == null)
+                {
+                    clearButton =
+                        FindStableButton(window, "clear board");
+                }
+                if (inventoryRegion == null ||
+                    boardRegion == null ||
+                    beginButton == null ||
+                    clearButton == null)
+                {
+                    AllflameLog.Throttled(
+                        "voyage_stable_incomplete",
+                        TimeSpan.FromSeconds(2),
+                        "VOYAGE_UI_STABLE" +
+                        "|Resolved=False" +
+                        "|RootIndex=" + rootIndex +
+                        "|Inventory=" +
+                        (inventoryRegion != null) +
+                        "|Board=" + (boardRegion != null) +
+                        "|Begin=" + (beginButton != null) +
+                        "|Clear=" + (clearButton != null));
+                    return false;
+                }
+
+                var resolved = new StableVoyageSnapshot
+                {
+                    Window = window,
+                    BeginVoyageButton = beginButton,
+                    ClearBoardButton = clearButton,
+                    RootIndex = rootIndex
+                };
+                List<Element> inventorySlots =
+                    SafeStableChildren(inventoryRegion);
+                resolved.InventorySlotCount = inventorySlots.Count;
+                foreach (Element slot in inventorySlots)
+                {
+                    if (ContainsStableLevelLabel(slot))
+                    {
+                        resolved.AvailableChartSlots.Add(slot);
+                    }
+                }
+                List<Element> boardSlots =
+                    SafeStableChildren(boardRegion);
+                resolved.BoardSlotCount = boardSlots.Count;
+                resolved.BoardChartCount =
+                    boardSlots.Count(ContainsStableLevelLabel);
+                snapshot = resolved;
+                AllflameLog.Throttled(
+                    "voyage_stable_resolved",
+                    TimeSpan.FromSeconds(2),
+                    "VOYAGE_UI_STABLE" +
+                    "|Resolved=True" +
+                    "|IdLabel=" + StableWindowId +
+                    "|RootIndex=" + rootIndex +
+                    "|WindowAddress=0x" +
+                    window.Address.ToString("X") +
+                    "|InventorySlots=" +
+                    resolved.InventorySlotCount +
+                    "|AvailableCharts=" +
+                    resolved.AvailableChartSlots.Count +
+                    "|BoardSlots=" + resolved.BoardSlotCount +
+                    "|BoardCharts=" + resolved.BoardChartCount +
+                    "|BeginEnabled=" +
+                    resolved.BeginVoyageEnabled);
+                return true;
+            }
+            return false;
+        }
+
+        public static bool ClickStableElement(
+            Element element,
+            string action)
+        {
+            if (!IsStableVisible(element))
+            {
+                return false;
+            }
+            Vector2i location;
+            try
+            {
+                location = element.CenterClickLocation();
+            }
+            catch
+            {
+                return false;
+            }
+            bool clicked = ClickClient(location);
+            AllflameLog.Info(
+                "VOYAGE_UI_ELEMENT_CLICK" +
+                "|Action=" + (action ?? String.Empty) +
+                "|Address=0x" + element.Address.ToString("X") +
+                "|Client=" + location +
+                "|Enabled=" + SafeStableEnabled(element) +
+                "|Clicked=" + clicked);
+            return clicked;
+        }
+
+        public static async Task<bool> CtrlClickStableChartSlot(
+            Element slot,
+            int slotIndex)
+        {
+            if (!IsStableVisible(slot) ||
+                !ContainsStableLevelLabel(slot))
+            {
+                return false;
+            }
+            Vector2i location;
+            try
+            {
+                location = slot.CenterClickLocation();
+            }
+            catch
+            {
+                return false;
+            }
+            bool clicked = await CtrlClickClient(location);
+            AllflameLog.Info(
+                "VOYAGE_CHART_SLOT_CTRL_CLICK" +
+                "|Slot=" + slotIndex +
+                "|Address=0x" + slot.Address.ToString("X") +
+                "|Client=" + location +
+                "|Clicked=" + clicked);
+            return clicked;
+        }
+
+        private static Element FindStableRegionByChildCount(
+            Element root,
+            int expectedChildren)
+        {
+            int visited = 0;
+            return FindStableRegionByChildCount(
+                root,
+                expectedChildren,
+                0,
+                ref visited);
+        }
+
+        private static Element FindStableRegionByChildCount(
+            Element element,
+            int expectedChildren,
+            int depth,
+            ref int visited)
+        {
+            if (element == null ||
+                depth > 12 ||
+                visited >= MaximumStableWindowVisited)
+            {
+                return null;
+            }
+            visited++;
+            List<Element> children = SafeStableChildren(element);
+            if (IsStableVisible(element) &&
+                children.Count == expectedChildren)
+            {
+                return element;
+            }
+            foreach (Element child in children)
+            {
+                Element found = FindStableRegionByChildCount(
+                    child,
+                    expectedChildren,
+                    depth + 1,
+                    ref visited);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        private static Element FindStableButton(
+            Element root,
+            string caption)
+        {
+            int visited = 0;
+            return FindStableButton(root, caption, 0, ref visited);
+        }
+
+        private static Element FindStableButton(
+            Element element,
+            string caption,
+            int depth,
+            ref int visited)
+        {
+            if (element == null ||
+                depth > 8 ||
+                visited >= MaximumStableWindowVisited)
+            {
+                return null;
+            }
+            visited++;
+            if (IsStableVisible(element) &&
+                SafeStableText(element).IndexOf(
+                    caption,
+                    StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return element;
+            }
+            foreach (Element child in SafeStableChildren(element))
+            {
+                Element found = FindStableButton(
+                    child,
+                    caption,
+                    depth + 1,
+                    ref visited);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        private static bool ContainsStableLevelLabel(Element root)
+        {
+            int visited = 0;
+            return ContainsStableLevelLabel(root, 0, ref visited);
+        }
+
+        private static bool ContainsStableLevelLabel(
+            Element element,
+            int depth,
+            ref int visited)
+        {
+            if (element == null || depth > 5 || visited >= 24)
+            {
+                return false;
+            }
+            visited++;
+            if (LevelLabel.IsMatch(SafeStableText(element)))
+            {
+                return true;
+            }
+            foreach (Element child in SafeStableChildren(element))
+            {
+                if (ContainsStableLevelLabel(
+                        child,
+                        depth + 1,
+                        ref visited))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static Element GetStableChild(
+            Element element,
+            int index)
+        {
+            List<Element> children = SafeStableChildren(element);
+            return index >= 0 && index < children.Count
+                ? children[index]
+                : null;
+        }
+
+        private static bool IsStableVisible(Element element)
+        {
+            try
+            {
+                return element != null &&
+                    element.IsValid &&
+                    (element.IsVisible || element.IsVisibleLocal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool SafeStableEnabled(Element element)
+        {
+            try
+            {
+                return element != null && element.IsEnable;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string SafeStableIdLabel(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? String.Empty
+                    : element.IdLabel ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static string SafeStableText(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? String.Empty
+                    : element.Text ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static List<Element> SafeStableChildren(Element element)
+        {
+            try
+            {
+                return element == null || element.Children == null
+                    ? new List<Element>()
+                    : element.Children;
+            }
+            catch
+            {
+                return new List<Element>();
+            }
         }
 
         public static void ArmExpectedOpen(TimeSpan duration)

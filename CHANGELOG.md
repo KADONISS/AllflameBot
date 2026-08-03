@@ -2,6 +2,18 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.122 - 2026-08-03
+
+- Resolve Voyage Planner from the stable `deepwater_voyage_window` IdLabel,
+  including its 60-slot Chart pool, nine-slot board, Clear Board button and
+  Begin Voyage button without requiring screen capture.
+- Detect available and placed Charts from their per-slot `L:` labels, clear
+  interrupted boards through the UI element, and Ctrl-click verified Chart
+  slots until all nine board positions are filled.
+- Verify each transfer from pool-count or board-count convergence, start the
+  Voyage only after nine confirmed placements, and retain the existing visual
+  implementation solely as a fallback when the stable UI cannot be resolved.
+
 ## 0.23.121 - 2026-08-03
 
 - Resolve the Chart Device from the stable `deepwater_charts_window` IdLabel
