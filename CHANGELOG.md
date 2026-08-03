@@ -2,6 +2,18 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.131 - 2026-08-03
+
+- Separate new-Capsule acquisition from locked-target maintenance and fresh
+  interaction snapshots during mandatory zero-lantern extraction.
+- Retain the exact locked Capsule by target id, anchor and area through the
+  approach, stabilization and interaction stages even after it has been
+  recorded in the rescue cycle target history.
+- Reuse the live object already resolved by the rescue loop and allow a short
+  snapshot reacquire window before rotating a genuinely missing target.
+- Add locked-target retained, rejected and reacquire markers, plus explicit
+  search mode and tried-filter details to Capsule live-scan logging.
+
 ## 0.23.130 - 2026-08-03
 
 - Scan configured Message in a Bottle stash tabs once per bot session and

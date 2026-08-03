@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.130";
+        public const string Current = "0.23.131";
     }
 
     public sealed class AllflameBot : IBot
@@ -25022,6 +25022,7 @@ namespace AllflameBot
         private const int MaximumRecoveryCycles = 3;
         private const int RegistryAnchorReacquireSeconds = 5;
         private const float RegistryAnchorReacquireDistance = 65f;
+        private const int LockedTargetReacquireMilliseconds = 1000;
         private static readonly bool UseDirectDpbCallUi = false;
         private DateTime _surfaceTransferBackoffUtc =
             DateTime.MinValue;
@@ -25114,6 +25115,13 @@ namespace AllflameBot
             AlternateCapsule,
             ReverseBreadcrumb,
             LiveObservedCapsule
+        }
+
+        private enum CapsuleRescueSearchMode
+        {
+            AcquireNewTarget,
+            MaintainLockedTarget,
+            InteractionSnapshot
         }
 
         private sealed class CapsuleApproachCandidate
@@ -26850,6 +26858,7 @@ namespace AllflameBot
 
             NetworkObject nearbyLive = FindLiveRescueCapsule(
                 new Vector2i(),
+                CapsuleRescueSearchMode.AcquireNewTarget,
                 true);
             if (nearbyLive != null &&
                 LokiPoe.Me.Position.DistanceF(nearbyLive.Position) <=
@@ -26880,12 +26889,18 @@ namespace AllflameBot
                 _rescueTargetAnchor != default(Vector2i) &&
                 nearbyLive.Position.DistanceF(_rescueTargetAnchor) <= 25f
                     ? nearbyLive
-                    : FindLiveRescueCapsule(_rescueTargetAnchor);
+                    : FindLiveRescueCapsule(
+                        _rescueTargetAnchor,
+                        _rescueTargetId == 0
+                            ? CapsuleRescueSearchMode.AcquireNewTarget
+                            : CapsuleRescueSearchMode.MaintainLockedTarget);
             if (live != null &&
                 _rescueTargetId != 0 &&
                 live.Id != _rescueTargetId)
             {
-                live = FindLiveRescueCapsule(_rescueTargetAnchor);
+                live = FindLiveRescueCapsule(
+                    _rescueTargetAnchor,
+                    CapsuleRescueSearchMode.MaintainLockedTarget);
             }
 
             switch (_zeroLanternStage)
@@ -27378,18 +27393,20 @@ namespace AllflameBot
             NetworkObject live)
         {
             Vector2i player = LokiPoe.Me.Position;
-            live = FindLiveRescueCapsule(_rescueTargetAnchor);
-            if (live == null || !IsRescueCapsuleUsable(live))
+            if (!IsLockedRescueTargetUsable(live))
             {
-                AllflameLog.Info(
-                    "CAPSULE_APPROACH_REJECTED" +
-                    "|AreaHash=" + AllflameContext.AreaHash +
-                    "|TargetId=" + _rescueTargetId +
-                    "|Anchor=" + _rescueTargetAnchor +
-                    "|Reason=LiveTargetLost|RescueCycle=" + _rescueCycle);
-                RotateZeroLanternRescue("LiveTargetLost");
+                live = FindLiveRescueCapsule(
+                    _rescueTargetAnchor,
+                    CapsuleRescueSearchMode.MaintainLockedTarget);
+            }
+            if (!IsLockedRescueTargetUsable(live))
+            {
+                HandleLockedTargetUnavailable(
+                    "ApproachInteractionRing",
+                    "LiveTargetLost");
                 return true;
             }
+            _rescueAnchorReacquireUtc = DateTime.MinValue;
             _rescueTargetId = live.Id;
             float distance = player.DistanceF(live.Position);
             float threshold = RescueInteractionThreshold(settings);
@@ -27459,7 +27476,9 @@ namespace AllflameBot
             await FinishMovementBeforeInteraction("Allflame Capsule rescue");
             ResetMoverApproachState();
             AllflameContext.Refresh(true);
-            NetworkObject first = FindLiveRescueCapsule(_rescueTargetAnchor);
+            NetworkObject first = FindLiveRescueCapsule(
+                _rescueTargetAnchor,
+                CapsuleRescueSearchMode.InteractionSnapshot);
             Vector2i firstPlayer = LokiPoe.Me.Position;
             float threshold = RescueInteractionThreshold(settings);
             if (!IsRescueSnapshotValid(first, firstPlayer, threshold))
@@ -27470,7 +27489,9 @@ namespace AllflameBot
             }
             await LokiCoroutine.Sleep(120);
             AllflameContext.Refresh(true);
-            NetworkObject second = FindLiveRescueCapsule(_rescueTargetAnchor);
+            NetworkObject second = FindLiveRescueCapsule(
+                _rescueTargetAnchor,
+                CapsuleRescueSearchMode.InteractionSnapshot);
             Vector2i secondPlayer = LokiPoe.Me.Position;
             if (!IsRescueSnapshotValid(second, secondPlayer, threshold))
             {
@@ -27497,10 +27518,12 @@ namespace AllflameBot
 
         private async Task<bool> InteractRescueCapsule()
         {
-            NetworkObject live = FindLiveRescueCapsule(_rescueTargetAnchor);
-            if (!IsRescueCapsuleUsable(live))
+            NetworkObject live = FindLiveRescueCapsule(
+                _rescueTargetAnchor,
+                CapsuleRescueSearchMode.InteractionSnapshot);
+            if (!IsLockedRescueTargetUsable(live))
             {
-                RotateZeroLanternRescue("InteractTargetLost");
+                ReturnToRescueApproach("InteractTargetSnapshotLost");
                 return true;
             }
             _rescueStageAttempt++;
@@ -27737,26 +27760,51 @@ namespace AllflameBot
 
         private NetworkObject FindLiveRescueCapsule(
             Vector2i anchor,
+            CapsuleRescueSearchMode searchMode =
+                CapsuleRescueSearchMode.AcquireNewTarget,
             bool includeTried = false)
         {
+            bool maintainLocked = searchMode !=
+                CapsuleRescueSearchMode.AcquireNewTarget;
+            bool filteredAsTried = false;
+            NetworkObject rejectedLocked = null;
             try
             {
                 List<NetworkObject> scanned = LokiPoe.ObjectManager.Objects
                     .Where(IsRescueCapsuleObject)
                     .ToList();
-                NetworkObject found = scanned
-                    .Where(obj => IsRescueCapsuleUsable(obj))
-                    .Where(obj =>
-                        anchor == default(Vector2i) ||
-                        obj.Position.DistanceF(anchor) <= 25f)
-                    .Where(obj =>
-                        includeTried ||
-                        _rescueStrategy !=
-                            CapsuleRescueStrategy.LiveObservedCapsule ||
-                        !_rescueTargetsThisCycle.Contains(
-                            RescueTargetKey(obj.Position)))
-                    .OrderBy(obj => obj.Distance)
-                    .FirstOrDefault();
+                NetworkObject found;
+                if (maintainLocked)
+                {
+                    rejectedLocked = scanned.FirstOrDefault(obj =>
+                        obj != null && obj.Id == _rescueTargetId);
+                    found = scanned
+                        .Where(IsLockedRescueTargetUsable)
+                        .OrderBy(obj => obj.Distance)
+                        .FirstOrDefault();
+                }
+                else
+                {
+                    IEnumerable<NetworkObject> usable = scanned
+                        .Where(obj => IsRescueCapsuleUsable(obj))
+                        .Where(obj =>
+                            anchor == default(Vector2i) ||
+                            obj.Position.DistanceF(anchor) <= 25f);
+                    filteredAsTried = !includeTried &&
+                        _rescueStrategy ==
+                            CapsuleRescueStrategy.LiveObservedCapsule &&
+                        usable.Any(obj => _rescueTargetsThisCycle.Contains(
+                            RescueTargetKey(obj.Position)));
+                    found = usable
+                        .Where(obj =>
+                            includeTried ||
+                            _rescueStrategy !=
+                                CapsuleRescueStrategy.LiveObservedCapsule ||
+                            !_rescueTargetsThisCycle.Contains(
+                                RescueTargetKey(obj.Position)))
+                        .OrderBy(obj => obj.Distance)
+                        .FirstOrDefault();
+                }
                 string scanDetails = String.Join(",",
                     scanned.Take(8).Select(obj =>
                         obj.Id + ":" + obj.IsValid + ":" +
@@ -27766,7 +27814,7 @@ namespace AllflameBot
                             : obj.Position.DistanceF(anchor).ToString("0.0"))));
                 AllflameLog.Throttled(
                     "capsule_rescue_live_scan_" + _rescueCycle + "_" +
-                    RescueTargetKey(anchor),
+                    RescueTargetKey(anchor) + "_" + searchMode,
                     TimeSpan.FromMilliseconds(500),
                     "CAPSULE_RESCUE_LIVE_SCAN" +
                     "|Task=" + Name +
@@ -27774,10 +27822,12 @@ namespace AllflameBot
                     "|Cycle=" + _rescueCycle +
                     "|Strategy=" + _rescueStrategy +
                     "|RoutePlan=" + _rescueRoutePlan +
+                    "|SearchMode=" + searchMode +
                     "|TargetId=" + _rescueTargetId +
                     "|Anchor=" + anchor +
                     "|RegistryOnly=" + _rescueTargetRegistryOnly +
                     "|LiveObserved=" + (found != null) +
+                    "|FilteredAsTried=" + filteredAsTried +
                     "|Proven=" + _rescueTargetProven +
                     "|Scanned=" + scanned.Count +
                     "|Objects=" + scanDetails +
@@ -27785,6 +27835,10 @@ namespace AllflameBot
                     "|NextAction=" + (found == null ? "ContinueReacquire" : "UseLiveTarget"));
                 if (found != null)
                 {
+                    if (maintainLocked)
+                    {
+                        LogLockedTargetRetained(found, searchMode);
+                    }
                     return found;
                 }
             }
@@ -27792,16 +27846,157 @@ namespace AllflameBot
             {
             }
             NetworkObject fallback = AllflameContext.CapsuleObject;
+            if (maintainLocked)
+            {
+                if (IsLockedRescueTargetUsable(fallback))
+                {
+                    LogLockedTargetRetained(fallback, searchMode);
+                    return fallback;
+                }
+                if (rejectedLocked == null && fallback != null)
+                {
+                    try
+                    {
+                        if (fallback.Id == _rescueTargetId)
+                        {
+                            rejectedLocked = fallback;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+                LogLockedTargetRejected(
+                    rejectedLocked,
+                    searchMode,
+                    LockedTargetRejectionReason(rejectedLocked));
+                return null;
+            }
             return IsRescueCapsuleUsable(fallback) &&
-                   (anchor == default(Vector2i) ||
-                    fallback.Position.DistanceF(anchor) <= 25f) &&
-                   (includeTried ||
-                    _rescueStrategy !=
-                        CapsuleRescueStrategy.LiveObservedCapsule ||
-                    !_rescueTargetsThisCycle.Contains(
-                        RescueTargetKey(fallback.Position)))
-                ? fallback
-                : null;
+                (anchor == default(Vector2i) ||
+                 fallback.Position.DistanceF(anchor) <= 25f) &&
+                (includeTried ||
+                 _rescueStrategy !=
+                    CapsuleRescueStrategy.LiveObservedCapsule ||
+                 !_rescueTargetsThisCycle.Contains(
+                    RescueTargetKey(fallback.Position)))
+                    ? fallback
+                    : null;
+        }
+
+        private bool IsLockedRescueTargetUsable(NetworkObject capsule)
+        {
+            return IsRescueCapsuleUsable(capsule) &&
+                _rescueTargetId != 0 &&
+                capsule.Id == _rescueTargetId &&
+                _rescueTargetAnchor != default(Vector2i) &&
+                capsule.Position.DistanceF(_rescueTargetAnchor) <= 25f &&
+                AllflameContext.AreaHash == _rescueAreaHash;
+        }
+
+        private string LockedTargetRejectionReason(NetworkObject capsule)
+        {
+            if (AllflameContext.AreaHash != _rescueAreaHash)
+            {
+                return "AreaChanged";
+            }
+            if (capsule == null)
+            {
+                return "Missing";
+            }
+            try
+            {
+                if (!capsule.IsValid)
+                {
+                    return "Invalid";
+                }
+                if (!capsule.IsTargetable)
+                {
+                    return "NotTargetable";
+                }
+                if (_rescueTargetId == 0 || capsule.Id != _rescueTargetId)
+                {
+                    return "IdMismatch";
+                }
+                if (_rescueTargetAnchor == default(Vector2i) ||
+                    capsule.Position.DistanceF(_rescueTargetAnchor) > 25f)
+                {
+                    return "AnchorDrift";
+                }
+            }
+            catch
+            {
+                return "Invalid";
+            }
+            return "Rejected";
+        }
+
+        private void LogLockedTargetRetained(
+            NetworkObject capsule,
+            CapsuleRescueSearchMode searchMode)
+        {
+            AllflameLog.Throttled(
+                "capsule_locked_target_retained_" + _rescueTargetId + "_" +
+                searchMode,
+                TimeSpan.FromMilliseconds(500),
+                "CAPSULE_LOCKED_TARGET_RETAINED" +
+                "|TargetId=" + capsule.Id +
+                "|Anchor=" + _rescueTargetAnchor +
+                "|Distance=" + capsule.Distance.ToString("0.0") +
+                "|Stage=" + _zeroLanternStage +
+                "|SearchMode=" + searchMode);
+        }
+
+        private void LogLockedTargetRejected(
+            NetworkObject capsule,
+            CapsuleRescueSearchMode searchMode,
+            string reason)
+        {
+            AllflameLog.Throttled(
+                "capsule_locked_target_rejected_" + _rescueTargetId + "_" +
+                searchMode + "_" + reason,
+                TimeSpan.FromMilliseconds(500),
+                "CAPSULE_LOCKED_TARGET_REJECTED" +
+                "|TargetId=" + _rescueTargetId +
+                "|ObservedId=" + (capsule == null ? 0 : capsule.Id) +
+                "|Anchor=" + _rescueTargetAnchor +
+                "|Reason=" + reason +
+                "|Stage=" + _zeroLanternStage +
+                "|SearchMode=" + searchMode);
+        }
+
+        private void HandleLockedTargetUnavailable(
+            string stage,
+            string rotateReason)
+        {
+            if (_rescueAnchorReacquireUtc == DateTime.MinValue)
+            {
+                _rescueAnchorReacquireUtc = DateTime.UtcNow;
+                AllflameLog.Info(
+                    "CAPSULE_LOCKED_TARGET_REACQUIRE" +
+                    "|TargetId=" + _rescueTargetId +
+                    "|Anchor=" + _rescueTargetAnchor +
+                    "|Stage=" + stage +
+                    "|TimeoutMilliseconds=" +
+                    LockedTargetReacquireMilliseconds +
+                    "|Action=WaitForFreshSnapshot");
+                return;
+            }
+            int elapsed = (int)(DateTime.UtcNow -
+                _rescueAnchorReacquireUtc).TotalMilliseconds;
+            if (elapsed < LockedTargetReacquireMilliseconds)
+            {
+                return;
+            }
+            AllflameLog.Info(
+                "CAPSULE_APPROACH_REJECTED" +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|TargetId=" + _rescueTargetId +
+                "|Anchor=" + _rescueTargetAnchor +
+                "|Reason=" + rotateReason +
+                "|ReacquireMilliseconds=" + elapsed +
+                "|RescueCycle=" + _rescueCycle);
+            RotateZeroLanternRescue(rotateReason);
         }
 
         private static bool IsRescueCapsuleObject(NetworkObject obj)
