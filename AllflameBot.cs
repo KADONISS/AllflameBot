@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.123";
+        public const string Current = "0.23.124";
     }
 
     public sealed class AllflameBot : IBot
@@ -560,6 +560,18 @@ namespace AllflameBot
                         capsuleTitleVisible &&
                         (CallBathysphereVisible ||
                          SendToSurfaceVisible);
+                    CapsuleUiButtons stableCapsuleUi;
+                    if (CapsuleDirectUi.TryGetStableButtons(
+                            out stableCapsuleUi))
+                    {
+                        CapsuleUiVisible = true;
+                        CallBathysphereVisible =
+                            CapsuleDirectUi.IsVisible(
+                                stableCapsuleUi.CallBathysphere);
+                        SendToSurfaceVisible =
+                            CapsuleDirectUi.IsVisible(
+                                stableCapsuleUi.SendToSurface);
+                    }
                     SnapshotLanternCounter(visibleUiText);
 
                     bool isVoyage = String.Equals(
@@ -15091,8 +15103,11 @@ namespace AllflameBot
 
     internal sealed class CapsuleUiButtons
     {
+        public Element Window;
+        public Element Title;
         public Element SendToSurface;
         public Element CallBathysphere;
+        public int RootIndex;
         public string DetectionMode;
         public int Visited;
     }
@@ -15107,12 +15122,117 @@ namespace AllflameBot
     internal static class CapsuleDirectUi
     {
         private const int MaximumVisited = 1800;
+        private const int MaximumStableVisited = 80;
+        private const string StableWindowId =
+            "deepwater_extraction_window";
+
+        public static bool TryGetStableButtons(
+            out CapsuleUiButtons buttons)
+        {
+            buttons = new CapsuleUiButtons();
+            List<Element> roots;
+            try
+            {
+                roots = LokiPoe.GetGuiElements();
+            }
+            catch
+            {
+                return false;
+            }
+            if (roots == null)
+            {
+                return false;
+            }
+
+            for (int rootIndex = 0;
+                 rootIndex < roots.Count;
+                 rootIndex++)
+            {
+                Element window = roots[rootIndex];
+                if (!IsUsable(window) ||
+                    !String.Equals(
+                        SafeIdLabel(window),
+                        StableWindowId,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Element title = GetChild(GetChild(window, 3), 0);
+                Element send = GetChild(GetChild(window, 6), 0);
+                Element call = GetChild(GetChild(window, 7), 0);
+                bool exact =
+                    HasCaption(title, "Allflame Capsule") &&
+                    HasCaption(send, "Send to Surface") &&
+                    HasCaption(call, "Call Bathysphere");
+                if (!HasCaption(send, "Send to Surface"))
+                {
+                    send = FindButtonInWindow(
+                        window,
+                        "Send to Surface");
+                }
+                if (!HasCaption(call, "Call Bathysphere"))
+                {
+                    call = FindButtonInWindow(
+                        window,
+                        "Call Bathysphere");
+                }
+
+                if (!IsUsable(send) ||
+                    !IsUsable(call) ||
+                    !TryGetValidatedCenter(send, out Vector2i sendCenter) ||
+                    !TryGetValidatedCenter(call, out Vector2i callCenter))
+                {
+                    AllflameLog.Throttled(
+                        "capsule_stable_incomplete",
+                        TimeSpan.FromSeconds(2),
+                        "CAPSULE_UI_STABLE" +
+                        "|Resolved=False" +
+                        "|RootIndex=" + rootIndex +
+                        "|IdLabel=" + StableWindowId +
+                        "|Title=" + IsUsable(title) +
+                        "|Send=" + IsUsable(send) +
+                        "|Call=" + IsUsable(call));
+                    return false;
+                }
+
+                buttons.Window = window;
+                buttons.Title = title;
+                buttons.SendToSurface = send;
+                buttons.CallBathysphere = call;
+                buttons.RootIndex = rootIndex;
+                buttons.DetectionMode = exact
+                    ? "StableExtractionPath"
+                    : "StableExtractionScopedText";
+                AllflameLog.Throttled(
+                    "capsule_stable_resolved",
+                    TimeSpan.FromSeconds(2),
+                    "CAPSULE_UI_STABLE" +
+                    "|Resolved=True" +
+                    "|IdLabel=" + StableWindowId +
+                    "|RootIndex=" + rootIndex +
+                    "|WindowAddress=0x" +
+                    window.Address.ToString("X") +
+                    "|Send=" + sendCenter +
+                    "|SendEnabled=" + SafeEnabled(send) +
+                    "|Call=" + callCenter +
+                    "|CallEnabled=" + SafeEnabled(call) +
+                    "|Mode=" + buttons.DetectionMode);
+                return true;
+            }
+            return false;
+        }
 
         public static bool TryGetButtons(
             bool allowGeometry,
             out CapsuleUiButtons buttons)
         {
             buttons = new CapsuleUiButtons();
+
+            if (TryGetStableButtons(out buttons))
+            {
+                return true;
+            }
 
             Element send =
                 VoyagePlanningUi.FindButton("Send to Surface");
@@ -15310,6 +15430,160 @@ namespace AllflameBot
         public static bool IsEnabled(Element element)
         {
             return IsUsable(element) && SafeEnabled(element);
+        }
+
+        public static bool IsVisible(Element element)
+        {
+            return IsUsable(element);
+        }
+
+        private static Element GetChild(Element parent, int index)
+        {
+            if (parent == null || index < 0)
+            {
+                return null;
+            }
+            try
+            {
+                List<Element> children = parent.Children;
+                return children != null && index < children.Count
+                    ? children[index]
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string SafeIdLabel(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? String.Empty
+                    : element.IdLabel ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static string SafeText(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? String.Empty
+                    : element.Text ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static bool HasCaption(
+            Element element,
+            string caption)
+        {
+            return IsUsable(element) &&
+                String.Equals(
+                    SafeText(element).Trim(),
+                    caption,
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static Element FindButtonInWindow(
+            Element window,
+            string caption)
+        {
+            int visited = 0;
+            return FindButtonInWindow(
+                window,
+                caption,
+                0,
+                ref visited);
+        }
+
+        private static Element FindButtonInWindow(
+            Element element,
+            string caption,
+            int depth,
+            ref int visited)
+        {
+            if (element == null ||
+                depth > 8 ||
+                visited >= MaximumStableVisited)
+            {
+                return null;
+            }
+            visited++;
+            if (HasCaption(element, caption))
+            {
+                return element;
+            }
+            List<Element> children;
+            try
+            {
+                children = element.Children;
+            }
+            catch
+            {
+                return null;
+            }
+            if (children == null)
+            {
+                return null;
+            }
+            foreach (Element child in children)
+            {
+                Element found = FindButtonInWindow(
+                    child,
+                    caption,
+                    depth + 1,
+                    ref visited);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        private static bool TryGetValidatedCenter(
+            Element element,
+            out Vector2i center)
+        {
+            center = new Vector2i();
+            if (!TryCenter(element, out center))
+            {
+                return false;
+            }
+            try
+            {
+                var client = LokiPoe.ClientWindowInfo.Client;
+                int width = client.Right - client.Left;
+                int height = client.Bottom - client.Top;
+                if (width <= 0 || height <= 0)
+                {
+                    return false;
+                }
+                bool clientRelative =
+                    center.X >= 0 && center.X < width &&
+                    center.Y >= 0 && center.Y < height;
+                bool screenRelative =
+                    center.X >= client.Left &&
+                    center.X < client.Right &&
+                    center.Y >= client.Top &&
+                    center.Y < client.Bottom;
+                return clientRelative || screenRelative;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static void CollectButtonCandidates(
@@ -25336,9 +25610,16 @@ namespace AllflameBot
                 !_surfaceSentForRequest;
             if (sendRequired)
             {
-                Element sendButton =
-                    VoyagePlanningUi.FindButton("Send to Surface");
-                if (sendButton == null)
+                Element sendButton;
+                string sendDetectionMode;
+                bool sendFound =
+                    CapsuleDirectUi.TryGetButton(
+                        CapsuleUiAction.SendToSurface,
+                        true,
+                        out sendButton,
+                        out sendDetectionMode) &&
+                    CapsuleDirectUi.IsEnabled(sendButton);
+                if (!sendFound)
                 {
                     if (_sendButtonMissingUtc == DateTime.MinValue)
                     {
@@ -25385,7 +25666,22 @@ namespace AllflameBot
                     TryGetCapsuleContainerItemCount(
                         out beforeContainerCount) &&
                     beforeContainerCount > 0;
-                bool inputSent = VoyagePlanningUi.Click(sendButton);
+                Element confirmedSendButton;
+                string confirmedSendMode;
+                bool sendRevalidated =
+                    CapsuleDirectUi.TryGetButton(
+                        CapsuleUiAction.SendToSurface,
+                        true,
+                        out confirmedSendButton,
+                        out confirmedSendMode) &&
+                    CapsuleDirectUi.IsEnabled(
+                        confirmedSendButton);
+                bool inputSent =
+                    sendRevalidated &&
+                    VoyagePlanningUi.Click(confirmedSendButton);
+                sendDetectionMode = sendRevalidated
+                    ? confirmedSendMode
+                    : sendDetectionMode;
                 _sendAttempts++;
                 int sendAttemptForLog = _sendAttempts;
                 bool acknowledged = false;
@@ -25422,10 +25718,18 @@ namespace AllflameBot
                         "Acknowledged:" + confirmation);
                 }
                 AllflameLog.Info(
+                    "CAPSULE_UI_ELEMENT_CLICK" +
+                    "|Action=SendToSurface" +
+                    "|Detection=" + sendDetectionMode +
+                    "|InputSent=" + inputSent +
+                    "|Acknowledged=" + acknowledged +
+                    "|Confirmation=" + confirmation);
+                AllflameLog.Info(
                     "VOYAGE_STAGE|Stage=7|Action=SendToSurface" +
                     "|InputSent=" + inputSent +
                     "|Acknowledged=" + acknowledged +
                     "|Confirmation=" + confirmation +
+                    "|Detection=" + sendDetectionMode +
                     "|Attempt=" + sendAttemptForLog +
                     "|ExtractionPending=" + extractionRequired);
                 if (acknowledged)
@@ -25627,6 +25931,17 @@ namespace AllflameBot
                                 }
                             }
 
+                            AllflameLog.Info(
+                                "CAPSULE_UI_ELEMENT_CLICK" +
+                                "|Action=CallBathysphere" +
+                                "|Detection=" +
+                                secondDirectMode +
+                                "|Client=" +
+                                secondDirectLocation +
+                                "|InputSent=" + inputSent +
+                                "|Acknowledged=" + acknowledged +
+                                "|WarningOkClicked=" +
+                                warningOkClicked);
                             AllflameLog.Info(
                                 "VOYAGE_STAGE" +
                                 "|Stage=8" +

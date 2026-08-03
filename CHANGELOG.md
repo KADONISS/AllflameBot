@@ -2,6 +2,18 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.124 - 2026-08-03
+
+- Resolve the opened Allflame Capsule through the stable
+  `deepwater_extraction_window` IdLabel without hardcoding its GUI root index
+  or runtime addresses.
+- Resolve `Send to Surface` and `Call Bathysphere` from their exact extraction
+  paths, with caption lookup restricted to that window when paths change.
+- Use the stable extraction snapshot for Capsule UI context and both action
+  buttons while retaining bounded geometry and visual detection as fallbacks.
+- Re-resolve buttons immediately before clicking and log input separately from
+  semantic acknowledgement of the surface transfer or Bathysphere call.
+
 ## 0.23.123 - 2026-08-03
 
 - Convert Voyage Planner Chart indices through DPB's
