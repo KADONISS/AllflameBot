@@ -386,7 +386,9 @@ namespace AllflameBot
                 Number("Maximum Bottles per session", "SecretMaxBottlesPerSession", 1, 100),
                 Number("Minimum free inventory squares", "SecretBottleMinimumFreeSquares", 2, 60),
                 Check("Read Bottles from Guild Stash", "SecretBottleUseGuildStash"),
-                Text("Bottle stash tab name or number", "SecretBottleStashTab"),
+                Text("Bottle stash tabs (names or numbers)", "SecretBottleStashTab"),
+                Note("Separate multiple tabs with commas, for example: 1, 2, 3."),
+                Note("All configured tabs are scanned before the bot decides that there are not enough Bottles."),
                 Note("The threshold is counted from the live DPB inventory, independently from Send after bottles collected."))));
             Grid.SetColumn(grid.Children[0], 0);
 

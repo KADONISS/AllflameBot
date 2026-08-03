@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.118";
+        public const string Current = "0.23.119";
     }
 
     public sealed class AllflameBot : IBot
@@ -30417,6 +30417,21 @@ namespace AllflameBot
             public int Row { get; set; }
         }
 
+        private enum BottleTabState
+        {
+            Unknown,
+            Available,
+            Depleted,
+            Failed
+        }
+
+        private sealed class BottleTabSnapshot
+        {
+            public string Name { get; set; }
+            public int Remaining { get; set; }
+            public BottleTabState State { get; set; }
+        }
+
         private readonly HashSet<int> _sellLocalIds =
             new HashSet<int>();
         private readonly HashSet<int> _transferredLocalIds =
@@ -30427,10 +30442,20 @@ namespace AllflameBot
             new Dictionary<int, int>();
         private readonly Dictionary<int, int> _transferAttempts =
             new Dictionary<int, int>();
-        private readonly Dictionary<int, int> _withdrawAttempts =
-            new Dictionary<int, int>();
+        private readonly Dictionary<string, int> _withdrawAttempts =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> _tabSwitchAttempts =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<BottleTabSnapshot> _bottleTabs =
+            new List<BottleTabSnapshot>();
         private bool _active;
+        private bool _cycleComplete;
+        private bool _cycleCompletionPending;
+        private bool _scanComplete;
+        private bool _waitingForInventorySpace;
         private ProcessingStage _stage;
+        private int _scanIndex;
+        private int _withdrawTarget;
         private int _opened;
         private int _kept;
         private int _sold;
@@ -30441,11 +30466,20 @@ namespace AllflameBot
         private DateTime _vendorAcceptDeadlineUtc = DateTime.MinValue;
         private DateTime _nextSessionUtc = DateTime.MinValue;
         private uint _sessionAreaHash;
+        private string _cycleSettingsSignature = String.Empty;
 
         public SecretBottleProcessingTask()
             : base(
                 "SecretBottleProcessingTask",
                 "Opens Message in a Bottle rewards and safely keeps or sells them by configured value.") { }
+
+        public override void Start()
+        {
+            ResetSessionState();
+            _cycleComplete = false;
+            _nextSessionUtc = DateTime.MinValue;
+            _cycleSettingsSignature = String.Empty;
+        }
 
         public override void Stop()
         {
@@ -30461,6 +30495,7 @@ namespace AllflameBot
                     "|Reason=TaskStopped");
             }
             ResetSessionState();
+            _cycleComplete = false;
         }
 
         public static bool IsBottleItem(Item item)
@@ -30491,6 +30526,19 @@ namespace AllflameBot
         public override async Task<bool> Run()
         {
             AllflameSettings settings = AllflameSettings.Instance;
+            string settingsSignature = BottleCycleSettingsSignature(settings);
+            if (!String.Equals(
+                    _cycleSettingsSignature,
+                    settingsSignature,
+                    StringComparison.Ordinal))
+            {
+                if (!_active)
+                {
+                    _cycleComplete = false;
+                    _nextSessionUtc = DateTime.MinValue;
+                }
+                _cycleSettingsSignature = settingsSignature;
+            }
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
                 AllflameContext.Phase == AllflamePhase.VoyagePlanning;
@@ -30504,6 +30552,15 @@ namespace AllflameBot
                 {
                     FinishSession("ContextChanged", true, 15);
                 }
+                if (!inHub)
+                {
+                    _cycleComplete = false;
+                    _cycleCompletionPending = false;
+                }
+                return false;
+            }
+            if (_cycleComplete)
+            {
                 return false;
             }
             if (_active &&
@@ -30530,7 +30587,11 @@ namespace AllflameBot
                     return false;
                 }
                 StartSession(bottleCount, threshold);
-                if (bottleCount < threshold)
+                LogReservedBottles(items);
+                int maximum = Math.Max(
+                    1,
+                    settings.SecretMaxBottlesPerSession);
+                if (bottleCount < maximum)
                 {
                     _stage = ProcessingStage.Withdraw;
                 }
@@ -30538,6 +30599,14 @@ namespace AllflameBot
 
             if (_stage == ProcessingStage.Withdraw)
             {
+                if (_waitingForInventorySpace)
+                {
+                    if (AllflameContext.InventoryFreeSquares <= 0)
+                    {
+                        return false;
+                    }
+                    _waitingForInventorySpace = false;
+                }
                 return await WithdrawBottlesFromStash(
                     settings,
                     bottleCount,
@@ -30582,6 +30651,7 @@ namespace AllflameBot
                     settings.SecretMaxBottlesPerSession);
                 if (bottle == null || _opened >= maximum)
                 {
+                    _cycleCompletionPending = true;
                     _stage = ProcessingStage.FindVendor;
                     return true;
                 }
@@ -30630,6 +30700,13 @@ namespace AllflameBot
             _vendor = null;
             _vendorStartedUtc = DateTime.MinValue;
             _vendorAcceptDeadlineUtc = DateTime.MinValue;
+            _cycleCompletionPending = false;
+            _scanComplete = false;
+            _waitingForInventorySpace = false;
+            _scanIndex = 0;
+            _withdrawTarget = 0;
+            _bottleTabs.Clear();
+            _tabSwitchAttempts.Clear();
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
@@ -30637,6 +30714,8 @@ namespace AllflameBot
             _transferAttempts.Clear();
             _withdrawAttempts.Clear();
             _sessionAreaHash = AllflameContext.AreaHash;
+            _cycleSettingsSignature =
+                BottleCycleSettingsSignature(AllflameSettings.Instance);
             AllflameLog.Info(
                 "SECRET_BOTTLE_SESSION_START" +
                 "|InventoryBottles=" + bottleCount +
@@ -30656,6 +30735,9 @@ namespace AllflameBot
             int threshold)
         {
             bool useGuild = settings.SecretBottleUseGuildStash;
+            int maximum = Math.Max(
+                1,
+                settings.SecretMaxBottlesPerSession);
             bool stashOpened = useGuild
                 ? LokiPoe.InGameState.GuildStashUi.IsOpened
                 : LokiPoe.InGameState.StashUi.IsOpened;
@@ -30673,6 +30755,15 @@ namespace AllflameBot
                 NetworkObject stash = FindBottleStashObject(useGuild);
                 if (stash == null || !stash.IsValid)
                 {
+                    if (inventoryBottleCount >= threshold)
+                    {
+                        _withdrawTarget = Math.Min(
+                            maximum,
+                            inventoryBottleCount);
+                        _cycleCompletionPending = true;
+                        _stage = ProcessingStage.Opening;
+                        return true;
+                    }
                     AllflameLog.Throttled(
                         "secret_bottle_stash_missing_" + useGuild,
                         TimeSpan.FromSeconds(3),
@@ -30681,6 +30772,7 @@ namespace AllflameBot
                         "|Reason=StashObjectMissing" +
                         "|Destination=" +
                         (useGuild ? "Guild" : "Personal"));
+                    _cycleCompletionPending = true;
                     FinishSession("StashObjectMissing", true, 30);
                     return false;
                 }
@@ -30690,78 +30782,193 @@ namespace AllflameBot
                 return true;
             }
 
-            string configuredTab =
-                (settings.SecretBottleStashTab ?? String.Empty).Trim();
-            string targetTab = ResolveBottleStashTab(
-                configuredTab,
-                useGuild);
-            if (String.IsNullOrEmpty(targetTab))
+            if (_bottleTabs.Count == 0)
             {
-                await Coroutines.CloseBlockingWindows();
-                FinishSession("BottleStashTabMissing", true, 60);
-                return false;
-            }
-            string currentTab = useGuild
-                ? LokiPoe.InGameState.GuildStashUi.TabControl.CurrentTabName
-                : LokiPoe.InGameState.StashUi.TabControl.CurrentTabName;
-            if (!String.Equals(
-                    currentTab,
-                    targetTab,
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                object result = SwitchBottleStashTab(targetTab, useGuild);
+                List<string> missing;
+                List<string> resolved = ResolveBottleStashTabs(
+                    settings.SecretBottleStashTab,
+                    useGuild,
+                    out missing);
+                foreach (string tab in resolved)
+                {
+                    _bottleTabs.Add(new BottleTabSnapshot
+                    {
+                        Name = tab,
+                        Remaining = -1,
+                        State = BottleTabState.Unknown
+                    });
+                }
                 AllflameLog.Info(
-                    "SECRET_BOTTLE_STASH" +
-                    "|Action=SwitchTab" +
-                    "|Configured=" + configuredTab +
-                    "|Resolved=" + targetTab +
-                    "|Result=" + result);
-                await LokiCoroutine.Sleep(600);
+                    "SECRET_BOTTLE_TABS_RESOLVED" +
+                    "|Configured=" +
+                    (settings.SecretBottleStashTab ?? String.Empty)
+                        .Replace("|", "/") +
+                    "|Resolved=" + String.Join(",", resolved) +
+                    "|Missing=" + String.Join(",", missing) +
+                    "|Destination=" +
+                    (useGuild ? "Guild" : "Personal"));
+                if (_bottleTabs.Count == 0)
+                {
+                    if (inventoryBottleCount >= threshold)
+                    {
+                        await Coroutines.CloseBlockingWindows();
+                        _withdrawTarget = Math.Min(
+                            maximum,
+                            inventoryBottleCount);
+                        _cycleCompletionPending = true;
+                        _stage = ProcessingStage.Opening;
+                        return true;
+                    }
+                    await Coroutines.CloseBlockingWindows();
+                    _cycleCompletionPending = true;
+                    FinishSession("BottleStashTabMissing", true, 60);
+                    return false;
+                }
+            }
+
+            string currentTab = CurrentBottleStashTab(useGuild);
+            if (!_scanComplete && _scanIndex < _bottleTabs.Count)
+            {
+                BottleTabSnapshot scanTab = _bottleTabs[_scanIndex];
+                if (!String.Equals(
+                        currentTab,
+                        scanTab.Name,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    bool switched = TrySwitchBottleTab(
+                        scanTab,
+                        useGuild,
+                        "Scan");
+                    await LokiCoroutine.Sleep(600);
+                    if (!switched &&
+                        scanTab.State == BottleTabState.Failed)
+                    {
+                        _scanIndex++;
+                    }
+                    return true;
+                }
+
+                InventoryControlWrapper scanControl =
+                    BottleStashInventoryControl(useGuild);
+                int count = BottleQuantity(InventoryItems(scanControl));
+                scanTab.Remaining = count;
+                scanTab.State = count > 0
+                    ? BottleTabState.Available
+                    : BottleTabState.Depleted;
+                _tabSwitchAttempts.Remove(scanTab.Name);
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_TAB_SCAN" +
+                    "|Tab=" + scanTab.Name +
+                    "|Index=" + (_scanIndex + 1) + "/" +
+                    _bottleTabs.Count +
+                    "|Bottles=" + count +
+                    "|State=" + scanTab.State);
+                _scanIndex++;
                 return true;
             }
 
-            InventoryControlWrapper stashControl = useGuild
-                ? LokiPoe.InGameState.GuildStashUi.InventoryControl
-                : LokiPoe.InGameState.StashUi.InventoryControl;
-            List<Item> stashItems = InventoryItems(stashControl);
-            int stashBottleCount = BottleQuantity(stashItems);
-            int combined = inventoryBottleCount + stashBottleCount;
-            AllflameLog.Throttled(
-                "secret_bottle_stash_count",
-                TimeSpan.FromSeconds(2),
-                "SECRET_BOTTLE_STASH_COUNT" +
-                "|Inventory=" + inventoryBottleCount +
-                "|Stash=" + stashBottleCount +
-                "|Combined=" + combined +
-                "|Required=" + threshold +
-                "|Tab=" + targetTab);
-            if (combined < threshold)
+            if (!_scanComplete)
             {
-                await Coroutines.CloseBlockingWindows();
-                FinishSession("CombinedBottleCountBelowThreshold", false, 30);
-                return false;
+                _scanComplete = true;
+                int stashTotal = _bottleTabs
+                    .Where(tab => tab.State == BottleTabState.Available)
+                    .Sum(tab => Math.Max(0, tab.Remaining));
+                int combinedTotal = inventoryBottleCount + stashTotal;
+                _withdrawTarget = Math.Min(maximum, combinedTotal);
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_SCAN_COMPLETE" +
+                    "|Tabs=" + String.Join(
+                        ",",
+                        _bottleTabs.Select(tab => tab.Name)) +
+                    "|Inventory=" + inventoryBottleCount +
+                    "|StashTotal=" + stashTotal +
+                    "|Combined=" + combinedTotal +
+                    "|Required=" + threshold +
+                    "|Maximum=" + maximum +
+                    "|WithdrawTarget=" + _withdrawTarget);
+                if (combinedTotal < threshold)
+                {
+                    await Coroutines.CloseBlockingWindows();
+                    _cycleCompletionPending = true;
+                    FinishSession(
+                        "CombinedBottleCountBelowThreshold",
+                        false,
+                        30);
+                    return false;
+                }
             }
-            if (inventoryBottleCount >= threshold)
+
+            if (inventoryBottleCount >= _withdrawTarget)
             {
                 await Coroutines.CloseBlockingWindows();
+                _cycleCompletionPending = true;
                 _stage = ProcessingStage.Opening;
                 return true;
             }
             if (AllflameContext.InventoryFreeSquares <= 0)
             {
                 await Coroutines.CloseBlockingWindows();
-                FinishSession("NeedInventorySpaceForBottleWithdrawal", true, 2);
+                _waitingForInventorySpace = true;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_WAIT" +
+                    "|Reason=NeedInventorySpaceForBottleWithdrawal" +
+                    "|Action=YieldToStashNonBottleItems");
                 return false;
+            }
+
+            BottleTabSnapshot target = _bottleTabs.FirstOrDefault(tab =>
+                tab.State == BottleTabState.Available &&
+                tab.Remaining > 0);
+            if (target == null)
+            {
+                await Coroutines.CloseBlockingWindows();
+                if (inventoryBottleCount >= threshold)
+                {
+                    _cycleCompletionPending = true;
+                    _stage = ProcessingStage.Opening;
+                    return true;
+                }
+                _cycleCompletionPending = true;
+                FinishSession("BottleTabsExhaustedOrFailed", true, 30);
+                return false;
+            }
+
+            currentTab = CurrentBottleStashTab(useGuild);
+            if (!String.Equals(
+                    currentTab,
+                    target.Name,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                TrySwitchBottleTab(target, useGuild, "Withdraw");
+                await LokiCoroutine.Sleep(600);
+                return true;
+            }
+            _tabSwitchAttempts.Remove(target.Name);
+
+            InventoryControlWrapper stashControl =
+                BottleStashInventoryControl(useGuild);
+            List<Item> stashItems = InventoryItems(stashControl);
+            int stashBottleCount = BottleQuantity(stashItems);
+            if (stashBottleCount <= 0)
+            {
+                UpdateBottleTabCache(
+                    target,
+                    0,
+                    "ConfirmedEmpty");
+                return true;
             }
 
             Item bottle = stashItems.FirstOrDefault(IsBottleItem);
             if (bottle == null)
             {
-                await Coroutines.CloseBlockingWindows();
-                FinishSession("BottleDisappearedFromConfiguredTab", true, 30);
-                return false;
+                UpdateBottleTabCache(
+                    target,
+                    0,
+                    "BottleObjectMissing");
+                return true;
             }
             int key = ItemKey(bottle);
+            string attemptKey = target.Name + ":" + key;
             int beforeInventory = inventoryBottleCount;
             string fastMoveResult;
             try
@@ -30777,34 +30984,49 @@ namespace AllflameBot
             await LokiCoroutine.Sleep(300);
             int afterInventory = BottleQuantity(
                 InventoryItems(MainInventory()));
+            int remaining = BottleQuantity(
+                InventoryItems(stashControl));
             bool moved = afterInventory > beforeInventory;
             int attempts;
-            _withdrawAttempts.TryGetValue(key, out attempts);
+            _withdrawAttempts.TryGetValue(attemptKey, out attempts);
             attempts++;
             AllflameLog.Info(
                 "SECRET_BOTTLE_STASH_WITHDRAW" +
-                "|Tab=" + targetTab +
+                "|Tab=" + target.Name +
                 "|Attempt=" + attempts +
                 "|Result=" + fastMoveResult +
                 "|BeforeInventory=" + beforeInventory +
                 "|AfterInventory=" + afterInventory +
+                "|Remaining=" + remaining +
                 "|Confirmed=" + moved);
             if (moved)
             {
-                _withdrawAttempts.Remove(key);
-                if (afterInventory >= threshold)
+                _withdrawAttempts.Remove(attemptKey);
+                UpdateBottleTabCache(
+                    target,
+                    remaining,
+                    "ConfirmedWithdraw");
+                if (afterInventory >= _withdrawTarget)
                 {
                     await Coroutines.CloseBlockingWindows();
+                    _cycleCompletionPending = true;
                     _stage = ProcessingStage.Opening;
                 }
                 return true;
             }
-            _withdrawAttempts[key] = attempts;
+            _withdrawAttempts[attemptKey] = attempts;
             if (attempts >= 3)
             {
-                await Coroutines.CloseBlockingWindows();
-                FinishSession("BottleWithdrawalRejectedThreeTimes", true, 30);
-                return false;
+                _withdrawAttempts.Remove(attemptKey);
+                target.State = BottleTabState.Failed;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_TAB_CACHE" +
+                    "|Tab=" + target.Name +
+                    "|Previous=" + target.Remaining +
+                    "|Remaining=" + remaining +
+                    "|State=Failed" +
+                    "|Source=WithdrawalRejectedThreeTimes" +
+                    "|Action=TryNextTab");
             }
             return true;
         }
@@ -30856,6 +31078,7 @@ namespace AllflameBot
                 if (attempts >= 3)
                 {
                     _failed++;
+                    _cycleCompletionPending = true;
                     _stage = ProcessingStage.FindVendor;
                     _nextSessionUtc = DateTime.UtcNow.AddSeconds(30);
                 }
@@ -30943,6 +31166,7 @@ namespace AllflameBot
                         "SecretBottleCursorStuck",
                         "Reward remained on cursor after " + rewardResult);
                 }
+                _cycleCompletionPending = true;
                 _stage = ProcessingStage.FindVendor;
                 AllflameLog.Info(
                     "SECRET_BOTTLE_REWARD" +
@@ -32193,6 +32417,8 @@ namespace AllflameBot
             bool fallback,
             int cooldownSeconds)
         {
+            bool completedCycle = _cycleCompletionPending;
+            int opened = _opened;
             AllflameLog.Info(
                 "SECRET_BOTTLE_PROCESS_DONE" +
                 "|Opened=" + _opened +
@@ -32202,6 +32428,20 @@ namespace AllflameBot
                 "|Fallback=" + fallback +
                 "|Reason=" + reason);
             ResetSessionState();
+            if (completedCycle)
+            {
+                _cycleComplete = true;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_CYCLE_COMPLETE" +
+                    "|Opened=" + opened +
+                    "|Maximum=" +
+                    Math.Max(
+                        1,
+                        AllflameSettings.Instance
+                            .SecretMaxBottlesPerSession) +
+                    "|Reason=" + reason +
+                    "|Action=ProceedToMap");
+            }
             _nextSessionUtc = DateTime.UtcNow.AddSeconds(
                 Math.Max(1, cooldownSeconds));
         }
@@ -32213,12 +32453,19 @@ namespace AllflameBot
             _vendor = null;
             _vendorStartedUtc = DateTime.MinValue;
             _vendorAcceptDeadlineUtc = DateTime.MinValue;
+            _cycleCompletionPending = false;
+            _scanComplete = false;
+            _waitingForInventorySpace = false;
+            _scanIndex = 0;
+            _withdrawTarget = 0;
+            _bottleTabs.Clear();
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
             _openAttempts.Clear();
             _transferAttempts.Clear();
             _withdrawAttempts.Clear();
+            _tabSwitchAttempts.Clear();
             _vendorAcceptAttempts = 0;
             _sessionAreaHash = 0;
         }
@@ -32374,10 +32621,13 @@ namespace AllflameBot
             }
         }
 
-        private static string ResolveBottleStashTab(
+        private static List<string> ResolveBottleStashTabs(
             string configured,
-            bool guild)
+            bool guild,
+            out List<string> missing)
         {
+            missing = new List<string>();
+            var resolved = new List<string>();
             try
             {
                 List<string> available = guild
@@ -32385,29 +32635,145 @@ namespace AllflameBot
                     : LokiPoe.InGameState.StashUi.TabControl.TabNames;
                 if (available == null || available.Count == 0)
                 {
-                    return String.Empty;
+                    return resolved;
                 }
-                string token = (configured ?? String.Empty).Trim();
-                string exact = available.FirstOrDefault(name =>
-                    String.Equals(
-                        name,
-                        token,
-                        StringComparison.OrdinalIgnoreCase));
-                if (!String.IsNullOrEmpty(exact))
+                string[] tokens = (configured ?? String.Empty)
+                    .Split(new[] { ',', ';' },
+                        StringSplitOptions.RemoveEmptyEntries);
+                foreach (string rawToken in tokens)
                 {
-                    return exact;
+                    string token = rawToken.Trim();
+                    if (String.IsNullOrEmpty(token))
+                    {
+                        continue;
+                    }
+                    string exact = available.FirstOrDefault(name =>
+                        String.Equals(
+                            name,
+                            token,
+                            StringComparison.OrdinalIgnoreCase));
+                    string result = exact;
+                    if (String.IsNullOrEmpty(result))
+                    {
+                        int number;
+                        if (Int32.TryParse(token, out number) &&
+                            number >= 1 &&
+                            number <= available.Count)
+                        {
+                            result = available[number - 1];
+                        }
+                    }
+                    if (String.IsNullOrEmpty(result))
+                    {
+                        missing.Add(token);
+                        continue;
+                    }
+                    if (!resolved.Any(tab =>
+                            String.Equals(
+                                tab,
+                                result,
+                                StringComparison.OrdinalIgnoreCase)))
+                    {
+                        resolved.Add(result);
+                    }
                 }
-                int number;
-                return Int32.TryParse(token, out number) &&
-                       number >= 1 &&
-                       number <= available.Count
-                    ? available[number - 1]
-                    : String.Empty;
+                return resolved;
             }
             catch
             {
-                return String.Empty;
+                return resolved;
             }
+        }
+
+        private bool TrySwitchBottleTab(
+            BottleTabSnapshot tab,
+            bool guild,
+            string purpose)
+        {
+            object result = SwitchBottleStashTab(tab.Name, guild);
+            bool success;
+            try
+            {
+                success = Convert.ToInt32(result) == 0;
+            }
+            catch
+            {
+                success = false;
+            }
+            int attempts;
+            _tabSwitchAttempts.TryGetValue(tab.Name, out attempts);
+            attempts++;
+            _tabSwitchAttempts[tab.Name] = attempts;
+            if (attempts >= 3)
+            {
+                tab.State = BottleTabState.Failed;
+            }
+            AllflameLog.Info(
+                "SECRET_BOTTLE_STASH" +
+                "|Action=SwitchTab" +
+                "|Purpose=" + purpose +
+                "|Tab=" + tab.Name +
+                "|Attempt=" + attempts +
+                "|Result=" + result +
+                "|Success=" + success +
+                "|State=" + tab.State);
+            return success && tab.State != BottleTabState.Failed;
+        }
+
+        private static string CurrentBottleStashTab(bool guild)
+        {
+            return guild
+                ? LokiPoe.InGameState.GuildStashUi.TabControl.CurrentTabName
+                : LokiPoe.InGameState.StashUi.TabControl.CurrentTabName;
+        }
+
+        private static InventoryControlWrapper BottleStashInventoryControl(
+            bool guild)
+        {
+            return guild
+                ? LokiPoe.InGameState.GuildStashUi.InventoryControl
+                : LokiPoe.InGameState.StashUi.InventoryControl;
+        }
+
+        private static void UpdateBottleTabCache(
+            BottleTabSnapshot tab,
+            int remaining,
+            string source)
+        {
+            int previous = tab.Remaining;
+            tab.Remaining = Math.Max(0, remaining);
+            tab.State = tab.Remaining > 0
+                ? BottleTabState.Available
+                : BottleTabState.Depleted;
+            AllflameLog.Info(
+                "SECRET_BOTTLE_TAB_CACHE" +
+                "|Tab=" + tab.Name +
+                "|Previous=" + previous +
+                "|Remaining=" + tab.Remaining +
+                "|State=" + tab.State +
+                "|Source=" + source);
+        }
+
+        private static void LogReservedBottles(IEnumerable<Item> items)
+        {
+            foreach (Item item in
+                (items ?? Enumerable.Empty<Item>()).Where(IsBottleItem))
+            {
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_RESERVED" +
+                    "|LocalId=" + item.LocalId +
+                    "|Quantity=" + Math.Max(1, item.StackCount) +
+                    "|Reason=PendingBottleCycle");
+            }
+        }
+
+        private static string BottleCycleSettingsSignature(
+            AllflameSettings settings)
+        {
+            return settings.SecretBottleUseGuildStash + "|" +
+                (settings.SecretBottleStashTab ?? String.Empty).Trim() + "|" +
+                Math.Max(1, settings.SecretBottlesToOpen) + "|" +
+                Math.Max(1, settings.SecretMaxBottlesPerSession);
         }
 
         private static object SwitchBottleStashTab(

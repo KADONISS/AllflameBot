@@ -2,6 +2,16 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.119 - 2026-08-03
+
+- Accept comma-separated Message in a Bottle stash tabs, scan every resolved
+  personal or guild tab, and remember available, depleted and failed tabs for
+  the active Bottle cycle.
+- Combine inventory and all configured stash counts before applying the open
+  threshold, then withdraw across tabs up to the per-session Bottle limit.
+- Complete one bounded Bottle cycle before yielding to map preparation, while
+  continuing to reserve unopened Bottles from the normal loot stash task.
+
 ## 0.23.118 - 2026-08-03
 
 - Defer Chart supply checks while a requested Chart Device cycle owns the
