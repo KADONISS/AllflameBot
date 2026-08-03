@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.121 - 2026-08-03
+
+- Add a stable `IdLabel` registry for Chart Device, Voyage Planner and
+  Extraction windows without relying on root indices or memory addresses.
+- Discover semantic Deepwater buttons and raw inventory candidates through
+  DPB's live UI tree, with bounded scans and observe-only diagnostics.
+- Supplement existing UI visibility checks with resolved roots and buttons;
+  clicking behavior remains unchanged while runtime evidence is collected.
+
 ## 0.23.120 - 2026-08-03
 
 - Deposit remaining pre-Voyage Charts into Chart Storage first, confirm each

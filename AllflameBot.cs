@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.120";
+        public const string Current = "0.23.121";
     }
 
     public sealed class AllflameBot : IBot
@@ -513,6 +513,7 @@ namespace AllflameBot
                 {
                     if (!LokiPoe.IsInGame)
                     {
+                        DeepwaterUiRegistry.Reset();
                         Phase = AllflamePhase.NotInGame;
                         AreaId = String.Empty;
                         AreaName = String.Empty;
@@ -539,16 +540,40 @@ namespace AllflameBot
                     SnapshotInventory();
                     TrackPosition(now);
                     HashSet<string> visibleUiText = CaptureVisibleUiText();
+                    DeepwaterUiRegistry.Refresh();
+                    bool voyagePlannerRootVisible =
+                        DeepwaterUiRegistry.IsVisible(
+                            DeepwaterUiKind.VoyagePlanner);
+                    bool extractionRootVisible =
+                        DeepwaterUiRegistry.IsVisible(
+                            DeepwaterUiKind.Extraction);
                     // "Plan Voyage" is also an NPC dialogue choice. Only the
                     // window title contains "Plan your Voyage"; using the
                     // shorter text incorrectly classified Valerie's dialogue
                     // as an already opened Voyage window.
-                    PlanVoyageVisible = ContainsUiText(
-                        visibleUiText,
-                        "Plan your Voyage");
+                    PlanVoyageVisible = voyagePlannerRootVisible ||
+                        ContainsUiText(
+                            visibleUiText,
+                            "Plan your Voyage");
                     ChartAreaOptionVisible = ContainsUiText(visibleUiText, "Chart Area");
-                    CallBathysphereVisible = ContainsUiText(visibleUiText, "Call Bathysphere");
-                    SendToSurfaceVisible = ContainsUiText(visibleUiText, "Send to Surface");
+                    Element callBathysphereButton;
+                    Element sendToSurfaceButton;
+                    CallBathysphereVisible =
+                        DeepwaterUiRegistry.TryGetButton(
+                            DeepwaterUiKind.Extraction,
+                            "Call Bathysphere",
+                            out callBathysphereButton) ||
+                        ContainsUiText(
+                            visibleUiText,
+                            "Call Bathysphere");
+                    SendToSurfaceVisible =
+                        DeepwaterUiRegistry.TryGetButton(
+                            DeepwaterUiKind.Extraction,
+                            "Send to Surface",
+                            out sendToSurfaceButton) ||
+                        ContainsUiText(
+                            visibleUiText,
+                            "Send to Surface");
                     bool capsuleTitleVisible =
                         ContainsUiText(
                             visibleUiText,
@@ -556,10 +581,10 @@ namespace AllflameBot
                     // The world-object label also says "Allflame Capsule".
                     // Requiring a Capsule-only action button prevents that
                     // label from impersonating the opened inventory window.
-                    CapsuleUiVisible =
-                        capsuleTitleVisible &&
-                        (CallBathysphereVisible ||
-                         SendToSurfaceVisible);
+                    CapsuleUiVisible = extractionRootVisible ||
+                        (capsuleTitleVisible &&
+                         (CallBathysphereVisible ||
+                          SendToSurfaceVisible));
                     SnapshotLanternCounter(visibleUiText);
 
                     bool isVoyage = String.Equals(
@@ -14203,6 +14228,687 @@ namespace AllflameBot
             _nativeBindFailed = false;
             _rawWithdrawFailed = false;
             _inventoryFull = false;
+        }
+    }
+
+    internal enum DeepwaterUiKind
+    {
+        ChartDevice,
+        VoyagePlanner,
+        Extraction
+    }
+
+    internal sealed class DeepwaterRawInventorySnapshot
+    {
+        public Element Element;
+        public InventorySlotUiElement Slot;
+        public string Path;
+        public int RawItemCount;
+        public List<int> RawKeys = new List<int>();
+    }
+
+    internal sealed class DeepwaterUiSnapshot
+    {
+        public DeepwaterUiKind Kind;
+        public Element Root;
+        public string RootIdLabel;
+        public long RootAddress;
+        public int RootChildren;
+        public int Visited;
+        public string Signature;
+        public readonly Dictionary<string, Element> Buttons =
+            new Dictionary<string, Element>(
+                StringComparer.OrdinalIgnoreCase);
+        public readonly List<DeepwaterRawInventorySnapshot> RawInventories =
+            new List<DeepwaterRawInventorySnapshot>();
+    }
+
+    /// <summary>
+    /// Resolves Deepwater windows from stable root IdLabels. Memory addresses
+    /// and root indices are deliberately excluded from the structural
+    /// signature because both change between client sessions.
+    /// </summary>
+    internal static class DeepwaterUiRegistry
+    {
+        private const int MaximumVisitedPerRoot = 1400;
+        private const int MaximumRawSlotProbes = 48;
+        private static readonly TimeSpan ScanInterval =
+            TimeSpan.FromMilliseconds(500);
+        private static readonly TimeSpan RawInventoryScanInterval =
+            TimeSpan.FromSeconds(2);
+        private static readonly Dictionary<DeepwaterUiKind, string> RootLabels =
+            new Dictionary<DeepwaterUiKind, string>
+            {
+                { DeepwaterUiKind.ChartDevice, "deepwater_charts_window" },
+                { DeepwaterUiKind.VoyagePlanner, "deepwater_voyage_window" },
+                { DeepwaterUiKind.Extraction, "deepwater_extraction_window" }
+            };
+        private static readonly Dictionary<DeepwaterUiKind, string[]> ButtonCaptions =
+            new Dictionary<DeepwaterUiKind, string[]>
+            {
+                {
+                    DeepwaterUiKind.ChartDevice,
+                    new[] { "Descend" }
+                },
+                {
+                    DeepwaterUiKind.VoyagePlanner,
+                    new[] { "Begin Voyage", "Clear Board" }
+                },
+                {
+                    DeepwaterUiKind.Extraction,
+                    new[] { "Send to Surface", "Call Bathysphere", "OK" }
+                }
+            };
+        private static readonly Dictionary<DeepwaterUiKind, DeepwaterUiSnapshot> Snapshots =
+            new Dictionary<DeepwaterUiKind, DeepwaterUiSnapshot>();
+        private static readonly Dictionary<DeepwaterUiKind, string> LastSignatures =
+            new Dictionary<DeepwaterUiKind, string>();
+        private static readonly HashSet<DeepwaterUiKind> PreviouslyVisible =
+            new HashSet<DeepwaterUiKind>();
+        private static DateTime _nextScanUtc = DateTime.MinValue;
+        private static DateTime _nextRawInventoryScanUtc = DateTime.MinValue;
+
+        public static void Reset()
+        {
+            Snapshots.Clear();
+            PreviouslyVisible.Clear();
+            LastSignatures.Clear();
+            _nextScanUtc = DateTime.MinValue;
+            _nextRawInventoryScanUtc = DateTime.MinValue;
+        }
+
+        public static void Refresh()
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now < _nextScanUtc)
+            {
+                return;
+            }
+            _nextScanUtc = now.Add(ScanInterval);
+            bool probeRawInventories = now >= _nextRawInventoryScanUtc;
+            if (probeRawInventories)
+            {
+                _nextRawInventoryScanUtc =
+                    now.Add(RawInventoryScanInterval);
+            }
+
+            List<Element> roots;
+            try
+            {
+                roots = LokiPoe.GetGuiElements();
+            }
+            catch (Exception exception)
+            {
+                AllflameLog.Throttled(
+                    "deepwater_ui_registry_scan_failed",
+                    TimeSpan.FromSeconds(5),
+                    "DEEPWATER_UI_SCAN_FAILED" +
+                    "|Type=" + exception.GetType().Name +
+                    "|Message=" + Sanitize(exception.Message) +
+                    "|Mode=ObserveOnly");
+                return;
+            }
+
+            var resolvedKinds = new HashSet<DeepwaterUiKind>();
+            if (roots != null)
+            {
+                foreach (KeyValuePair<DeepwaterUiKind, string> entry in
+                    RootLabels)
+                {
+                    Element root = FindVisibleRoot(roots, entry.Value);
+                    if (root == null)
+                    {
+                        continue;
+                    }
+                    DeepwaterUiSnapshot previousSnapshot;
+                    Snapshots.TryGetValue(entry.Key, out previousSnapshot);
+                    DeepwaterUiSnapshot snapshot = BuildSnapshot(
+                        entry.Key,
+                        entry.Value,
+                        root,
+                        probeRawInventories,
+                        previousSnapshot);
+                    Snapshots[entry.Key] = snapshot;
+                    resolvedKinds.Add(entry.Key);
+                    PublishSnapshot(snapshot);
+                }
+            }
+
+            foreach (DeepwaterUiKind kind in RootLabels.Keys)
+            {
+                if (resolvedKinds.Contains(kind))
+                {
+                    PreviouslyVisible.Add(kind);
+                    continue;
+                }
+                Snapshots.Remove(kind);
+                if (PreviouslyVisible.Remove(kind))
+                {
+                    AllflameLog.Info(
+                        "DEEPWATER_UI_CLOSED" +
+                        "|Kind=" + kind +
+                        "|IdLabel=" + RootLabels[kind] +
+                        "|Mode=ObserveOnly");
+                }
+            }
+        }
+
+        public static bool IsVisible(DeepwaterUiKind kind)
+        {
+            DeepwaterUiSnapshot snapshot;
+            return Snapshots.TryGetValue(kind, out snapshot) &&
+                snapshot != null &&
+                IsVisibleSurface(snapshot.Root);
+        }
+
+        public static bool TryGetSnapshot(
+            DeepwaterUiKind kind,
+            out DeepwaterUiSnapshot snapshot)
+        {
+            snapshot = null;
+            DeepwaterUiSnapshot found;
+            if (!Snapshots.TryGetValue(kind, out found) ||
+                found == null ||
+                !IsVisibleSurface(found.Root))
+            {
+                return false;
+            }
+            snapshot = found;
+            return true;
+        }
+
+        public static bool TryGetButton(
+            DeepwaterUiKind kind,
+            string caption,
+            out Element button)
+        {
+            button = null;
+            DeepwaterUiSnapshot snapshot;
+            Element found;
+            if (!TryGetSnapshot(kind, out snapshot) ||
+                !snapshot.Buttons.TryGetValue(
+                    caption ?? String.Empty,
+                    out found) ||
+                !IsUsable(found))
+            {
+                return false;
+            }
+            button = found;
+            return true;
+        }
+
+        public static bool TryGetBestRawInventory(
+            DeepwaterUiKind kind,
+            out DeepwaterRawInventorySnapshot inventory)
+        {
+            inventory = null;
+            DeepwaterUiSnapshot snapshot;
+            if (!TryGetSnapshot(kind, out snapshot))
+            {
+                return false;
+            }
+            inventory = snapshot.RawInventories
+                .Where(candidate =>
+                    candidate != null &&
+                    candidate.Slot != null &&
+                    candidate.RawItemCount > 0)
+                .OrderByDescending(candidate => candidate.RawItemCount)
+                .ThenBy(candidate => candidate.Path)
+                .FirstOrDefault();
+            return inventory != null;
+        }
+
+        private static Element FindVisibleRoot(
+            IList<Element> roots,
+            string wantedIdLabel)
+        {
+            for (int index = roots.Count - 1; index >= 0; index--)
+            {
+                Element root = roots[index];
+                try
+                {
+                    if (root != null &&
+                        root.IsValid &&
+                        String.Equals(
+                            root.IdLabel,
+                            wantedIdLabel,
+                            StringComparison.OrdinalIgnoreCase) &&
+                        IsVisibleSurface(root))
+                    {
+                        return root;
+                    }
+                }
+                catch
+                {
+                }
+            }
+            return null;
+        }
+
+        private static DeepwaterUiSnapshot BuildSnapshot(
+            DeepwaterUiKind kind,
+            string rootIdLabel,
+            Element root,
+            bool probeRawInventories,
+            DeepwaterUiSnapshot previousSnapshot)
+        {
+            var snapshot = new DeepwaterUiSnapshot
+            {
+                Kind = kind,
+                Root = root,
+                RootIdLabel = rootIdLabel,
+                RootAddress = SafeAddress(root),
+                RootChildren = SafeChildren(root).Count
+            };
+            var visitedAddresses = new HashSet<long>();
+            int rawSlotProbes = 0;
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(220);
+            ScanElement(
+                snapshot,
+                root,
+                "root",
+                0,
+                visitedAddresses,
+                deadline,
+                ref rawSlotProbes,
+                probeRawInventories);
+            if (!probeRawInventories && previousSnapshot != null)
+            {
+                snapshot.RawInventories.AddRange(
+                    previousSnapshot.RawInventories);
+            }
+            snapshot.Signature = BuildSignature(snapshot);
+            return snapshot;
+        }
+
+        private static void ScanElement(
+            DeepwaterUiSnapshot snapshot,
+            Element element,
+            string path,
+            int depth,
+            ISet<long> visitedAddresses,
+            DateTime deadline,
+            ref int rawSlotProbes,
+            bool probeRawInventories)
+        {
+            if (element == null ||
+                depth > 15 ||
+                snapshot.Visited >= MaximumVisitedPerRoot ||
+                DateTime.UtcNow >= deadline)
+            {
+                return;
+            }
+            long address = SafeAddress(element);
+            if (address == 0 || !visitedAddresses.Add(address))
+            {
+                return;
+            }
+            snapshot.Visited++;
+
+            if (IsUsable(element))
+            {
+                MatchButtons(snapshot, element);
+                if (probeRawInventories &&
+                    rawSlotProbes < MaximumRawSlotProbes &&
+                    IsRawSlotProbeCandidate(element))
+                {
+                    rawSlotProbes++;
+                    DeepwaterRawInventorySnapshot rawInventory;
+                    if (TryCreateRawInventory(
+                            element,
+                            path,
+                            out rawInventory))
+                    {
+                        snapshot.RawInventories.Add(rawInventory);
+                    }
+                }
+            }
+
+            List<Element> children = SafeChildren(element);
+            for (int index = 0; index < children.Count; index++)
+            {
+                ScanElement(
+                    snapshot,
+                    children[index],
+                    path + "/" + index,
+                    depth + 1,
+                    visitedAddresses,
+                    deadline,
+                    ref rawSlotProbes,
+                    probeRawInventories);
+                if (snapshot.Visited >= MaximumVisitedPerRoot ||
+                    DateTime.UtcNow >= deadline)
+                {
+                    break;
+                }
+            }
+        }
+
+        private static void MatchButtons(
+            DeepwaterUiSnapshot snapshot,
+            Element element)
+        {
+            string text = SafeText(element);
+            string idLabel = SafeIdLabel(element);
+            foreach (string caption in ButtonCaptions[snapshot.Kind])
+            {
+                if (snapshot.Buttons.ContainsKey(caption) ||
+                    (!Contains(text, caption) &&
+                     !Contains(idLabel, NormalizeCaption(caption))))
+                {
+                    continue;
+                }
+                Element clickable = ResolveClickableAncestor(
+                    element,
+                    snapshot.Root);
+                if (IsUsable(clickable))
+                {
+                    snapshot.Buttons[caption] = clickable;
+                }
+            }
+        }
+
+        private static Element ResolveClickableAncestor(
+            Element element,
+            Element root)
+        {
+            Element current = element;
+            Element best = element;
+            for (int depth = 0; depth < 4 && current != null; depth++)
+            {
+                if (IsButtonGeometry(current))
+                {
+                    best = current;
+                    if (SafeEnabled(current))
+                    {
+                        return current;
+                    }
+                }
+                if (ReferenceEquals(current, root))
+                {
+                    break;
+                }
+                try
+                {
+                    current = current.Parent;
+                }
+                catch
+                {
+                    break;
+                }
+            }
+            return best;
+        }
+
+        private static bool IsButtonGeometry(Element element)
+        {
+            try
+            {
+                return IsUsable(element) &&
+                    element.Width >= 70f &&
+                    element.Width <= 420f &&
+                    element.Height >= 20f &&
+                    element.Height <= 100f;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsRawSlotProbeCandidate(Element element)
+        {
+            try
+            {
+                return element.Width >= 120f &&
+                    element.Width <= 1400f &&
+                    element.Height >= 60f &&
+                    element.Height <= 1200f &&
+                    SafeChildren(element).Count > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryCreateRawInventory(
+            Element element,
+            string path,
+            out DeepwaterRawInventorySnapshot inventory)
+        {
+            inventory = null;
+            try
+            {
+                var slot = new InventorySlotUiElement(
+                    element.Address,
+                    StashType.NormalStash);
+                if (slot == null ||
+                    !slot.IsValid ||
+                    !slot.IsVisible ||
+                    slot.DictionaryIdElements == null ||
+                    slot.DictionaryIdElements.Count == 0)
+                {
+                    return false;
+                }
+                var keys = slot.DictionaryIdElements
+                    .Where(pair =>
+                        pair.Value != null &&
+                        pair.Value.IsValid &&
+                        pair.Value.IsVisible)
+                    .Select(pair => pair.Key)
+                    .Distinct()
+                    .OrderBy(key => key)
+                    .ToList();
+                if (keys.Count == 0)
+                {
+                    return false;
+                }
+                inventory = new DeepwaterRawInventorySnapshot
+                {
+                    Element = element,
+                    Slot = slot,
+                    Path = path,
+                    RawItemCount = keys.Count,
+                    RawKeys = keys
+                };
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void PublishSnapshot(DeepwaterUiSnapshot snapshot)
+        {
+            string previous;
+            if (LastSignatures.TryGetValue(snapshot.Kind, out previous) &&
+                String.Equals(
+                    previous,
+                    snapshot.Signature,
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+            LastSignatures[snapshot.Kind] = snapshot.Signature;
+            string buttons = snapshot.Buttons.Count == 0
+                ? "None"
+                : String.Join(
+                    ",",
+                    snapshot.Buttons.Keys.OrderBy(value => value));
+            int rawItems = snapshot.RawInventories.Sum(
+                inventory => inventory.RawItemCount);
+            AllflameLog.Info(
+                "DEEPWATER_UI_RESOLVED" +
+                "|Kind=" + snapshot.Kind +
+                "|IdLabel=" + snapshot.RootIdLabel +
+                "|Address=0x" + snapshot.RootAddress.ToString("X") +
+                "|Children=" + snapshot.RootChildren +
+                "|Visited=" + snapshot.Visited +
+                "|Buttons=" + buttons +
+                "|RawSlots=" + snapshot.RawInventories.Count +
+                "|RawItems=" + rawItems +
+                "|Mode=ObserveOnly" +
+                "|Signature=" + snapshot.Signature);
+            foreach (DeepwaterRawInventorySnapshot raw in
+                snapshot.RawInventories)
+            {
+                AllflameLog.Info(
+                    "DEEPWATER_RAW_INVENTORY" +
+                    "|Kind=" + snapshot.Kind +
+                    "|Path=" + raw.Path +
+                    "|Address=0x" +
+                    SafeAddress(raw.Element).ToString("X") +
+                    "|RawItems=" + raw.RawItemCount +
+                    "|Keys=" + String.Join(",", raw.RawKeys.Take(12)) +
+                    "|Truncated=" + (raw.RawKeys.Count > 12) +
+                    "|Mode=ObserveOnly");
+            }
+        }
+
+        private static string BuildSignature(DeepwaterUiSnapshot snapshot)
+        {
+            return snapshot.Kind + ":" +
+                snapshot.RootIdLabel + ":C" +
+                snapshot.RootChildren + ":B" +
+                String.Join(
+                    ",",
+                    snapshot.Buttons.Keys.OrderBy(value => value)) +
+                ":R" + String.Join(
+                    ",",
+                    snapshot.RawInventories
+                        .OrderBy(inventory => inventory.Path)
+                        .Select(inventory =>
+                            inventory.Path + "=" +
+                            inventory.RawItemCount));
+        }
+
+        private static bool IsVisibleSurface(Element root)
+        {
+            try
+            {
+                if (root == null || !root.IsValid)
+                {
+                    return false;
+                }
+                if (root.IsVisible)
+                {
+                    return true;
+                }
+                return SafeChildren(root).Any(child =>
+                    child != null &&
+                    child.IsValid &&
+                    child.IsVisible);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsUsable(Element element)
+        {
+            try
+            {
+                return element != null &&
+                    element.IsValid &&
+                    (element.IsVisible || element.IsVisibleLocal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool SafeEnabled(Element element)
+        {
+            try
+            {
+                return element != null && element.IsEnable;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static long SafeAddress(Element element)
+        {
+            try
+            {
+                return element == null ? 0 : element.Address;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static List<Element> SafeChildren(Element element)
+        {
+            try
+            {
+                return element == null || element.Children == null
+                    ? new List<Element>()
+                    : element.Children;
+            }
+            catch
+            {
+                return new List<Element>();
+            }
+        }
+
+        private static string SafeText(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? String.Empty
+                    : element.Text ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static string SafeIdLabel(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? String.Empty
+                    : element.IdLabel ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static bool Contains(string value, string expected)
+        {
+            return !String.IsNullOrEmpty(value) &&
+                !String.IsNullOrEmpty(expected) &&
+                value.IndexOf(
+                    expected,
+                    StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static string NormalizeCaption(string caption)
+        {
+            return (caption ?? String.Empty)
+                .Replace(" ", "_")
+                .ToLowerInvariant();
+        }
+
+        private static string Sanitize(string value)
+        {
+            return (value ?? String.Empty)
+                .Replace("|", "/")
+                .Replace("\r", " ")
+                .Replace("\n", " ");
         }
     }
 
