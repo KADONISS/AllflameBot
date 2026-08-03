@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.124";
+        public const string Current = "0.23.125";
     }
 
     public sealed class AllflameBot : IBot
@@ -2067,7 +2067,7 @@ namespace AllflameBot
     {
         public const float CapsuleTraversalRadius = 55f;
         public const float CapsuleSafeLanternDistance = 120f;
-        public const float CapsuleNearbyExitDistance = 250f;
+        public const float CapsuleNearbyExitDistance = 150f;
         private const float CapsuleMaximumLanternDistance = 150f;
         private static readonly List<Vector2i> LanternAnchors =
             new List<Vector2i>();
@@ -2808,7 +2808,7 @@ namespace AllflameBot
                     "|Reserved=" +
                     (HasReservedExitCapsule &&
                      ReservedExitCapsule.DistanceF(position) <= 25f) +
-                    "|MaxPlayerDistance=250");
+                    "|MaxPlayerDistance=150");
                 return true;
             }
 
@@ -24446,8 +24446,6 @@ namespace AllflameBot
     internal sealed class UseAllflameCapsuleTask : ObserverTask
     {
         private const int MaximumRecoveryCycles = 3;
-        private const int MaximumZeroLanternRescueCycles = 3;
-        private const int ZeroLanternRescueDeadlineSeconds = 60;
         private const int RegistryAnchorReacquireSeconds = 5;
         private const float RegistryAnchorReacquireDistance = 65f;
         private static readonly bool UseDirectDpbCallUi = false;
@@ -24641,25 +24639,6 @@ namespace AllflameBot
                 return false;
             }
 
-            if (VoyageRunState.ZeroLanternChestGraceActive &&
-                AllflameContext.LanternAuraActive)
-            {
-                AllflameLog.Throttled(
-                    "voyage_zero_lantern_chest_grace",
-                    TimeSpan.FromSeconds(1),
-                    "ZERO_LANTERN_CHEST_GRACE_WAIT|Runner=Voyage" +
-                    "|RemainingSeconds=" +
-                    VoyageRunState
-                        .ZeroLanternChestGraceRemainingSeconds +
-                    "|PendingChests=" +
-                    AllflameChestRoute.PendingCount +
-                    "|LootActive=" +
-                    AllflameLootState.IsActive +
-                    "|BlockedTask=" + Name);
-                ResetRequest();
-                return false;
-            }
-
             // Once Call has been issued, this task must not create a second
             // surface-transfer request during the short frame in which the
             // context still reports Phase=Voyage. Waiting and extraction now
@@ -24769,6 +24748,12 @@ namespace AllflameBot
                 !_zeroLanternCapsuleGuardLogged)
             {
                 _zeroLanternCapsuleGuardLogged = true;
+                AllflameLog.Info(
+                    "CAPSULE_MANDATORY_EXTRACTION" +
+                    "|Counter=" +
+                    AllflameContext.LanternCounterCurrent + "/" +
+                    AllflameContext.LanternCounterMaximum +
+                    "|Action=CancelChestLootAndExplore");
                 ZeroLanternSafety.AbortChestAndLootWork(
                     true,
                     Name,
@@ -24862,8 +24847,45 @@ namespace AllflameBot
             Vector2i preferredCapsule = new Vector2i();
             float preferredLanternDistance =
                 Single.MaxValue;
+            bool mandatoryLiveOverride =
+                extractionRequired &&
+                LokiPoe.Me != null &&
+                capsule != null &&
+                capsule.IsValid &&
+                capsule.IsTargetable &&
+                LokiPoe.Me.Position.DistanceF(capsule.Position) <=
+                    VoyageRunState.CapsuleNearbyExitDistance;
+            if (mandatoryLiveOverride)
+            {
+                Vector2i previousAnchor = _hasLockedExitAnchor
+                    ? _lockedExitAnchor
+                    : new Vector2i();
+                float liveDistance = LokiPoe.Me.Position.DistanceF(
+                    capsule.Position);
+                bool replaceLock = !_hasLockedExitAnchor ||
+                    _lockedExitAnchor.DistanceF(capsule.Position) > 25f;
+                if (replaceLock)
+                {
+                    VoyageRunState.RestoreLiveCapsuleForFailsafe(
+                        capsule.Position,
+                        "MandatoryExtractionWithin150");
+                    LockExitAnchor(
+                        capsule.Position,
+                        VoyageRunState.IsCapsuleProven(capsule.Position),
+                        "MandatoryLiveWithin150",
+                        true,
+                        true);
+                    AllflameLog.Info(
+                        "CAPSULE_LIVE_OVERRIDE" +
+                        "|Live=" + capsule.Position +
+                        "|Distance=" + liveDistance.ToString("0.0") +
+                        "|PreviousRegistryAnchor=" + previousAnchor +
+                        "|LockDistance=150");
+                }
+            }
             bool nearbyLivePreferred =
                 extractionRequired &&
+                !mandatoryLiveOverride &&
                 !_hasLockedExitAnchor &&
                 LokiPoe.Me != null &&
                 capsule != null &&
@@ -24902,7 +24924,7 @@ namespace AllflameBot
                     "capsule_live_nearby_preferred",
                     TimeSpan.FromSeconds(2),
                     "CAPSULE_TARGET_PREFERRED" +
-                    "|Source=LiveTraversedWithin250" +
+                    "|Source=LiveTraversedWithin150" +
                     "|Position=" + preferredCapsule +
                     "|PlayerDistance=" +
                     LokiPoe.Me.Position.DistanceF(
@@ -24923,7 +24945,7 @@ namespace AllflameBot
                 LockExitAnchor(
                     preferredCapsule,
                     VoyageRunState.IsCapsuleProven(preferredCapsule),
-                    "NearestTraversedWithin250",
+                    "NearestTraversedWithin150",
                     true);
                 preferredCapsule = _lockedExitAnchor;
                 preferredLanternDistance =
@@ -26241,22 +26263,26 @@ namespace AllflameBot
             {
                 _rescueOverallStartedUtc = DateTime.UtcNow;
                 AllflameLog.Info(
-                    "CAPSULE_RESCUE_DEADLINE" +
+                    "CAPSULE_MANDATORY_EXTRACTION" +
                     "|Task=" + Name +
                     "|AreaHash=" + AllflameContext.AreaHash +
                     "|Cycle=" + _rescueCycle +
                     "|Strategy=" + _rescueStrategy +
                     "|RoutePlan=" + _rescueRoutePlan +
                     "|ElapsedSeconds=0" +
-                    "|DeadlineSeconds=" + ZeroLanternRescueDeadlineSeconds +
                     "|NextAction=AcquireCapsule");
             }
-            if (RescueDeadlineExceeded())
+            LogMandatoryExtractionStatus();
+
+            NetworkObject nearbyLive = FindLiveRescueCapsule(
+                new Vector2i(),
+                true);
+            if (nearbyLive != null &&
+                LokiPoe.Me.Position.DistanceF(nearbyLive.Position) <=
+                    VoyageRunState.CapsuleNearbyExitDistance)
             {
-                StopExhaustedRescue("OverallDeadlineExceeded");
-                return true;
+                ApplyMandatoryLiveRescueOverride(nearbyLive);
             }
-            LogRescueDeadline();
             if (!AllflameContext.LanternAuraActive)
             {
                 return RunZeroLanternSafetyOnly();
@@ -26276,8 +26302,11 @@ namespace AllflameBot
                 return true;
             }
 
-            NetworkObject live = FindLiveRescueCapsule(
-                _rescueTargetAnchor);
+            NetworkObject live = nearbyLive != null &&
+                _rescueTargetAnchor != default(Vector2i) &&
+                nearbyLive.Position.DistanceF(_rescueTargetAnchor) <= 25f
+                    ? nearbyLive
+                    : FindLiveRescueCapsule(_rescueTargetAnchor);
             if (live != null &&
                 _rescueTargetId != 0 &&
                 live.Id != _rescueTargetId)
@@ -26428,6 +26457,8 @@ namespace AllflameBot
                 IsRescueCapsuleUsable(live) &&
                 (_rescueTargetAnchor == default(Vector2i) ||
                  live.Position.DistanceF(_rescueTargetAnchor) <= 25f ||
+                 player.DistanceF(live.Position) <=
+                    VoyageRunState.CapsuleNearbyExitDistance ||
                  _rescueStrategy == CapsuleRescueStrategy.LiveObservedCapsule))
             {
                 VoyageRunState.RememberCapsule(live.Position);
@@ -26443,7 +26474,9 @@ namespace AllflameBot
                     live.Position,
                     VoyageRunState.IsCapsuleProven(live.Position),
                     "RescueAcquireLive",
-                    true);
+                    true,
+                    player.DistanceF(live.Position) <=
+                        VoyageRunState.CapsuleNearbyExitDistance);
                 MarkRescueExplicitProgress("LiveCapsuleAcquired");
                 return true;
             }
@@ -26500,6 +26533,63 @@ namespace AllflameBot
                 return true;
             }
             return false;
+        }
+
+        private void ApplyMandatoryLiveRescueOverride(NetworkObject live)
+        {
+            if (!IsRescueCapsuleUsable(live) || LokiPoe.Me == null)
+            {
+                return;
+            }
+            float distance = LokiPoe.Me.Position.DistanceF(live.Position);
+            if (distance > VoyageRunState.CapsuleNearbyExitDistance)
+            {
+                return;
+            }
+            bool targetChanged = _rescueTargetId != live.Id ||
+                _rescueTargetAnchor.DistanceF(live.Position) > 25f;
+            bool lockChanged = !_hasLockedExitAnchor ||
+                _lockedExitAnchor.DistanceF(live.Position) > 25f;
+            if (!targetChanged && !lockChanged)
+            {
+                return;
+            }
+
+            Vector2i previousAnchor = _hasLockedExitAnchor
+                ? _lockedExitAnchor
+                : new Vector2i();
+            VoyageRunState.RestoreLiveCapsuleForFailsafe(
+                live.Position,
+                "MandatoryRescueWithin150");
+            _rescueStrategy = CapsuleRescueStrategy.LiveObservedCapsule;
+            _rescueTargetAnchor = live.Position;
+            _rescueTargetId = live.Id;
+            _rescueTargetRegistryOnly = false;
+            _rescueTargetLiveObserved = true;
+            _rescueTargetProven =
+                VoyageRunState.IsCapsuleProven(live.Position);
+            _rescueAnchorReacquireUtc = DateTime.MinValue;
+            _rescueTargetsThisCycle.Add(RescueTargetKey(live.Position));
+            _rescueApproachCandidates.Clear();
+            _rescueCandidateCursor = 0;
+            _rescueCandidate = null;
+            _rescueRouteReloads = 0;
+            LockExitAnchor(
+                live.Position,
+                _rescueTargetProven,
+                "MandatoryRescueLiveWithin150",
+                true,
+                true);
+            BeginRescueStage(
+                ZeroLanternExtractionStage.PlanCoveredRoute,
+                "MandatoryLiveOverride");
+            MarkRescueExplicitProgress("MandatoryLiveCapsuleObserved");
+            AllflameLog.Info(
+                "CAPSULE_LIVE_OVERRIDE" +
+                "|Live=" + live.Position +
+                "|Distance=" + distance.ToString("0.0") +
+                "|PreviousRegistryAnchor=" + previousAnchor +
+                "|LockDistance=150");
         }
 
         private bool RunRescueRoutePlan(
@@ -27071,7 +27161,9 @@ namespace AllflameBot
             return Math.Max(35f, settings.InteractDistance + 12f);
         }
 
-        private NetworkObject FindLiveRescueCapsule(Vector2i anchor)
+        private NetworkObject FindLiveRescueCapsule(
+            Vector2i anchor,
+            bool includeTried = false)
         {
             try
             {
@@ -27084,6 +27176,7 @@ namespace AllflameBot
                         anchor == default(Vector2i) ||
                         obj.Position.DistanceF(anchor) <= 25f)
                     .Where(obj =>
+                        includeTried ||
                         _rescueStrategy !=
                             CapsuleRescueStrategy.LiveObservedCapsule ||
                         !_rescueTargetsThisCycle.Contains(
@@ -27128,7 +27221,8 @@ namespace AllflameBot
             return IsRescueCapsuleUsable(fallback) &&
                    (anchor == default(Vector2i) ||
                     fallback.Position.DistanceF(anchor) <= 25f) &&
-                   (_rescueStrategy !=
+                   (includeTried ||
+                    _rescueStrategy !=
                         CapsuleRescueStrategy.LiveObservedCapsule ||
                     !_rescueTargetsThisCycle.Contains(
                         RescueTargetKey(fallback.Position)))
@@ -27322,13 +27416,6 @@ namespace AllflameBot
             return true;
         }
 
-        private bool RescueDeadlineExceeded()
-        {
-            return _rescueOverallStartedUtc != DateTime.MinValue &&
-                DateTime.UtcNow - _rescueOverallStartedUtc >=
-                    TimeSpan.FromSeconds(ZeroLanternRescueDeadlineSeconds);
-        }
-
         private int RescueElapsedSeconds()
         {
             return _rescueOverallStartedUtc == DateTime.MinValue
@@ -27345,12 +27432,12 @@ namespace AllflameBot
                 AllflameContext.CallBathysphereVisible;
         }
 
-        private void LogRescueDeadline()
+        private void LogMandatoryExtractionStatus()
         {
             AllflameLog.Throttled(
-                "capsule_rescue_deadline",
+                "capsule_mandatory_extraction_status",
                 TimeSpan.FromSeconds(1),
-                "CAPSULE_RESCUE_DEADLINE" +
+                "CAPSULE_MANDATORY_EXTRACTION" +
                 "|Task=" + Name +
                 "|AreaHash=" + AllflameContext.AreaHash +
                 "|Cycle=" + _rescueCycle +
@@ -27360,40 +27447,8 @@ namespace AllflameBot
                 "|Anchor=" + _rescueTargetAnchor +
                 "|Reloads=" + _rescueRouteReloads +
                 "|ElapsedSeconds=" + RescueElapsedSeconds() +
-                "|DeadlineSeconds=" + ZeroLanternRescueDeadlineSeconds +
                 "|UiVisible=" + RescueUiVisible() +
                 "|NextAction=" + _zeroLanternStage);
-        }
-
-        private void StopExhaustedRescue(string reason)
-        {
-            if (AllflameStopController.StopRequested)
-            {
-                return;
-            }
-            Vector2i player = LokiPoe.Me == null
-                ? new Vector2i()
-                : LokiPoe.Me.Position;
-            string detail =
-                "ActiveTask=UseAllflameCapsuleTask" +
-                "|Reason=" + (reason ?? String.Empty) +
-                "|AreaHash=" + AllflameContext.AreaHash +
-                "|Cycle=" + _rescueCycle +
-                "|MaximumCycles=" + MaximumZeroLanternRescueCycles +
-                "|Strategy=" + _rescueStrategy +
-                "|RoutePlan=" + _rescueRoutePlan +
-                "|TargetId=" + _rescueTargetId +
-                "|Anchor=" + _rescueTargetAnchor +
-                "|Player=" + player +
-                "|Reloads=" + _rescueRouteReloads +
-                "|ElapsedSeconds=" + RescueElapsedSeconds() +
-                "|UiVisible=" + RescueUiVisible();
-            AllflameLog.Info(
-                "CAPSULE_RESCUE_EXHAUSTED" +
-                "|Task=" + Name +
-                "|" + detail +
-                "|NextAction=RecoveryStop");
-            AllflameStopController.Stop("CapsuleRescueExhausted", detail);
         }
 
         private void MarkRescueExplicitProgress(string reason)
@@ -27686,16 +27741,9 @@ namespace AllflameBot
 
         private void StartNewZeroLanternRescueCycle(string reason)
         {
-            if (RescueDeadlineExceeded() ||
-                _rescueCycle + 1 >= MaximumZeroLanternRescueCycles)
-            {
-                StopExhaustedRescue(
-                    RescueDeadlineExceeded()
-                        ? "OverallDeadlineExceeded"
-                        : "MaximumRescueCyclesExceeded:" + reason);
-                return;
-            }
-            _rescueCycle++;
+            _rescueCycle = _rescueCycle >= Int32.MaxValue - 1
+                ? 1
+                : _rescueCycle + 1;
             _rescueStrategy = CapsuleRescueStrategy.SameCapsuleCandidate;
             _rescueActionsThisCycle.Clear();
             _rescueTargetsThisCycle.Clear();
@@ -27730,11 +27778,13 @@ namespace AllflameBot
                 ZeroLanternExtractionStage.AcquireCapsule,
                 "NewRescueCycle:" + reason);
             AllflameLog.Info(
-                "CAPSULE_RESCUE_CYCLE" +
+                "CAPSULE_RESCUE_CONTINUE" +
                 "|AreaHash=" + AllflameContext.AreaHash +
                 "|TargetId=0|Anchor=None|RescueCycle=" + _rescueCycle +
                 "|Previous=ExhaustedStrategies|Next=AcquireCapsule" +
-                "|Reason=" + reason + "|Action=RefreshRegistryAndNavmesh");
+                "|Reason=" + reason +
+                "|Action=RotateWithoutStop" +
+                "|CooldownMilliseconds=750");
         }
 
         private void ResetZeroLanternRescue(string reason)
@@ -28108,12 +28158,14 @@ namespace AllflameBot
             Vector2i anchor,
             bool proven,
             string uiState,
-            bool directApproach = false)
+            bool directApproach = false,
+            bool forceReplace = false)
         {
             uint areaHash = AllflameContext.AreaHash;
             if (_hasLockedExitAnchor &&
                 _lockedExitAreaHash == areaHash &&
-                _lockedExitAnchor.DistanceF(anchor) > 25f)
+                _lockedExitAnchor.DistanceF(anchor) > 25f &&
+                !forceReplace)
             {
                 return;
             }

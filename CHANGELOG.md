@@ -2,6 +2,18 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.125 - 2026-08-03
+
+- Make Capsule extraction exclusive and mandatory as soon as a Voyage reaches
+  `0/x`, cancelling chest grace, ground-loot work and further exploration.
+- Prefer and force-lock any live targetable Capsule within 150 units over a
+  stale reserved or registry-only anchor, even when it was not traversed.
+- Remove the zero-lantern rescue deadline and maximum-cycle stop; exhausted
+  strategies now rotate after a short cooldown while retaining the two-reload
+  limit for each anchor.
+- Keep rescue progress explicit: accepted movement input does not count as
+  convergence toward the Capsule.
+
 ## 0.23.124 - 2026-08-03
 
 - Resolve the opened Allflame Capsule through the stable
