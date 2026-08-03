@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.117";
+        public const string Current = "0.23.118";
     }
 
     public sealed class AllflameBot : IBot
@@ -11340,6 +11340,30 @@ namespace AllflameBot
                 return false;
             }
 
+            int loadedDeviceCharts = LoadedChartDeviceItemCount();
+            if (AllflameRunState.ChartRequested || loadedDeviceCharts > 0)
+            {
+                AllflameLog.Throttled(
+                    "chart_supply_deferred_device_cycle",
+                    TimeSpan.FromSeconds(2),
+                    "CHART_SUPPLY_DEFERRED" +
+                    "|Reason=" +
+                    (loadedDeviceCharts > 0
+                        ? "ChartAlreadyLoadedInDevice"
+                        : "ChartDeviceCycleActive") +
+                    "|Task=" + Name +
+                    "|AreaHash=" + AllflameContext.AreaHash +
+                    "|ChartRequested=" +
+                    AllflameRunState.ChartRequested +
+                    "|InventoryCharts=" +
+                    AllflameContext.InventoryChartCount +
+                    "|DeviceCharts=" + loadedDeviceCharts +
+                    "|NextTask=LoadChartDeviceTask");
+                ResetApproachTracking();
+                AllflameProgressWatchdog.Clear(Name);
+                return false;
+            }
+
             if (_lastAreaHash != AllflameContext.AreaHash)
             {
                 _lastAreaHash = AllflameContext.AreaHash;
@@ -11386,6 +11410,18 @@ namespace AllflameBot
                         "CHART_SUPPLY_FAILED" +
                         "|Reason=" + supplyReason +
                         "|NextAction=ControlledStop");
+                    AllflameLog.Info(
+                        "CHART_SUPPLY_EXHAUSTED" +
+                        "|InventoryCharts=0" +
+                        "|DeviceCharts=0" +
+                        "|ChartRequested=False" +
+                        "|StorageProbeCompleted=" +
+                        AllflameRunState.ChartStorageProbeCompleted +
+                        "|StorageChecked=" +
+                        AllflameRunState.ChartStorageChecked +
+                        "|VoyageStashEnabled=" +
+                        settings.CheckVoyageStashFirst +
+                        "|NextAction=RecoveryStop");
                     AllflameStopController.Stop(
                         "NoChartsRemaining",
                         settings.RunInventoryChartsOnly
@@ -11755,6 +11791,38 @@ namespace AllflameBot
                 "VoyageStashTab=" + tabName +
                 "|StoredCharts=0|InventoryCharts=0");
             return true;
+        }
+
+        private static int LoadedChartDeviceItemCount()
+        {
+            try
+            {
+                if (NativeDeepwaterChartDeviceUi.IsOpened)
+                {
+                    List<Item> nativeItems =
+                        NativeDeepwaterChartDeviceUi.DeviceItems;
+                    return nativeItems == null
+                        ? 0
+                        : nativeItems.Count;
+                }
+
+                if (!LokiPoe.InGameState.MapDeviceUi.IsOpened)
+                {
+                    return 0;
+                }
+                InventoryControlWrapper control =
+                    LokiPoe.InGameState.MapDeviceUi.InventoryControl;
+                return control == null ||
+                       control.Inventory == null ||
+                       control.Inventory.Items == null
+                    ? 0
+                    : control.Inventory.Items.Count(
+                        AllflameContext.IsChartItem);
+            }
+            catch
+            {
+                return 0;
+            }
         }
 
         private enum VoyageStashApproachResult
@@ -17213,6 +17281,7 @@ namespace AllflameBot
         private int _customChartLocalId;
         private int _descendAttempts;
         private bool _descendIssued;
+        private bool _loadConfirmationLogged;
         private DateTime _portalWaitUntilUtc = DateTime.MinValue;
 
         public EnterBathysphereTask()
@@ -17225,6 +17294,7 @@ namespace AllflameBot
             _customChartLocalId = 0;
             _descendAttempts = 0;
             _descendIssued = false;
+            _loadConfirmationLogged = false;
             _portalWaitUntilUtc = DateTime.MinValue;
             _descendDisabledSinceUtc = DateTime.MinValue;
         }
@@ -17236,6 +17306,7 @@ namespace AllflameBot
             _customChartLocalId = 0;
             _descendAttempts = 0;
             _descendIssued = false;
+            _loadConfirmationLogged = false;
             _portalWaitUntilUtc = DateTime.MinValue;
             _descendDisabledSinceUtc = DateTime.MinValue;
         }
@@ -17252,6 +17323,7 @@ namespace AllflameBot
                 _customChartLocalId = 0;
                 _descendAttempts = 0;
                 _descendIssued = false;
+                _loadConfirmationLogged = false;
                 _portalWaitUntilUtc = DateTime.MinValue;
                 _descendDisabledSinceUtc = DateTime.MinValue;
                 return false;
@@ -17404,6 +17476,11 @@ namespace AllflameBot
                 return true;
             }
 
+            LogChartDeviceLoadConfirmed(
+                "MapDevice",
+                deviceItems.Count(AllflameContext.IsChartItem),
+                AllflameContext.InventoryChartCount);
+
             if (DateTime.UtcNow < _nextActivateUtc)
             {
                 return true;
@@ -17448,6 +17525,18 @@ namespace AllflameBot
                 nativeDeepwaterUiOpened
                     ? nativeDeviceHasChart
                     : movedChartLeftInventory;
+            if (chartLoadConfirmed)
+            {
+                LogChartDeviceLoadConfirmed(
+                    nativeDeepwaterUiOpened
+                        ? "DeepwaterNative"
+                        : "DeepwaterFallback",
+                    nativeDeepwaterUiOpened
+                        ? nativeDeviceItems.Count
+                        : 1,
+                    inventoryItems.Count(
+                        AllflameContext.IsChartItem));
+            }
             if (!chartLoadConfirmed)
             {
                 Item chart = inventoryItems
@@ -17604,6 +17693,34 @@ namespace AllflameBot
                 "|Attempt=" + _descendAttempts);
             await LokiCoroutine.Sleep(900);
             return true;
+        }
+
+        private void LogChartDeviceLoadConfirmed(
+            string ui,
+            int deviceCharts,
+            int inventoryCharts)
+        {
+            if (_loadConfirmationLogged)
+            {
+                return;
+            }
+            _loadConfirmationLogged = true;
+            string source =
+                AllflameSettings.Instance.EnableChartStorageWithdrawal &&
+                AllflameRunState.ChartStorageProbeCompleted
+                    ? "ChartStorage"
+                    : "InventoryOrVoyageStash";
+            AllflameLog.Info(
+                "CHART_DEVICE_LOAD_CONFIRMED" +
+                "|Source=" + source +
+                "|Ui=" + ui +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|LocalId=" + _customChartLocalId +
+                "|InventoryCharts=" + inventoryCharts +
+                "|DeviceCharts=" + deviceCharts +
+                "|ChartRequested=" +
+                AllflameRunState.ChartRequested +
+                "|NextAction=Descend");
         }
 
         private static async Task<bool> CtrlClickInventoryChart(

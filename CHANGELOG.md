@@ -2,6 +2,14 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.118 - 2026-08-03
+
+- Defer Chart supply checks while a requested Chart Device cycle owns the
+  current Chart, preventing the last inventory Chart from being mistaken for
+  exhausted supply immediately after it is loaded into the device.
+- Confirm and log native Chart Device contents before Descend, and distinguish
+  a loaded device from genuinely exhausted Chart Storage supply.
+
 ## 0.23.117 - 2026-08-03
 
 - Restrict the Secret Bottle value threshold and NPC selling to confirmed
