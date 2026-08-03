@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.120 - 2026-08-03
+
+- Deposit remaining pre-Voyage Charts into Chart Storage first, confirm each
+  inventory transfer, and try all 15 storage pages before using a fallback.
+- Treat the personal Chart stash tab as optional: blank, missing, unavailable
+  or transfer-rejecting tabs no longer stop the active Voyage.
+- Invalidate depleted Chart Storage page caches after a confirmed deposit so
+  later withdrawal cycles can discover newly stored Charts.
+
 ## 0.23.119 - 2026-08-03
 
 - Accept comma-separated Message in a Bottle stash tabs, scan every resolved

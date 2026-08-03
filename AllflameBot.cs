@@ -7510,18 +7510,36 @@ namespace AllflameBot
 
     internal sealed class PreVoyageChartStashTask : ObserverTask
     {
+        private const int MaximumStorageOpenAttempts = 3;
+        private const int MaximumStorageResolveAttempts = 3;
+        private const int StorageMainTabCount = 3;
+        private const int StorageSubTabCount = 5;
+        private static readonly TimeSpan StorageDepositTimeout =
+            TimeSpan.FromSeconds(30);
         private DateTime _retryAfterUtc = DateTime.MinValue;
+        private DateTime _storageStartedUtc = DateTime.MinValue;
         private int _failedChartKey;
         private int _failedAttempts;
         private int _movedCharts;
+        private int _storageMovedCharts;
         private int _stashOpenAttempts;
         private int _tabAttempts;
+        private int _storageOpenAttempts;
+        private int _storageResolveAttempts;
+        private int _storageMainTab;
+        private int _storageSubTab;
+        private string _storageFailureReason = String.Empty;
+        private bool _storageUnavailable;
+        private bool _storageStartLogged;
+        private bool _storageOpenPending;
+        private InventoryControlWrapper _storageControl;
+        private InventorySlotUiElement _storageSlot;
         private uint _lastAreaHash;
 
         public PreVoyageChartStashTask()
             : base(
                 "PreVoyageChartStashTask",
-                "Stores remaining Charts in the configured Voyage Stash tab before entering a Voyage.") { }
+                "Stores remaining Charts in Chart Storage, with an optional personal Stash fallback, before entering a Voyage.") { }
 
         public override void Start()
         {
@@ -7575,6 +7593,7 @@ namespace AllflameBot
                 _tabAttempts = 0;
                 _failedChartKey = 0;
                 _failedAttempts = 0;
+                ResetStorageState();
             }
 
             if (AllflameProgressWatchdog.TryConsumeRecovery(
@@ -7623,29 +7642,34 @@ namespace AllflameBot
             List<Item> charts = GetInventoryCharts();
             if (charts.Count == 0)
             {
-                settings.LastVoyageStashTotal =
-                    Math.Max(
-                        0,
-                        settings.LastVoyageStashTotal +
-                        _movedCharts);
-                settings.LastChartStorageScan =
-                    "VoyageStash:" +
-                    (settings.VoyageStashTab ?? String.Empty) +
-                    "=" + settings.LastVoyageStashTotal;
-                settings.Save();
-                AllflameRunState.MarkVoyagePreStashCompleted();
-                AllflameProgressWatchdog.MarkProgress(
-                    "ProceedToBeginVoyage");
+                return await CompletePreStash(0, "AllChartsStored");
+            }
+
+            if (!_storageUnavailable)
+            {
+                if (await HandleChartStorageDeposit(charts))
+                {
+                    return true;
+                }
+            }
+
+            string configured =
+                (settings.VoyageStashTab ?? String.Empty).Trim();
+            if (String.IsNullOrEmpty(configured))
+            {
                 AllflameLog.Info(
-                    "VOYAGE_PRE_STASH|Stage=Chart|State=Complete" +
-                    "|MovedCharts=" + _movedCharts +
-                    "|Destination=" +
-                    (settings.VoyageStashTab ?? String.Empty) +
-                    "|Action=ProceedToBeginVoyage");
-                await Coroutines.CloseBlockingWindows();
-                ResetLocalState();
-                AllflameProgressWatchdog.Clear();
-                return true;
+                    "VOYAGE_CHART_STASH_SKIPPED" +
+                    "|Reason=NoPersonalFallbackConfigured" +
+                    "|StorageResult=" +
+                    (_storageUnavailable
+                        ? "Unavailable"
+                        : "Complete") +
+                    "|StorageReason=" + _storageFailureReason +
+                    "|ChartsKeptInInventory=" + charts.Count +
+                    "|NextAction=ContinueVoyage");
+                return await CompletePreStash(
+                    charts.Count,
+                    "NoPersonalFallbackConfigured");
             }
 
             if (!LokiPoe.InGameState.StashUi.IsOpened)
@@ -7663,7 +7687,7 @@ namespace AllflameBot
                         "|NextAction=ReacquireStash");
                     if (_stashOpenAttempts >= 3)
                     {
-                        return await FailPreStash(
+                        return await SkipPersonalFallback(
                             "StashObjectMissing",
                             String.Empty,
                             String.Empty);
@@ -7725,7 +7749,7 @@ namespace AllflameBot
                         : _stashOpenAttempts));
                 if (!opened && _stashOpenAttempts >= 3)
                 {
-                    return await FailPreStash(
+                    return await SkipPersonalFallback(
                         "StashOpenFailed",
                         String.Empty,
                         String.Empty);
@@ -7733,27 +7757,19 @@ namespace AllflameBot
                 return true;
             }
 
-            string configured =
-                (settings.VoyageStashTab ?? String.Empty).Trim();
             string targetTab = ResolveStashTabName(configured);
             if (String.IsNullOrEmpty(targetTab))
             {
-                _tabAttempts++;
-                AllflameProgressWatchdog.SetRetry(_tabAttempts);
                 AllflameLog.Info(
-                    "VOYAGE_PRE_STASH_RETRY|Stage=Tab" +
-                    "|Attempt=" + _tabAttempts +
-                    "|Reason=TabMissing" +
-                    "|Configured=" + configured);
-                if (_tabAttempts >= 3)
-                {
-                    return await FailPreStash(
-                        "TabMissing",
-                        configured,
-                        String.Empty);
-                }
-                _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
-                return true;
+                    "VOYAGE_CHART_STASH_SKIPPED" +
+                    "|Reason=PersonalFallbackTabMissing" +
+                    "|Configured=" + configured +
+                    "|StorageReason=" + _storageFailureReason +
+                    "|ChartsKeptInInventory=" + charts.Count +
+                    "|NextAction=ContinueVoyage");
+                return await CompletePreStash(
+                    charts.Count,
+                    "PersonalFallbackTabMissing");
             }
 
             string currentTab =
@@ -7796,7 +7812,7 @@ namespace AllflameBot
                     "|Attempt=" + _tabAttempts);
                 if (!tabAccepted && _tabAttempts >= 3)
                 {
-                    return await FailPreStash(
+                    return await SkipPersonalFallback(
                         "TabSwitchFailed",
                         targetTab,
                         String.Empty);
@@ -7814,7 +7830,10 @@ namespace AllflameBot
                 AllflameTransferTiming.NextDelayMilliseconds(
                     settings);
             bool inputSent =
-                await CtrlShiftClickInventoryChart(chart);
+                await CtrlClickInventoryChart(
+                    chart,
+                    true,
+                    "VOYAGE_PRE_STASH_CHART_INPUT_FAILED");
             await LokiCoroutine.Sleep(80);
             AllflameContext.Refresh(true);
             int afterCount = GetInventoryCharts().Count;
@@ -7881,7 +7900,7 @@ namespace AllflameBot
             }
             if (_failedAttempts >= 3)
             {
-                return await FailPreStash(
+                return await SkipPersonalFallback(
                     "ChartTransferFailed",
                     targetTab,
                     chart.FullName);
@@ -7892,42 +7911,348 @@ namespace AllflameBot
             return true;
         }
 
-        private async Task<bool> FailPreStash(
+        private async Task<bool> SkipPersonalFallback(
             string reason,
             string tab,
             string item)
         {
             int inventoryCharts = GetInventoryCharts().Count;
-            int requiredCharts = AllflameRunState.VoyageRequiredCharts;
-            string nextAction = inventoryCharts >= requiredCharts
-                ? "ContinueWithInventoryCharts"
-                : "ControlledStop";
             AllflameLog.Info(
-                "VOYAGE_STASH_UNAVAILABLE" +
+                "VOYAGE_CHART_STASH_FALLBACK" +
+                "|Result=Skipped" +
                 "|Reason=" + reason +
                 "|Tab=" + (tab ?? String.Empty) +
                 "|Item=" + (item ?? String.Empty) +
                 "|AreaHash=" + AllflameContext.AreaHash +
                 "|Attempts=" + Math.Max(_failedAttempts, _stashOpenAttempts) +
                 "|InventoryCharts=" + inventoryCharts +
-                "|RequiredCharts=" + requiredCharts +
-                "|NextAction=" + nextAction);
+                "|StorageReason=" + _storageFailureReason +
+                "|NextAction=ContinueVoyage");
+            return await CompletePreStash(
+                inventoryCharts,
+                reason);
+        }
+
+        private async Task<bool> HandleChartStorageDeposit(
+            IList<Item> charts)
+        {
+            if (_storageStartedUtc == DateTime.MinValue)
+            {
+                _storageStartedUtc = DateTime.UtcNow;
+            }
+            if (!_storageStartLogged)
+            {
+                _storageStartLogged = true;
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEPOSIT_START" +
+                    "|Charts=" + charts.Count +
+                    "|Player=" + LokiPoe.MyPosition +
+                    "|AreaHash=" + AllflameContext.AreaHash +
+                    "|PersonalFallback=" +
+                    ((AllflameSettings.Instance.VoyageStashTab ??
+                        String.Empty).Trim()));
+            }
+
+            if (DateTime.UtcNow - _storageStartedUtc >=
+                StorageDepositTimeout)
+            {
+                await MarkStorageUnavailable(
+                    "Timeout",
+                    charts.Count);
+                return true;
+            }
+
+            if (LokiPoe.InGameState.StashUi.IsOpened ||
+                LokiPoe.InGameState.GuildStashUi.IsOpened)
+            {
+                await Coroutines.CloseBlockingWindows();
+                _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(350);
+                return true;
+            }
+
+            InventoryControlWrapper resolvedControl;
+            InventorySlotUiElement resolvedSlot;
+            if (ChartStorageUi.TryResolve(
+                    _storageMainTab,
+                    _storageSubTab,
+                    _storageControl,
+                    _storageSlot,
+                    out resolvedControl,
+                    out resolvedSlot))
+            {
+                _storageControl = resolvedControl;
+                _storageSlot = resolvedSlot;
+                _storageOpenPending = false;
+                _storageOpenAttempts = 0;
+                _storageResolveAttempts = 0;
+
+                Item chart = charts[0];
+                int beforeCount = charts.Count;
+                int beforeUnits = CountInventoryChartUnits();
+                bool inputSent = await CtrlClickInventoryChart(
+                    chart,
+                    false,
+                    "CHART_STORAGE_DEPOSIT_INPUT_FAILED");
+                await LokiCoroutine.Sleep(100);
+                AllflameContext.Refresh(true);
+                int afterCount = GetInventoryCharts().Count;
+                int afterUnits = CountInventoryChartUnits();
+                bool moved = inputSent && afterUnits < beforeUnits;
+                if (moved)
+                {
+                    _storageStartedUtc = DateTime.UtcNow;
+                    _storageMovedCharts += Math.Max(
+                        1,
+                        beforeUnits - afterUnits);
+                    _failedChartKey = 0;
+                    _failedAttempts = 0;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "ChartStorageDepositConfirmed");
+                    ChartStorageUi.MarkDepositConfirmed();
+                    int delay =
+                        AllflameTransferTiming.NextDelayMilliseconds(
+                            AllflameSettings.Instance);
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(delay);
+                    AllflameLog.Info(
+                        "CHART_STORAGE_DEPOSIT_MOVED" +
+                        "|Main=" + (_storageMainTab + 1) +
+                        "|Sub=" + (_storageSubTab + 1) +
+                        "|Name=" + chart.FullName +
+                        "|LocalId=" + chart.LocalId +
+                        "|Before=" + beforeCount +
+                        "|After=" + afterCount +
+                        "|BeforeUnits=" + beforeUnits +
+                        "|AfterUnits=" + afterUnits +
+                        "|Mode=CtrlClick" +
+                        "|NextDelayMs=" + delay);
+                    return true;
+                }
+
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEPOSIT_PAGE_REJECTED" +
+                    "|Main=" + (_storageMainTab + 1) +
+                    "|Sub=" + (_storageSubTab + 1) +
+                    "|Name=" + chart.FullName +
+                    "|InputSent=" + inputSent +
+                    "|BeforeUnits=" + beforeUnits +
+                    "|AfterUnits=" + afterUnits +
+                    "|Reason=" + (inputSent
+                        ? "TransferNotConfirmed"
+                        : "InputRejected") +
+                    "|NextAction=TryNextPage");
+                if (!AdvanceStoragePage())
+                {
+                    await MarkStorageUnavailable(
+                        "AllPagesRejected",
+                        afterCount);
+                    return true;
+                }
+                _storageControl = null;
+                _storageSlot = null;
+                _retryAfterUtc =
+                    DateTime.UtcNow.AddMilliseconds(300);
+                return true;
+            }
+
+            if (ChartStorageUi.TryResolve(
+                    _storageControl,
+                    _storageSlot,
+                    out resolvedControl,
+                    out resolvedSlot))
+            {
+                _storageControl = resolvedControl;
+                _storageSlot = resolvedSlot;
+                _storageOpenPending = false;
+                _storageOpenAttempts = 0;
+                _storageResolveAttempts = 0;
+                bool mainReady = ChartStorageUi.IsMainTabActive(
+                    _storageMainTab);
+                bool mainClicked = mainReady ||
+                    ChartStorageUi.TryClickMainTab(_storageMainTab);
+                bool subClicked = mainClicked &&
+                    ChartStorageUi.TryClickSubTab(
+                        _storageMainTab,
+                        _storageSubTab);
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEPOSIT_PAGE" +
+                    "|Main=" + (_storageMainTab + 1) +
+                    "|Sub=" + (_storageSubTab + 1) +
+                    "|MainReady=" + mainReady +
+                    "|MainClicked=" + mainClicked +
+                    "|SubClicked=" + subClicked +
+                    "|Action=Select");
+                _storageControl = null;
+                _storageSlot = null;
+                _retryAfterUtc =
+                    DateTime.UtcNow.AddMilliseconds(450);
+                return true;
+            }
+
+            if (_storageOpenPending)
+            {
+                _storageResolveAttempts++;
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEPOSIT_RETRY" +
+                    "|Stage=ResolveUi" +
+                    "|Attempt=" + _storageResolveAttempts +
+                    "|Maximum=" + MaximumStorageResolveAttempts);
+                if (_storageResolveAttempts >=
+                    MaximumStorageResolveAttempts)
+                {
+                    await MarkStorageUnavailable(
+                        "PageLayerNotResolved",
+                        charts.Count);
+                    return true;
+                }
+                _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
+                return true;
+            }
+
+            NetworkObject storage = AllflameContext.ChartStorageObject;
+            if (storage == null || !storage.IsValid)
+            {
+                _storageOpenAttempts++;
+                AllflameContext.Refresh(true);
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEPOSIT_RETRY" +
+                    "|Stage=Open" +
+                    "|Attempt=" + _storageOpenAttempts +
+                    "|Maximum=" + MaximumStorageOpenAttempts +
+                    "|Reason=StorageObjectMissing");
+                if (_storageOpenAttempts >= MaximumStorageOpenAttempts)
+                {
+                    await MarkStorageUnavailable(
+                        "StorageObjectMissing",
+                        charts.Count);
+                    return true;
+                }
+                _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
+                return true;
+            }
+
+            if (storage.Distance > AllflameSettings.Instance.InteractDistance)
+            {
+                await MoveOrInteract(storage, "Chart Storage Deposit");
+                return true;
+            }
+
+            bool interacted = false;
+            try
+            {
+                interacted = await Coroutines.InteractWith(storage);
+            }
+            catch (Exception exception)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_DEPOSIT_OPEN_EXCEPTION" +
+                    "|Type=" + exception.GetType().Name +
+                    "|Message=" +
+                    (exception.Message ?? String.Empty).Replace("|", "/"));
+            }
+            _storageOpenAttempts++;
+            _storageOpenPending = interacted;
+            AllflameLog.Info(
+                "CHART_STORAGE_DEPOSIT_OPEN" +
+                "|Success=" + interacted +
+                "|Attempt=" + _storageOpenAttempts +
+                "|Maximum=" + MaximumStorageOpenAttempts);
+            if (!interacted &&
+                _storageOpenAttempts >= MaximumStorageOpenAttempts)
+            {
+                await MarkStorageUnavailable(
+                    "StorageInteractionRejected",
+                    charts.Count);
+                return true;
+            }
+            _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(
+                interacted ? 1000 : 600);
+            return true;
+        }
+
+        private bool AdvanceStoragePage()
+        {
+            _storageSubTab++;
+            if (_storageSubTab >= StorageSubTabCount)
+            {
+                _storageSubTab = 0;
+                _storageMainTab++;
+            }
+            return _storageMainTab < StorageMainTabCount;
+        }
+
+        private async Task MarkStorageUnavailable(
+            string reason,
+            int inventoryCharts)
+        {
+            _storageUnavailable = true;
+            _storageFailureReason = reason ?? String.Empty;
+            AllflameLog.Info(
+                "CHART_STORAGE_DEPOSIT_UNAVAILABLE" +
+                "|Reason=" + _storageFailureReason +
+                "|Moved=" + _storageMovedCharts +
+                "|InventoryCharts=" + inventoryCharts +
+                "|ElapsedMilliseconds=" +
+                Math.Max(
+                    0,
+                    (long)(DateTime.UtcNow - _storageStartedUtc)
+                        .TotalMilliseconds) +
+                "|NextAction=" +
+                (String.IsNullOrWhiteSpace(
+                    AllflameSettings.Instance.VoyageStashTab)
+                    ? "ContinueVoyage"
+                    : "PersonalStashFallback"));
+            await Coroutines.CloseBlockingWindows();
+            _storageControl = null;
+            _storageSlot = null;
+            _storageOpenPending = false;
+            _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(350);
+        }
+
+        private async Task<bool> CompletePreStash(
+            int chartsKeptInInventory,
+            string reason)
+        {
+            AllflameSettings settings = AllflameSettings.Instance;
+            settings.LastChartStorageTotal = Math.Max(
+                0,
+                settings.LastChartStorageTotal + _storageMovedCharts);
+            settings.LastVoyageStashTotal = Math.Max(
+                0,
+                settings.LastVoyageStashTotal + _movedCharts);
+            settings.LastChartStorageScan =
+                "ChartStorageDeposit=" + _storageMovedCharts +
+                ";VoyageStash:" +
+                (settings.VoyageStashTab ?? String.Empty) +
+                "=" + settings.LastVoyageStashTotal;
+            settings.Save();
+            string destination = _storageMovedCharts > 0
+                ? (_movedCharts > 0
+                    ? "ChartStorage+PersonalStash"
+                    : "ChartStorage")
+                : (_movedCharts > 0
+                    ? "PersonalStash"
+                    : "Inventory");
+            AllflameLog.Info(
+                "CHART_STORAGE_DEPOSIT_COMPLETE" +
+                "|Moved=" + _storageMovedCharts +
+                "|FallbackMoved=" + _movedCharts +
+                "|ChartsKeptInInventory=" + chartsKeptInInventory +
+                "|Reason=" + reason +
+                "|Destination=" + destination);
+            AllflameLog.Info(
+                "VOYAGE_PRE_STASH|Stage=Chart|State=Complete" +
+                "|StorageMoved=" + _storageMovedCharts +
+                "|FallbackMoved=" + _movedCharts +
+                "|ChartsKeptInInventory=" + chartsKeptInInventory +
+                "|Destination=" + destination +
+                "|Action=ProceedToBeginVoyage");
+            AllflameRunState.MarkVoyagePreStashCompleted();
+            AllflameProgressWatchdog.MarkProgress(
+                "ProceedToBeginVoyage");
             await Coroutines.CloseBlockingWindows();
             ResetLocalState();
-            if (inventoryCharts >= requiredCharts)
-            {
-                AllflameProgressWatchdog.Clear();
-                AllflameRunState.MarkVoyagePreStashCompleted();
-                return false;
-            }
-            AllflameStopController.Stop(
-                "VoyageStashUnavailable",
-                "Reason=" + reason +
-                "|Tab=" + (tab ?? String.Empty) +
-                "|Item=" + (item ?? String.Empty) +
-                "|AreaHash=" + AllflameContext.AreaHash +
-                "|InventoryCharts=" + inventoryCharts +
-                "|RequiredCharts=" + requiredCharts);
+            AllflameProgressWatchdog.Clear();
             return true;
         }
 
@@ -7953,6 +8278,12 @@ namespace AllflameBot
             {
                 return new List<Item>();
             }
+        }
+
+        private static int CountInventoryChartUnits()
+        {
+            return GetInventoryCharts().Sum(item =>
+                Math.Max(1, item.StackCount));
         }
 
         private static int CountNonChartInventoryItems()
@@ -8006,8 +8337,10 @@ namespace AllflameBot
                     : String.Empty;
         }
 
-        private static async Task<bool>
-            CtrlShiftClickInventoryChart(Item chart)
+        private static async Task<bool> CtrlClickInventoryChart(
+            Item chart,
+            bool useShift,
+            string failureMarker)
         {
             try
             {
@@ -8067,11 +8400,14 @@ namespace AllflameBot
                         short.MinValue,
                         System.Windows.Forms.Keys.None);
                     controlDown = true;
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ShiftKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    shiftDown = true;
+                    if (useShift)
+                    {
+                        LokiPoe.ProcessHookManager.SetKeyState(
+                            System.Windows.Forms.Keys.ShiftKey,
+                            short.MinValue,
+                            System.Windows.Forms.Keys.None);
+                        shiftDown = true;
+                    }
                     await LokiCoroutine.Sleep(20);
                     DreamPoeBot.BotFramework.MouseManager
                         .ClickLMB(0, 0);
@@ -8099,7 +8435,9 @@ namespace AllflameBot
             catch (Exception exception)
             {
                 AllflameLog.Info(
-                    "VOYAGE_PRE_STASH_CHART_INPUT_FAILED|Name=" +
+                    (failureMarker ??
+                        "VOYAGE_PRE_STASH_CHART_INPUT_FAILED") +
+                    "|Name=" +
                     (chart == null
                         ? "Unknown"
                         : chart.FullName) +
@@ -8117,9 +8455,26 @@ namespace AllflameBot
             _failedChartKey = 0;
             _failedAttempts = 0;
             _movedCharts = 0;
+            _storageMovedCharts = 0;
             _stashOpenAttempts = 0;
             _tabAttempts = 0;
+            ResetStorageState();
             _lastAreaHash = 0;
+        }
+
+        private void ResetStorageState()
+        {
+            _storageStartedUtc = DateTime.MinValue;
+            _storageOpenAttempts = 0;
+            _storageResolveAttempts = 0;
+            _storageMainTab = 0;
+            _storageSubTab = 0;
+            _storageFailureReason = String.Empty;
+            _storageUnavailable = false;
+            _storageStartLogged = false;
+            _storageOpenPending = false;
+            _storageControl = null;
+            _storageSlot = null;
         }
     }
 
@@ -12457,6 +12812,7 @@ namespace AllflameBot
         private bool _inventoryFull;
         private InventoryControlWrapper _storageControl;
         private InventorySlotUiElement _storageSlot;
+        private int _observedDepositRevision;
 
         private sealed class StorageChartEntry
         {
@@ -12490,11 +12846,13 @@ namespace AllflameBot
             : base("OpenChartStorageTask", "Probes and withdraws Chart Storage pages in forward order.")
         {
             ResetSessionPageCache();
+            _observedDepositRevision = ChartStorageUi.DepositRevision;
         }
 
         public override void Start()
         {
             ResetSessionPageCache();
+            _observedDepositRevision = ChartStorageUi.DepositRevision;
             ResetScan();
         }
 
@@ -12506,6 +12864,15 @@ namespace AllflameBot
 
         public override async Task<bool> Run()
         {
+            if (_observedDepositRevision != ChartStorageUi.DepositRevision)
+            {
+                ResetSessionPageCache();
+                _observedDepositRevision = ChartStorageUi.DepositRevision;
+                AllflameLog.Info(
+                    "CHART_STORAGE_PAGE_CACHE_INVALIDATED" +
+                    "|Reason=DepositConfirmed" +
+                    "|Revision=" + _observedDepositRevision);
+            }
             AllflameSettings settings = AllflameSettings.Instance;
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
@@ -14973,8 +15340,22 @@ namespace AllflameBot
     {
         private const int ChartStorageServerInventoryId = 151;
         private static int _cachedRequestedInventoryId = -1;
+        private static int _depositRevision;
         private static DateTime _nextDynamicInventoryProbeUtc =
             DateTime.MinValue;
+
+        public static int DepositRevision
+        {
+            get { return _depositRevision; }
+        }
+
+        public static void MarkDepositConfirmed()
+        {
+            unchecked
+            {
+                _depositRevision++;
+            }
+        }
 
         public static bool TryResolve(
             InventoryControlWrapper cachedControl,

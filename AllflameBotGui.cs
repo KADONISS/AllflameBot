@@ -213,7 +213,7 @@ namespace AllflameBot
             grid.Children.Add(Card("VOYAGE STASH", Stack(
                 Check("Withdraw from Chart Storage first", "EnableChartStorageWithdrawal"),
                 Check("Fall back to personal Stash", "CheckVoyageStashFirst"),
-                Text("Chart stash tab name/number", "VoyageStashTab"),
+                Text("Personal chart stash fallback (optional)", "VoyageStashTab"),
                 Number("Charts per withdrawal", "ChartsPerWithdrawal", 1, 60),
                 Button("DEBUG: Read visible Chart Storage page", delegate
                 {
