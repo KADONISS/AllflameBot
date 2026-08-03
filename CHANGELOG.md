@@ -2,6 +2,22 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.135 - 2026-08-04
+
+- Add a mandatory final Capsule approach for exhausted-Lantern Voyages when a
+  live targetable Capsule is within 150 units, keeping the target locked even
+  when the Lantern coverage model rejects its target or segment.
+- Fall back through path-validated local steps of 40, 30, 20 and 12 units and
+  allow the final interaction-ring candidates outside modeled coverage.
+- Measure real convergence toward the locked Capsule, reload the pather at
+  most twice after four seconds without progress and retain those recovery
+  counters across route retries.
+- Enforce a 30-second final-approach timeout with a controlled
+  `MandatoryCapsuleReturnTimeout` recovery stop instead of rotating the same
+  Capsule forever.
+- Add `CAPSULE_FINAL_APPROACH_*` diagnostics for target lock, local steps,
+  progress, recovery and timeout decisions.
+
 ## 0.23.134 - 2026-08-04
 
 - Accelerate pre-Voyage Chart Storage deposits with a persistent fast-deposit

@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.134";
+        public const string Current = "0.23.135";
     }
 
     public sealed class AllflameBot : IBot
@@ -24981,11 +24981,13 @@ namespace AllflameBot
         private DateTime _rescueWatchdogUtc = DateTime.MinValue;
         private DateTime _rescueOverallStartedUtc = DateTime.MinValue;
         private DateTime _rescueAnchorReacquireUtc = DateTime.MinValue;
+        private DateTime _mandatoryFinalApproachStartedUtc = DateTime.MinValue;
         private uint _rescueAreaHash;
         private int _rescueCycle;
         private int _rescueStageAttempt;
         private int _rescueRoutePlan;
         private int _rescueRouteReloads;
+        private int _mandatoryFinalApproachReloads;
         private int _rescueTargetId;
         private Vector2i _rescueTargetAnchor;
         private float _rescueInteractionRange;
@@ -25020,6 +25022,13 @@ namespace AllflameBot
         private readonly List<Vector2i> _rescueBreadcrumbs =
             new List<Vector2i>();
         private int _rescueBreadcrumbCursor;
+        private bool _mandatoryFinalApproachActive;
+
+        private const int MandatoryFinalApproachTimeoutSeconds = 30;
+        private const int MandatoryFinalApproachNoProgressSeconds = 4;
+        private const int MandatoryFinalApproachMaximumReloads = 2;
+        private static readonly float[] MandatoryFinalApproachStepLengths =
+            { 40f, 30f, 20f, 12f };
 
         private sealed class VisualCallProbe
         {
@@ -26750,7 +26759,12 @@ namespace AllflameBot
             {
                 ApplyMandatoryLiveRescueOverride(nearbyLive);
             }
-            if (!AllflameContext.LanternAuraActive)
+            if (StopMandatoryFinalApproachOnTimeout(settings, nearbyLive))
+            {
+                return true;
+            }
+            if (!AllflameContext.LanternAuraActive &&
+                !_mandatoryFinalApproachActive)
             {
                 return RunZeroLanternSafetyOnly();
             }
@@ -27023,7 +27037,8 @@ namespace AllflameBot
                 _rescueTargetAnchor.DistanceF(live.Position) > 25f;
             bool lockChanged = !_hasLockedExitAnchor ||
                 _lockedExitAnchor.DistanceF(live.Position) > 25f;
-            if (!targetChanged && !lockChanged)
+            bool approachChanged = !_mandatoryFinalApproachActive;
+            if (!targetChanged && !lockChanged && !approachChanged)
             {
                 return;
             }
@@ -27041,6 +27056,12 @@ namespace AllflameBot
             _rescueTargetLiveObserved = true;
             _rescueTargetProven =
                 VoyageRunState.IsCapsuleProven(live.Position);
+            _mandatoryFinalApproachActive = true;
+            if (_mandatoryFinalApproachStartedUtc == DateTime.MinValue)
+            {
+                _mandatoryFinalApproachStartedUtc = DateTime.UtcNow;
+                _mandatoryFinalApproachReloads = 0;
+            }
             _rescueAnchorReacquireUtc = DateTime.MinValue;
             _rescueTargetsThisCycle.Add(RescueTargetKey(live.Position));
             _rescueApproachCandidates.Clear();
@@ -27063,6 +27084,13 @@ namespace AllflameBot
                 "|Distance=" + distance.ToString("0.0") +
                 "|PreviousRegistryAnchor=" + previousAnchor +
                 "|LockDistance=150");
+            AllflameLog.Info(
+                "CAPSULE_FINAL_APPROACH_START" +
+                "|TargetId=" + live.Id +
+                "|Target=" + live.Position +
+                "|Player=" + LokiPoe.Me.Position +
+                "|Distance=" + distance.ToString("0.0") +
+                "|CoverageOverride=True");
         }
 
         private bool RunRescueRoutePlan(
@@ -27197,13 +27225,28 @@ namespace AllflameBot
                 LogRescueProgress("RouteDistanceImproved", distance);
             }
             if (DateTime.UtcNow - _rescueProgressUtc >=
-                TimeSpan.FromSeconds(4))
+                TimeSpan.FromSeconds(
+                    MandatoryFinalApproachNoProgressSeconds))
             {
                 bool waypointOscillation =
                     IsRescueWaypointOscillating();
-                if (_rescueRouteReloads < 2)
+                int completedReloads = _mandatoryFinalApproachActive
+                    ? _mandatoryFinalApproachReloads
+                    : _rescueRouteReloads;
+                if (completedReloads <
+                    MandatoryFinalApproachMaximumReloads)
                 {
                     _rescueRouteReloads++;
+                    if (_mandatoryFinalApproachActive)
+                    {
+                        _mandatoryFinalApproachReloads++;
+                        AllflameLog.Info(
+                            "CAPSULE_FINAL_APPROACH_RECOVERY" +
+                            "|Attempt=" +
+                            _mandatoryFinalApproachReloads +
+                            "|Reason=TargetReacquire" +
+                            "|Action=ReloadPather");
+                    }
                     try { ExilePather.Reload(true); } catch { }
                     _rescueProgressUtc = DateTime.UtcNow;
                     _rescueBestDistance = distance;
@@ -27222,6 +27265,18 @@ namespace AllflameBot
                             ? "WaypointOscillation"
                             : "NoFinalAnchorConvergence") +
                         "|Action=ReloadPather");
+                    if (_mandatoryFinalApproachActive)
+                    {
+                        AllflameLog.Info(
+                            "CAPSULE_FINAL_APPROACH_RECOVERY" +
+                            "|Attempt=" +
+                            _mandatoryFinalApproachReloads +
+                            "|Reason=" + (waypointOscillation
+                                ? "Oscillation"
+                                : "NoProgress") +
+                            "|Distance=" + distance.ToString("0.0") +
+                            "|Action=ReloadPather");
+                    }
                     return true;
                 }
                 if (_rescueTargetRegistryOnly && _rescueTargetId == 0)
@@ -27231,6 +27286,14 @@ namespace AllflameBot
                         : "RouteNoProgressAfterTwoReloads";
                     RejectRegistryAnchor(routeReason);
                     RotateRegistryReacquireTarget(routeReason);
+                }
+                else if (_mandatoryFinalApproachActive)
+                {
+                    StopMandatoryFinalApproach(
+                        waypointOscillation
+                            ? "OscillationAfterTwoReloads"
+                            : "NoProgressAfterTwoReloads",
+                        distance);
                 }
                 else
                 {
@@ -27250,6 +27313,11 @@ namespace AllflameBot
                     RejectRegistryAnchor("NoCoveredRouteWaypoint");
                     RotateRegistryReacquireTarget("NoCoveredRouteWaypoint");
                 }
+                else if (_mandatoryFinalApproachActive)
+                {
+                    HandleMandatoryFinalApproachFailure(
+                        "NoPath", distance);
+                }
                 else
                 {
                     RotateZeroLanternRescue("NoCoveredRouteWaypoint");
@@ -27266,6 +27334,18 @@ namespace AllflameBot
                 waypoint,
                 Name + " zero-lantern rescue");
             _rescueRoutePreviousWaypoint = waypoint;
+            if (_mandatoryFinalApproachActive)
+            {
+                AllflameLog.Info(
+                    "CAPSULE_FINAL_APPROACH_STEP" +
+                    "|From=" + player +
+                    "|Waypoint=" + waypoint +
+                    "|Target=" + _rescueTargetAnchor +
+                    "|DistanceBefore=" + distance.ToString("0.0") +
+                    "|StepLength=" + player.DistanceF(waypoint).ToString("0.0") +
+                    "|Path=True" +
+                    "|Moving=" + moving);
+            }
             LogRescueProgress(
                 moving ? "RouteMoveAccepted" : "RouteMoveRejected",
                 distance);
@@ -27304,13 +27384,29 @@ namespace AllflameBot
             if (_rescueApproachCandidates.Count == 0 &&
                 !BuildRescueApproachCandidates(player, live.Position))
             {
-                RotateZeroLanternRescue("ApproachCandidatesExhausted");
+                if (_mandatoryFinalApproachActive)
+                {
+                    HandleMandatoryFinalApproachFailure(
+                        "NoPath", distance);
+                }
+                else
+                {
+                    RotateZeroLanternRescue("ApproachCandidatesExhausted");
+                }
                 return true;
             }
             if (_rescueCandidate == null &&
                 !SelectNextRescueApproachCandidate(player))
             {
-                RotateZeroLanternRescue("ApproachCandidatesExhausted");
+                if (_mandatoryFinalApproachActive)
+                {
+                    HandleMandatoryFinalApproachFailure(
+                        "NoPath", distance);
+                }
+                else
+                {
+                    RotateZeroLanternRescue("ApproachCandidatesExhausted");
+                }
                 return true;
             }
             if (DateTime.UtcNow - _rescueAttemptStartedUtc >=
@@ -27326,6 +27422,15 @@ namespace AllflameBot
                 _rescueBestDistance = distance;
                 _rescueProgressUtc = DateTime.UtcNow;
                 LogRescueProgress("ApproachDistanceImproved", distance);
+            }
+            if (_mandatoryFinalApproachActive &&
+                DateTime.UtcNow - _rescueProgressUtc >=
+                    TimeSpan.FromSeconds(
+                        MandatoryFinalApproachNoProgressSeconds))
+            {
+                HandleMandatoryFinalApproachFailure(
+                    "NoProgress", distance);
+                return true;
             }
             if (DateTime.UtcNow < _rescueCooldownUntilUtc)
             {
@@ -27469,7 +27574,20 @@ namespace AllflameBot
                     "|Attempt=" + _openAttempts +
                     "|RescueCycle=" + _rescueCycle);
                 await Coroutines.CloseBlockingWindows();
-                RotateZeroLanternRescue("UiNotConfirmedAfterBoundedAttempts");
+                if (_mandatoryFinalApproachActive)
+                {
+                    StopMandatoryFinalApproach(
+                        "UiNotConfirmedAfterBoundedAttempts",
+                        LokiPoe.Me == null
+                            ? Single.MaxValue
+                            : LokiPoe.Me.Position.DistanceF(
+                                _rescueTargetAnchor));
+                }
+                else
+                {
+                    RotateZeroLanternRescue(
+                        "UiNotConfirmedAfterBoundedAttempts");
+                }
             }
             else
             {
@@ -27515,7 +27633,8 @@ namespace AllflameBot
                     {
                         pathable = false;
                     }
-                    if (!coverage) rejection = "OutsideLanternCoverage";
+                    if (!coverage && !_mandatoryFinalApproachActive)
+                        rejection = "OutsideLanternCoverage";
                     else if (!pathable) rejection = "NoPath";
                     else if (!raycastClear) rejection = "RaycastBlocked";
                     AllflameLog.Info(
@@ -27529,6 +27648,9 @@ namespace AllflameBot
                         "|Path=" + pathable +
                         "|Raycast=" + raycastClear +
                         "|Coverage=" + coverage +
+                        "|Policy=" + (_mandatoryFinalApproachActive
+                            ? "MandatoryFinalApproach"
+                            : "StrictCoverage") +
                         "|Result=" + (String.IsNullOrEmpty(rejection) ? "Accepted" : "Rejected") +
                         "|Reason=" + rejection +
                         "|RescueCycle=" + _rescueCycle);
@@ -27569,9 +27691,24 @@ namespace AllflameBot
                 _rescueCandidate = candidate;
                 _rescueStageAttempt++;
                 _rescueAttemptStartedUtc = DateTime.UtcNow;
-                _rescueProgressUtc = _rescueAttemptStartedUtc;
-                _rescueBestDistance = player.DistanceF(
-                    _rescueTargetAnchor);
+                if (!_mandatoryFinalApproachActive)
+                {
+                    _rescueProgressUtc = _rescueAttemptStartedUtc;
+                    _rescueBestDistance = player.DistanceF(
+                        _rescueTargetAnchor);
+                }
+                else
+                {
+                    if (_rescueProgressUtc == DateTime.MinValue)
+                    {
+                        _rescueProgressUtc = _rescueAttemptStartedUtc;
+                    }
+                    if (_rescueBestDistance == Single.MaxValue)
+                    {
+                        _rescueBestDistance = player.DistanceF(
+                            _rescueTargetAnchor);
+                    }
+                }
                 _rescueWatchdogUtc = DateTime.UtcNow;
                 _rescueWatchdogPlayer = player;
                 _rescueLastAction =
@@ -28004,6 +28141,19 @@ namespace AllflameBot
                     waypoint = breadcrumb;
                     return true;
                 }
+                if (_mandatoryFinalApproachActive &&
+                    TryGetMandatoryFinalApproachStep(
+                        player, anchor, out waypoint))
+                {
+                    AllflameLog.Info(
+                        "CAPSULE_SAFETY_CHECK" +
+                        "|Action=ZeroLanternRescueRoute" +
+                        "|Player=" + player +
+                        "|Target=" + anchor +
+                        "|Policy=MandatoryFinalApproach" +
+                        "|Decision=Override");
+                    return true;
+                }
                 return false;
             }
             catch
@@ -28094,8 +28244,16 @@ namespace AllflameBot
                 "|RescueCycle=" + _rescueCycle +
                 "|Previous=" + _rescueStrategy +
                 "|Next=ForcedRotation" +
-                    "|Reason=WatchdogNoAnchorLiveOrUiProgress" +
+                "|Reason=WatchdogNoAnchorLiveOrUiProgress" +
                 "|LastAction=" + _rescueLastAction);
+            if (_mandatoryFinalApproachActive)
+            {
+                HandleMandatoryFinalApproachFailure(
+                    "WatchdogNoProgress",
+                    player.DistanceF(_rescueTargetAnchor));
+                _rescueWatchdogUtc = DateTime.UtcNow;
+                return true;
+            }
             RotateZeroLanternRescue("WatchdogNoNovelProgress");
             return true;
         }
@@ -28129,7 +28287,9 @@ namespace AllflameBot
                 "|RoutePlan=" + _rescueRoutePlan +
                 "|TargetId=" + _rescueTargetId +
                 "|Anchor=" + _rescueTargetAnchor +
-                "|Reloads=" + _rescueRouteReloads +
+                "|Reloads=" + (_mandatoryFinalApproachActive
+                    ? _mandatoryFinalApproachReloads
+                    : _rescueRouteReloads) +
                 "|ElapsedSeconds=" + RescueElapsedSeconds() +
                 "|UiVisible=" + RescueUiVisible() +
                 "|NextAction=" + _zeroLanternStage);
@@ -28295,6 +28455,17 @@ namespace AllflameBot
                     "ApproachDistanceImproved",
                     StringComparison.Ordinal))
             {
+                if (_mandatoryFinalApproachActive)
+                {
+                    AllflameLog.Info(
+                        "CAPSULE_FINAL_APPROACH_PROGRESS" +
+                        "|Distance=" + distance.ToString("0.0") +
+                        "|BestDistance=" + _rescueBestDistance.ToString("0.0") +
+                        "|NoProgressSeconds=0" +
+                        "|Reloads=" +
+                        _mandatoryFinalApproachReloads +
+                        "|Result=" + result);
+                }
                 MarkRescueExplicitProgress(result);
             }
         }
@@ -28378,7 +28549,23 @@ namespace AllflameBot
                 _rescueCandidate = null;
                 if (!_rescueRegistryRefreshedThisCycle)
                 {
+                    if (_mandatoryFinalApproachActive &&
+                        _mandatoryFinalApproachReloads >=
+                            MandatoryFinalApproachMaximumReloads)
+                    {
+                        StopMandatoryFinalApproach(
+                            "TargetReacquireAfterTwoReloads",
+                            LokiPoe.Me == null
+                                ? Single.MaxValue
+                                : LokiPoe.Me.Position.DistanceF(
+                                    _rescueTargetAnchor));
+                        return;
+                    }
                     _rescueRegistryRefreshedThisCycle = true;
+                    if (_mandatoryFinalApproachActive)
+                    {
+                        _mandatoryFinalApproachReloads++;
+                    }
                     try { ExilePather.Reload(true); } catch { }
                     AllflameContext.Refresh(true);
                 }
@@ -28425,6 +28612,19 @@ namespace AllflameBot
 
         private void StartNewZeroLanternRescueCycle(string reason)
         {
+            if (_mandatoryFinalApproachActive &&
+                _mandatoryFinalApproachReloads >=
+                    MandatoryFinalApproachMaximumReloads)
+            {
+                StopMandatoryFinalApproach(
+                    "RescueCycleAfterTwoReloads",
+                    LokiPoe.Me == null ||
+                    _rescueTargetAnchor == default(Vector2i)
+                        ? Single.MaxValue
+                        : LokiPoe.Me.Position.DistanceF(
+                            _rescueTargetAnchor));
+                return;
+            }
             _rescueCycle = _rescueCycle >= Int32.MaxValue - 1
                 ? 1
                 : _rescueCycle + 1;
@@ -28456,6 +28656,15 @@ namespace AllflameBot
             _visualCapsuleUiOpen = false;
             _rescueCooldownUntilUtc = DateTime.UtcNow.AddMilliseconds(750);
             ResetMoverApproachState();
+            if (_mandatoryFinalApproachActive)
+            {
+                _mandatoryFinalApproachReloads++;
+                AllflameLog.Info(
+                    "CAPSULE_FINAL_APPROACH_RECOVERY" +
+                    "|Attempt=" + _mandatoryFinalApproachReloads +
+                    "|Reason=RescueCycle" +
+                    "|Action=ReloadPather");
+            }
             try { ExilePather.Reload(true); } catch { }
             AllflameContext.Refresh(true);
             BeginRescueStage(
@@ -28482,6 +28691,9 @@ namespace AllflameBot
             _rescueWatchdogUtc = DateTime.MinValue;
             _rescueOverallStartedUtc = DateTime.MinValue;
             _rescueAnchorReacquireUtc = DateTime.MinValue;
+            _mandatoryFinalApproachStartedUtc = DateTime.MinValue;
+            _mandatoryFinalApproachActive = false;
+            _mandatoryFinalApproachReloads = 0;
             _rescueAreaHash = AllflameContext.AreaHash;
             _rescueCycle = 0;
             _rescueStageAttempt = 0;
@@ -29918,6 +30130,178 @@ namespace AllflameBot
                     ":" + ex.Message);
                 return false;
             }
+        }
+
+        private bool TryGetMandatoryFinalApproachStep(
+            Vector2i player,
+            Vector2i anchor,
+            out Vector2i waypoint)
+        {
+            waypoint = anchor;
+            float distance = player.DistanceF(anchor);
+            if (!_mandatoryFinalApproachActive ||
+                distance <= 1f ||
+                distance > VoyageRunState.CapsuleNearbyExitDistance + 10f)
+            {
+                return false;
+            }
+
+            double dx = anchor.X - player.X;
+            double dy = anchor.Y - player.Y;
+            double length = Math.Sqrt(dx * dx + dy * dy);
+            foreach (float requestedLength in
+                MandatoryFinalApproachStepLengths)
+            {
+                float stepLength = Math.Min(
+                    requestedLength,
+                    Math.Max(12f, distance - 24f));
+                Vector2i candidate = new Vector2i(
+                    player.X + (int)Math.Round(dx / length * stepLength),
+                    player.Y + (int)Math.Round(dy / length * stepLength));
+                bool pathable = false;
+                try
+                {
+                    PathfindingCommand command =
+                        new PathfindingCommand(player, candidate, 3f);
+                    pathable = ExilePather.FindPath(ref command) &&
+                        command.Path != null &&
+                        command.Path.Count > 0 &&
+                        candidate.DistanceF(anchor) < distance - 1f;
+                }
+                catch
+                {
+                    pathable = false;
+                }
+                AllflameLog.Info(
+                    "CAPSULE_FINAL_APPROACH_STEP" +
+                    "|From=" + player +
+                    "|Waypoint=" + candidate +
+                    "|Target=" + anchor +
+                    "|DistanceBefore=" + distance.ToString("0.0") +
+                    "|StepLength=" + player.DistanceF(candidate).ToString("0.0") +
+                    "|Path=" + pathable +
+                    "|Result=" + (pathable ? "Selected" : "Rejected"));
+                if (pathable)
+                {
+                    waypoint = candidate;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void HandleMandatoryFinalApproachFailure(
+            string reason,
+            float distance)
+        {
+            AllflameLog.Throttled(
+                "capsule_final_approach_no_path",
+                TimeSpan.FromMilliseconds(750),
+                "CAPSULE_FINAL_APPROACH_PROGRESS" +
+                "|Distance=" + distance.ToString("0.0") +
+                "|BestDistance=" + _rescueBestDistance.ToString("0.0") +
+                "|NoProgressSeconds=" + Math.Max(
+                    0,
+                    (int)Math.Floor(
+                        (DateTime.UtcNow - _rescueProgressUtc)
+                            .TotalSeconds)) +
+                "|Reloads=" + _mandatoryFinalApproachReloads +
+                "|Result=" + reason);
+            if (_rescueProgressUtc == DateTime.MinValue)
+            {
+                _rescueProgressUtc = DateTime.UtcNow;
+                return;
+            }
+            if (DateTime.UtcNow - _rescueProgressUtc <
+                TimeSpan.FromSeconds(
+                    MandatoryFinalApproachNoProgressSeconds))
+            {
+                return;
+            }
+            if (_mandatoryFinalApproachReloads <
+                MandatoryFinalApproachMaximumReloads)
+            {
+                _rescueRouteReloads++;
+                _mandatoryFinalApproachReloads++;
+                try { ExilePather.Reload(true); } catch { }
+                _rescueProgressUtc = DateTime.UtcNow;
+                _rescueBestDistance = distance;
+                _rescueWatchdogUtc = DateTime.UtcNow;
+                _rescueApproachCandidates.Clear();
+                _rescueCandidate = null;
+                _rescueCandidateCursor = 0;
+                _rescueActionsThisCycle.Clear();
+                ResetMoverApproachState();
+                AllflameLog.Info(
+                    "CAPSULE_FINAL_APPROACH_RECOVERY" +
+                    "|Attempt=" + _mandatoryFinalApproachReloads +
+                    "|Reason=" + reason +
+                    "|Distance=" + distance.ToString("0.0") +
+                    "|Action=ReloadPather");
+                return;
+            }
+            StopMandatoryFinalApproach(
+                reason + "AfterTwoReloads",
+                distance);
+        }
+
+        private bool StopMandatoryFinalApproachOnTimeout(
+            AllflameSettings settings,
+            NetworkObject live)
+        {
+            if (!_mandatoryFinalApproachActive ||
+                _mandatoryFinalApproachStartedUtc == DateTime.MinValue ||
+                DateTime.UtcNow - _mandatoryFinalApproachStartedUtc <
+                    TimeSpan.FromSeconds(
+                        MandatoryFinalApproachTimeoutSeconds) ||
+                _zeroLanternStage >= ZeroLanternExtractionStage.Stabilize)
+            {
+                return false;
+            }
+
+            float distance = LokiPoe.Me == null
+                ? Single.MaxValue
+                : LokiPoe.Me.Position.DistanceF(_rescueTargetAnchor);
+            if (IsLockedRescueTargetUsable(live) &&
+                distance <= RescueInteractionThreshold(settings))
+            {
+                BeginRescueStage(
+                    ZeroLanternExtractionStage.Stabilize,
+                    "MandatoryFinalApproachTimeoutInsideInteractionRing");
+                return false;
+            }
+            StopMandatoryFinalApproach("HardTimeout30Seconds", distance);
+            return true;
+        }
+
+        private void StopMandatoryFinalApproach(
+            string reason,
+            float distance)
+        {
+            int elapsed = _mandatoryFinalApproachStartedUtc ==
+                DateTime.MinValue
+                    ? 0
+                    : Math.Max(
+                        0,
+                        (int)Math.Floor(
+                            (DateTime.UtcNow -
+                             _mandatoryFinalApproachStartedUtc)
+                                .TotalSeconds));
+            string detail =
+                "Reason=" + reason +
+                "|ElapsedSeconds=" + elapsed +
+                "|TargetId=" + _rescueTargetId +
+                "|Target=" + _rescueTargetAnchor +
+                "|Distance=" + (distance == Single.MaxValue
+                    ? "Unavailable"
+                    : distance.ToString("0.0")) +
+                "|Reloads=" + _mandatoryFinalApproachReloads +
+                "|ActiveTask=UseAllflameCapsuleTask";
+            AllflameLog.Info(
+                "CAPSULE_FINAL_APPROACH_TIMEOUT|" + detail);
+            AllflameStopController.Stop(
+                "MandatoryCapsuleReturnTimeout",
+                detail);
         }
 
         private static Item FindInventoryItemByLocalId(
