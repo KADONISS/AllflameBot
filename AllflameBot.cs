@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.120";
+        public const string Current = "0.23.123";
     }
 
     public sealed class AllflameBot : IBot
@@ -9789,9 +9789,11 @@ namespace AllflameBot
                 int beforeAvailable =
                     current.AvailableChartSlots.Count;
                 int beforeBoard = current.BoardChartCount;
-                Element chartSlot = current.AvailableChartSlots[0];
+                VoyagePlanningUi.StableChartSlot chartSlot =
+                    current.AvailableChartSlots[0];
                 bool inputSent =
                     await VoyagePlanningUi.CtrlClickStableChartSlot(
+                        current,
                         chartSlot,
                         placement);
                 bool moved = false;
@@ -10213,19 +10215,26 @@ namespace AllflameBot
         internal sealed class StableVoyageSnapshot
         {
             public Element Window;
+            public Element InventoryRegion;
             public Element BeginVoyageButton;
             public Element ClearBoardButton;
             public int RootIndex;
             public int InventorySlotCount;
             public int BoardSlotCount;
             public int BoardChartCount;
-            public readonly List<Element> AvailableChartSlots =
-                new List<Element>();
+            public readonly List<StableChartSlot> AvailableChartSlots =
+                new List<StableChartSlot>();
 
             public bool BeginVoyageEnabled
             {
                 get { return SafeStableEnabled(BeginVoyageButton); }
             }
+        }
+
+        internal sealed class StableChartSlot
+        {
+            public Element Element;
+            public int Index;
         }
 
         public static bool TryGetDpbAvailableCharts(
@@ -10374,6 +10383,7 @@ namespace AllflameBot
                 var resolved = new StableVoyageSnapshot
                 {
                     Window = window,
+                    InventoryRegion = inventoryRegion,
                     BeginVoyageButton = beginButton,
                     ClearBoardButton = clearButton,
                     RootIndex = rootIndex
@@ -10381,11 +10391,19 @@ namespace AllflameBot
                 List<Element> inventorySlots =
                     SafeStableChildren(inventoryRegion);
                 resolved.InventorySlotCount = inventorySlots.Count;
-                foreach (Element slot in inventorySlots)
+                for (int slotIndex = 0;
+                     slotIndex < inventorySlots.Count;
+                     slotIndex++)
                 {
+                    Element slot = inventorySlots[slotIndex];
                     if (ContainsStableLevelLabel(slot))
                     {
-                        resolved.AvailableChartSlots.Add(slot);
+                        resolved.AvailableChartSlots.Add(
+                            new StableChartSlot
+                            {
+                                Element = slot,
+                                Index = slotIndex
+                            });
                     }
                 }
                 List<Element> boardSlots =
@@ -10445,31 +10463,171 @@ namespace AllflameBot
         }
 
         public static async Task<bool> CtrlClickStableChartSlot(
-            Element slot,
-            int slotIndex)
+            StableVoyageSnapshot snapshot,
+            StableChartSlot chartSlot,
+            int placementIndex)
         {
-            if (!IsStableVisible(slot) ||
-                !ContainsStableLevelLabel(slot))
+            if (snapshot == null ||
+                chartSlot == null ||
+                !IsStableVisible(chartSlot.Element) ||
+                !ContainsStableLevelLabel(chartSlot.Element))
             {
                 return false;
             }
             Vector2i location;
+            string coordinateMode;
+            string rejectionReason;
+            if (!TryResolveStableChartLocation(
+                    snapshot,
+                    chartSlot.Index,
+                    out location,
+                    out coordinateMode,
+                    out rejectionReason))
+            {
+                AllflameLog.Info(
+                    "VOYAGE_CHART_SLOT_REJECTED" +
+                    "|Placement=" + (placementIndex + 1) + "/9" +
+                    "|InventoryIndex=" + chartSlot.Index +
+                    "|Reason=" + rejectionReason +
+                    "|Action=UseVisualFallback");
+                VoyageVisualSnapshot visual;
+                if (!TryAnalyze(out visual, true) ||
+                    visual.ChartLocations == null ||
+                    visual.ChartLocations.Count == 0)
+                {
+                    return false;
+                }
+                location = visual.ChartLocations[0];
+                if (!IsClientLocationValid(location))
+                {
+                    AllflameLog.Info(
+                        "VOYAGE_CHART_SLOT_REJECTED" +
+                        "|Placement=" +
+                        (placementIndex + 1) + "/9" +
+                        "|InventoryIndex=" + chartSlot.Index +
+                        "|Reason=VisualOutsideClient:" + location +
+                        "|Action=AbortClick");
+                    return false;
+                }
+                coordinateMode = "VisualFallback";
+            }
+            bool inputSent = await CtrlClickClient(location);
+            AllflameLog.Info(
+                "VOYAGE_CHART_SLOT_CTRL_CLICK" +
+                "|Placement=" + (placementIndex + 1) + "/9" +
+                "|InventoryIndex=" + chartSlot.Index +
+                "|Address=0x" +
+                chartSlot.Element.Address.ToString("X") +
+                "|Client=" + location +
+                "|CoordinateMode=" + coordinateMode +
+                "|InputSent=" + inputSent +
+                "|Confirmed=False");
+            return inputSent;
+        }
+
+        private static bool TryResolveStableChartLocation(
+            StableVoyageSnapshot snapshot,
+            int inventoryIndex,
+            out Vector2i location,
+            out string mode,
+            out string rejectionReason)
+        {
+            location = new Vector2i();
+            mode = "Unavailable";
+            rejectionReason = String.Empty;
+            if (snapshot.InventoryRegion == null ||
+                inventoryIndex < 0 ||
+                inventoryIndex >= 60)
+            {
+                rejectionReason = "InvalidStableSlot";
+                return false;
+            }
+
             try
             {
-                location = slot.CenterClickLocation();
+                var slotUi = new InventorySlotUiElement(
+                    snapshot.InventoryRegion.Address,
+                    StashType.NormalStash);
+                if (slotUi == null ||
+                    !slotUi.IsValid ||
+                    !slotUi.IsVisible)
+                {
+                    rejectionReason = "InventorySlotUiUnavailable";
+                    return false;
+                }
+
+                const int columns = 6;
+                const int rows = 10;
+                if (slotUi.Size.X != columns ||
+                    slotUi.Size.Y != rows)
+                {
+                    rejectionReason =
+                        "UnexpectedGridSize:" + slotUi.Size;
+                    return false;
+                }
+                int column = inventoryIndex % columns;
+                int row = inventoryIndex / columns;
+                location = slotUi.SlotClickLocation(
+                    new Vector2i(column + 1, row + 1));
+                if (!IsClientLocationValid(location))
+                {
+                    rejectionReason =
+                        "OutsideClient:" + location;
+                    return false;
+                }
+
+                mode = "InventorySlotUiElement";
+                AllflameLog.Throttled(
+                    "voyage_chart_grid_geometry",
+                    TimeSpan.FromSeconds(2),
+                    "VOYAGE_CHART_GRID" +
+                    "|InventoryAddress=0x" +
+                    snapshot.InventoryRegion.Address.ToString("X") +
+                    "|GridSize=" + slotUi.Size +
+                    "|GridTopLeft=" + slotUi.LocationTopLeft +
+                    "|Index=" + inventoryIndex +
+                    "|Column=" + column +
+                    "|Row=" + row +
+                    "|Client=" + location +
+                    "|Mode=" + mode);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                rejectionReason =
+                    exception.GetType().Name + ":" +
+                    exception.Message.Replace("|", "/");
+                return false;
+            }
+        }
+
+        private static bool IsClientLocationValid(Vector2i location)
+        {
+            try
+            {
+                var client = LokiPoe.ClientWindowInfo.Client;
+                int width = client.Right - client.Left;
+                int height = client.Bottom - client.Top;
+                if (width <= 0 || height <= 0)
+                {
+                    return false;
+                }
+                bool clientRelative =
+                    location.X >= 0 &&
+                    location.X < width &&
+                    location.Y >= 0 &&
+                    location.Y < height;
+                bool screenRelative =
+                    location.X >= client.Left &&
+                    location.X < client.Right &&
+                    location.Y >= client.Top &&
+                    location.Y < client.Bottom;
+                return clientRelative || screenRelative;
             }
             catch
             {
                 return false;
             }
-            bool clicked = await CtrlClickClient(location);
-            AllflameLog.Info(
-                "VOYAGE_CHART_SLOT_CTRL_CLICK" +
-                "|Slot=" + slotIndex +
-                "|Address=0x" + slot.Address.ToString("X") +
-                "|Client=" + location +
-                "|Clicked=" + clicked);
-            return clicked;
         }
 
         private static Element FindStableRegionByChildCount(

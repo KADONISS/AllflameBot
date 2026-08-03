@@ -2,6 +2,18 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.123 - 2026-08-03
+
+- Convert Voyage Planner Chart indices through DPB's
+  `InventorySlotUiElement.SlotClickLocation` so placement follows the current
+  client resolution and UI scale instead of unreliable child-element centers.
+- Reject Chart coordinates outside the game client and use the existing visual
+  detector only when DPB cannot resolve a valid native grid coordinate.
+- Track the real 60-slot inventory index, distinguish input submission from a
+  confirmed transfer, and continue requiring inventory or board convergence
+  before counting a Chart as placed.
+- Synchronize the runtime bot version marker with the release metadata.
+
 ## 0.23.122 - 2026-08-03
 
 - Resolve Voyage Planner from the stable `deepwater_voyage_window` IdLabel,
