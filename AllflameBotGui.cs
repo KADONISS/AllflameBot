@@ -154,9 +154,7 @@ namespace AllflameBot
             grid.Children.Add(Card("LANTERNS", Stack(
                 Check("Use game's Auto-Lantern", "UseGameAutoLantern"),
                 Check("Press V fallback when auto-place misses", "UseVForLantern"),
-                Check("Return when Lanterns are exhausted", "FinishSmallChartWhenLanternsEmpty"),
-                Number("Chest grace at 0/x (seconds)", "ZeroLanternChestGraceSeconds", 0, 60),
-                Note("Finish pending chest/loot work for at most this duration. 0 exits immediately."))));
+                Note("At confirmed 0/x the bot immediately cancels chest and loot work, then returns."))));
             Grid.SetColumn(grid.Children[1], 1);
 
             grid.Children.Add(Card("CHESTS", BuildChestPicker()));
@@ -309,8 +307,6 @@ namespace AllflameBot
                 Number("Delay between loot actions (ms)", "LootActionDelayMilliseconds", 30, 500),
                 Number("Failed pickup retry delay (ms)", "LootRetryDelayMilliseconds", 100, 1000),
                 Number("Maximum attempts per item", "MaxLootAttempts", 1, 8),
-                Number("At 0 Lantern: loot items worth at least (Divine)", "ZeroLanternLootMinDivines", 1, 10000),
-                Note("At 0/x Lantern the bot leaves immediately unless a tracked chest drop meets this price threshold."),
                 Note("Filter-visible drops remain required until the WorldItem disappears."))));
             Grid.SetColumn(grid.Children[2], 2);
 

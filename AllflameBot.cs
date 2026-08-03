@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.133";
+        public const string Current = "0.23.134";
     }
 
     public sealed class AllflameBot : IBot
@@ -1678,41 +1678,20 @@ namespace AllflameBot
             get { return Chests.Values.Count(chest => !chest.Completed); }
         }
 
-        public static int CountPendingWithinLanternCoverage(bool voyage)
+        public static int CancelPendingForMandatoryReturn()
         {
-            return Chests.Values.Count(chest =>
-                !chest.Completed &&
-                IsWithinLanternCoverage(chest.Position, voyage));
-        }
-
-        public static int DiscardPendingOutsideLanternCoverage(
-            bool voyage)
-        {
-            List<TrackedChest> unsafeChests =
-                Chests.Values
-                    .Where(chest =>
-                        !chest.Completed &&
-                        !IsWithinLanternCoverage(
-                            chest.Position,
-                            voyage))
-                    .ToList();
-            foreach (TrackedChest chest in unsafeChests)
+            int cancelled = 0;
+            foreach (TrackedChest chest in Chests.Values)
             {
-                chest.Completed = true;
-                if (_activeChestId == chest.Id)
+                if (chest.Completed)
                 {
-                    _activeChestId = 0;
+                    continue;
                 }
-                AllflameLog.Info(
-                    "CHEST_GRACE_UNSAFE_SKIPPED" +
-                    "|Runner=" + (voyage ? "Voyage" : "Chart") +
-                    "|Id=" + chest.Id +
-                    "|Name=" + chest.Name +
-                    "|Position=" + chest.Position +
-                    "|SafeRadius=120" +
-                    "|Reason=OutsidePlacedLanternCoverage");
+                chest.Completed = true;
+                cancelled++;
             }
-            return unsafeChests.Count;
+            _activeChestId = 0;
+            return cancelled;
         }
 
         public static bool IsWithinLanternCoverage(
@@ -2032,38 +2011,28 @@ namespace AllflameBot
                 : AllflameRunState.LanternsExhausted;
         }
 
-        public static bool IsPlayerSafe(bool voyage)
-        {
-            return !IsExhausted(voyage) ||
-                   AllflameContext.LanternAuraActive;
-        }
-
-        public static bool IsTargetSafe(
-            Vector2i position,
-            bool voyage)
-        {
-            return !IsExhausted(voyage) ||
-                   (AllflameContext.LanternAuraActive &&
-                    AllflameChestRoute.IsWithinLanternCoverage(
-                        position,
-                        voyage));
-        }
-
         public static void AbortChestAndLootWork(
             bool voyage,
             string source,
             Vector2i target)
         {
-            if (voyage)
-            {
-                VoyageRunState.CancelZeroLanternChestGrace();
-            }
-            else
-            {
-                AllflameRunState.CancelZeroLanternChestGrace();
-            }
+            int cancelledChests =
+                AllflameChestRoute.CancelPendingForMandatoryReturn();
+            bool lootWasActive = AllflameLootState.IsActive;
             AllflameLootState.Clear();
             BottleSafetyMovement.Reset();
+            AllflameLog.Info(
+                "ZERO_LANTERN_MANDATORY_RETURN" +
+                "|Runner=" + (voyage ? "Voyage" : "Chart") +
+                "|Counter=" +
+                AllflameContext.LanternCounterCurrent + "/" +
+                AllflameContext.LanternCounterMaximum +
+                "|ChestCancelled=" + (cancelledChests > 0) +
+                "|CancelledChests=" + cancelledChests +
+                "|LootCancelled=" + lootWasActive +
+                "|Source=" + (source ?? String.Empty) +
+                "|Action=" +
+                (voyage ? "FindCapsule" : "ReturnToExtraction"));
             AllflameLog.Info(
                 "ZERO_LANTERN_SAFETY_ABORT" +
                 "|Runner=" + (voyage ? "Voyage" : "Chart") +
@@ -2197,8 +2166,6 @@ namespace AllflameBot
         private static DateTime _voyageEnteredUtc = DateTime.MinValue;
         private static bool _positiveLanternCounterObserved;
         private static int _lanternCounterEmptySnapshots;
-        private static DateTime _zeroLanternChestGraceUntilUtc =
-            DateTime.MinValue;
         private static int _safeBreadcrumbReturnIndex = -1;
         private static bool _safeBreadcrumbReturnInitialized;
 
@@ -2207,35 +2174,6 @@ namespace AllflameBot
         public static Vector2i Spawn { get; private set; }
         public static uint AreaHash { get; private set; }
         public static bool LanternsExhausted { get; private set; }
-        public static bool ZeroLanternChestGraceActive
-        {
-            get
-            {
-                return Active &&
-                    LanternsExhausted &&
-                    DateTime.UtcNow < _zeroLanternChestGraceUntilUtc &&
-                    HasPendingChestWork();
-            }
-        }
-        public static int ZeroLanternChestGraceRemainingSeconds
-        {
-            get
-            {
-                if (!ZeroLanternChestGraceActive)
-                {
-                    return 0;
-                }
-                return Math.Max(
-                    1,
-                    (int)Math.Ceiling(
-                        (_zeroLanternChestGraceUntilUtc - DateTime.UtcNow)
-                            .TotalSeconds));
-            }
-        }
-        public static void CancelZeroLanternChestGrace()
-        {
-            _zeroLanternChestGraceUntilUtc = DateTime.MinValue;
-        }
         public static bool TimedExitRequested { get; private set; }
         public static string ExtractionReason { get; private set; }
         public static bool FailedAfterDeath { get; private set; }
@@ -2291,7 +2229,6 @@ namespace AllflameBot
             _voyageEnteredUtc = DateTime.MinValue;
             _positiveLanternCounterObserved = false;
             _lanternCounterEmptySnapshots = 0;
-            _zeroLanternChestGraceUntilUtc = DateTime.MinValue;
             _safeBreadcrumbReturnIndex = -1;
             _safeBreadcrumbReturnInitialized = false;
         }
@@ -2500,20 +2437,13 @@ namespace AllflameBot
                 LanternsExhausted = true;
                 TimedExitRequested = false;
                 ExtractionReason = "LanternCounter0";
-                StartZeroLanternChestGrace(
-                    "Voyage",
-                    current,
-                    maximum);
-                // Publish the extraction request immediately, but preserve an
-                // active chest/loot session during the bounded user-configured
-                // grace. The Capsule task resumes as soon as work finishes or
-                // the absolute deadline expires.
                 SurfaceTransferPending = true;
-                if (!ZeroLanternChestGraceActive)
-                {
-                    AllflameLootState.Clear();
-                    BottleSafetyMovement.Reset();
-                }
+                ZeroLanternSafety.AbortChestAndLootWork(
+                    true,
+                    "VoyageLanternCounter0",
+                    LokiPoe.Me == null
+                        ? new Vector2i()
+                        : LokiPoe.Me.Position);
                 AllflameLog.Info(
                     "VOYAGE_EXTRACTION_TRIGGER" +
                     "|Reason=LanternCounterEmptyConfirmed" +
@@ -2525,66 +2455,6 @@ namespace AllflameBot
                     "|RegisteredCapsules=" +
                     CapsuleAnchors.Count);
             }
-        }
-
-        private static void StartZeroLanternChestGrace(
-            string runner,
-            int current,
-            int maximum)
-        {
-            int unsafeChestsSkipped =
-                AllflameChestRoute
-                    .DiscardPendingOutsideLanternCoverage(true);
-            bool unsafeLootCleared =
-                AllflameLootState.IsActive &&
-                !AllflameLootState
-                    .IsActiveClusterWithinLanternCoverage(true);
-            if (unsafeLootCleared)
-            {
-                AllflameLootState.Clear();
-            }
-            int seconds = Math.Max(
-                0,
-                Math.Min(
-                    60,
-                    AllflameSettings.Instance
-                        .ZeroLanternChestGraceSeconds));
-            _zeroLanternChestGraceUntilUtc = seconds <= 0
-                ? DateTime.MinValue
-                : DateTime.UtcNow.AddSeconds(seconds);
-            AllflameLog.Info(
-                "ZERO_LANTERN_CHEST_GRACE|Runner=" + runner +
-                "|Counter=" + current + "/" + maximum +
-                "|ConfiguredSeconds=" + seconds +
-                "|PendingChests=" + AllflameChestRoute.PendingCount +
-                "|UnsafeChestsSkipped=" +
-                unsafeChestsSkipped +
-                "|UnsafeLootCleared=" +
-                unsafeLootCleared +
-                "|LootActive=" +
-                (AllflameSettings.Instance.EnableGroundLoot &&
-                 AllflameLootState.IsActive) +
-                "|Active=" + ZeroLanternChestGraceActive);
-        }
-
-        private static bool HasPendingChestWork()
-        {
-            AllflameSettings settings = AllflameSettings.Instance;
-            NetworkObject activeChest =
-                AllflameChestRoute.FindLiveActiveTarget();
-            bool interactionAlreadyReady =
-                settings.OpenKnownChestsFirst &&
-                activeChest != null &&
-                activeChest.IsValid &&
-                activeChest.IsTargetable &&
-                activeChest.Distance <= Math.Max(
-                    12,
-                    settings.InteractDistance + 4);
-            return interactionAlreadyReady ||
-                (settings.EnableGroundLoot &&
-                 AllflameLootState.IsActive &&
-                 AllflameLootState
-                    .IsActiveClusterWithinLanternCoverage(true));
         }
 
         public static void ObserveLantern(Vector2i position)
@@ -3446,8 +3316,6 @@ namespace AllflameBot
         private static bool _lanternProgressFailsafeLogged;
         private static string _lanternExhaustionSource;
         private static bool _lanternExhaustionLogged;
-        private static DateTime _zeroLanternChestGraceUntilUtc =
-            DateTime.MinValue;
         private static DateTime _sulphurWaitUntilUtc;
         private static bool _sulphurCollectionPending;
         private static readonly List<Vector2i> LanternRoute =
@@ -3474,35 +3342,6 @@ namespace AllflameBot
         public static int CompletedChartAreas { get; private set; }
         public static bool LanternWasActive { get; private set; }
         public static bool LanternsExhausted { get; private set; }
-        public static bool ZeroLanternChestGraceActive
-        {
-            get
-            {
-                return _lastPhase == AllflamePhase.ChartArea &&
-                    LanternsExhausted &&
-                    DateTime.UtcNow < _zeroLanternChestGraceUntilUtc &&
-                    HasPendingChestWork();
-            }
-        }
-        public static int ZeroLanternChestGraceRemainingSeconds
-        {
-            get
-            {
-                if (!ZeroLanternChestGraceActive)
-                {
-                    return 0;
-                }
-                return Math.Max(
-                    1,
-                    (int)Math.Ceiling(
-                        (_zeroLanternChestGraceUntilUtc - DateTime.UtcNow)
-                            .TotalSeconds));
-            }
-        }
-        public static void CancelZeroLanternChestGrace()
-        {
-            _zeroLanternChestGraceUntilUtc = DateTime.MinValue;
-        }
         public static bool LanternSearchRecovery { get; private set; }
         public static bool ChartAbandonedAfterDeath { get; private set; }
         public static bool HasChartSpawnPosition { get; private set; }
@@ -3570,7 +3409,6 @@ namespace AllflameBot
             _lanternProgressFailsafeLogged = false;
             _lanternExhaustionSource = String.Empty;
             _lanternExhaustionLogged = false;
-            _zeroLanternChestGraceUntilUtc = DateTime.MinValue;
             _sulphurWaitUntilUtc = DateTime.MinValue;
             _sulphurCollectionPending = false;
             BoatStagingRequired = false;
@@ -3608,7 +3446,6 @@ namespace AllflameBot
                 _lanternProgressFailsafeLogged = false;
                 _lanternExhaustionSource = String.Empty;
                 _lanternExhaustionLogged = false;
-                _zeroLanternChestGraceUntilUtc = DateTime.MinValue;
                 LanternRoute.Clear();
                 OutwardRoute.Clear();
                 _returnLanternIndex = -1;
@@ -3671,7 +3508,6 @@ namespace AllflameBot
                 _lanternProgressFailsafeLogged = false;
                 _lanternExhaustionSource = String.Empty;
                 _lanternExhaustionLogged = false;
-                _zeroLanternChestGraceUntilUtc = DateTime.MinValue;
                 LanternRoute.Clear();
                 OutwardRoute.Clear();
                 _returnLanternIndex = -1;
@@ -3794,19 +3630,6 @@ namespace AllflameBot
             }
             if (LanternsExhausted)
             {
-                // Aura loss can be observed before the UI counter snapshot.
-                // If the real 0/x value arrives afterwards, still arm the
-                // bounded chest grace once; never extend its deadline.
-                if (_zeroLanternChestGraceUntilUtc == DateTime.MinValue &&
-                    maximum > 0 &&
-                    current <= 0 &&
-                    String.Equals(
-                        _lanternExhaustionSource,
-                        "AuraLost",
-                        StringComparison.Ordinal))
-                {
-                    StartZeroLanternChestGrace();
-                }
                 return;
             }
             if (maximum <= 0)
@@ -3905,16 +3728,16 @@ namespace AllflameBot
 
             LanternsExhausted = true;
             _lanternExhaustionSource = source ?? String.Empty;
-            if (_lanternExhaustionSource.StartsWith(
-                    "UiCounterEmpty:",
-                    StringComparison.Ordinal))
-            {
-                StartZeroLanternChestGrace();
-            }
             _returnLanternIndex = LanternRoute.Count - 1;
             _returnOutwardIndex = OutwardRoute.Count - 1;
             _returnLanternInitialized = true;
             _returnOutwardInitialized = true;
+            ZeroLanternSafety.AbortChestAndLootWork(
+                false,
+                _lanternExhaustionSource,
+                LokiPoe.Me == null
+                    ? new Vector2i()
+                    : LokiPoe.Me.Position);
             if (!_lanternExhaustionLogged)
             {
                 _lanternExhaustionLogged = true;
@@ -3924,57 +3747,6 @@ namespace AllflameBot
                     "|RecordedLanterns=" + LanternRoute.Count +
                     "|RecordedBreadcrumbs=" + OutwardRoute.Count);
             }
-        }
-
-        private static void StartZeroLanternChestGrace()
-        {
-            int unsafeChestsSkipped =
-                AllflameChestRoute
-                    .DiscardPendingOutsideLanternCoverage(false);
-            bool unsafeLootCleared =
-                AllflameLootState.IsActive &&
-                !AllflameLootState
-                    .IsActiveClusterWithinLanternCoverage(false);
-            if (unsafeLootCleared)
-            {
-                AllflameLootState.Clear();
-            }
-            int seconds = Math.Max(
-                0,
-                Math.Min(
-                    60,
-                    AllflameSettings.Instance
-                        .ZeroLanternChestGraceSeconds));
-            _zeroLanternChestGraceUntilUtc = seconds <= 0
-                ? DateTime.MinValue
-                : DateTime.UtcNow.AddSeconds(seconds);
-            AllflameLog.Info(
-                "ZERO_LANTERN_CHEST_GRACE|Runner=Chart" +
-                "|Counter=" +
-                AllflameContext.LanternCounterCurrent + "/" +
-                AllflameContext.LanternCounterMaximum +
-                "|ConfiguredSeconds=" + seconds +
-                "|PendingChests=" + AllflameChestRoute.PendingCount +
-                "|UnsafeChestsSkipped=" +
-                unsafeChestsSkipped +
-                "|UnsafeLootCleared=" +
-                unsafeLootCleared +
-                "|LootActive=" +
-                (AllflameSettings.Instance.EnableGroundLoot &&
-                 AllflameLootState.IsActive) +
-                "|Active=" + ZeroLanternChestGraceActive);
-        }
-
-        private static bool HasPendingChestWork()
-        {
-            AllflameSettings settings = AllflameSettings.Instance;
-            return (settings.OpenKnownChestsFirst &&
-                    AllflameChestRoute
-                        .CountPendingWithinLanternCoverage(false) > 0) ||
-                (settings.EnableGroundLoot &&
-                 AllflameLootState.IsActive &&
-                 AllflameLootState
-                    .IsActiveClusterWithinLanternCoverage(false));
         }
 
         public static void ObserveOutwardBreadcrumb(Vector2i position)
@@ -4435,25 +4207,6 @@ namespace AllflameBot
                 existing.DistanceF(position) <= radius);
         }
 
-        public static bool IsActiveClusterWithinLanternCoverage(
-            bool voyage)
-        {
-            if (!IsActive || ChestPositions.Count == 0)
-            {
-                return false;
-            }
-
-            return ChestPositions.All(position =>
-                voyage
-                    ? VoyageRunState
-                        .IsPositionWithinLanternCoverage(
-                            position,
-                            120f)
-                    : AllflameRunState.IsNearPlacedLantern(
-                        position,
-                        120f));
-        }
-
         public static void BeginChestOpen(NetworkObject chest)
         {
             if (chest == null)
@@ -4648,68 +4401,6 @@ namespace AllflameBot
         public static void MarkDropUnlootable(int worldId)
         {
             RequiredChestDropWorldIds.Remove(worldId);
-        }
-
-        public static bool HasValuableRequiredDropAtOrAbove(
-            int minimumDivines)
-        {
-            if (!IsActive ||
-                minimumDivines <= 0 ||
-                RequiredChestDropWorldIds.Count == 0)
-            {
-                return false;
-            }
-
-            try
-            {
-                foreach (WorldItem worldItem in
-                    LokiPoe.ObjectManager.Objects.OfType<WorldItem>())
-                {
-                    if (worldItem == null ||
-                        !worldItem.IsValid ||
-                        worldItem.IsAllocatedToOther ||
-                        !RequiredChestDropWorldIds.Contains(worldItem.Id))
-                    {
-                        continue;
-                    }
-
-                    Item item = null;
-                    try
-                    {
-                        item = worldItem.Item;
-                    }
-                    catch
-                    {
-                    }
-                    if (item == null || !item.IsValid)
-                    {
-                        continue;
-                    }
-
-                    AllflamePriceQuote quote =
-                        AllflamePrices.Quote(item);
-                    if (quote.IsPriced &&
-                        quote.TotalDivines >= minimumDivines)
-                    {
-                        AllflameLog.Throttled(
-                            "zero_lantern_valuable_loot_" + worldItem.Id,
-                            TimeSpan.FromSeconds(1),
-                            "ZERO_LANTERN_VALUABLE_LOOT" +
-                            "|WorldId=" + worldItem.Id +
-                            "|Name=" + quote.Name +
-                            "|Quantity=" + quote.Quantity +
-                            "|ValueDivines=" +
-                            quote.TotalDivines.ToString("0.###") +
-                            "|MinimumDivines=" + minimumDivines +
-                            "|Action=PickupBeforeReturn");
-                        return true;
-                    }
-                }
-            }
-            catch
-            {
-            }
-            return false;
         }
 
         public static void MarkMessageBottleCollected(Item item)
@@ -8004,6 +7695,13 @@ namespace AllflameBot
         private InventoryControlWrapper _storageControl;
         private InventorySlotUiElement _storageSlot;
         private uint _lastAreaHash;
+        private bool _storagePageReady;
+        private bool _storageDepositPending;
+        private int _storagePendingChartKey;
+        private int _storagePendingBeforeCount;
+        private int _storagePendingBeforeUnits;
+        private string _storagePendingChartName = String.Empty;
+        private DateTime _storageDepositIssuedUtc = DateTime.MinValue;
 
         public PreVoyageChartStashTask()
             : base(
@@ -8439,77 +8137,87 @@ namespace AllflameBot
                 return true;
             }
 
-            InventoryControlWrapper resolvedControl;
-            InventorySlotUiElement resolvedSlot;
-            if (ChartStorageUi.TryResolve(
-                    _storageMainTab,
-                    _storageSubTab,
-                    _storageControl,
-                    _storageSlot,
-                    out resolvedControl,
-                    out resolvedSlot))
+            if (_storageDepositPending)
             {
-                _storageControl = resolvedControl;
-                _storageSlot = resolvedSlot;
-                _storageOpenPending = false;
-                _storageOpenAttempts = 0;
-                _storageResolveAttempts = 0;
-
-                Item chart = charts[0];
-                int beforeCount = charts.Count;
-                int beforeUnits = CountInventoryChartUnits();
-                bool inputSent = await CtrlClickInventoryChart(
-                    chart,
-                    false,
-                    "CHART_STORAGE_DEPOSIT_INPUT_FAILED");
-                await LokiCoroutine.Sleep(100);
-                AllflameContext.Refresh(true);
                 int afterCount = GetInventoryCharts().Count;
                 int afterUnits = CountInventoryChartUnits();
-                bool moved = inputSent && afterUnits < beforeUnits;
+                bool moved = afterUnits < _storagePendingBeforeUnits;
                 if (moved)
                 {
                     _storageStartedUtc = DateTime.UtcNow;
                     _storageMovedCharts += Math.Max(
                         1,
-                        beforeUnits - afterUnits);
+                        _storagePendingBeforeUnits - afterUnits);
                     _failedChartKey = 0;
                     _failedAttempts = 0;
                     AllflameProgressWatchdog.MarkProgress(
                         "ChartStorageDepositConfirmed");
                     ChartStorageUi.MarkDepositConfirmed();
-                    int delay =
-                        AllflameTransferTiming.NextDelayMilliseconds(
-                            AllflameSettings.Instance);
-                    _retryAfterUtc =
-                        DateTime.UtcNow.AddMilliseconds(delay);
                     AllflameLog.Info(
-                        "CHART_STORAGE_DEPOSIT_MOVED" +
+                        "CHART_STORAGE_FAST_DEPOSIT_CONFIRMED" +
                         "|Main=" + (_storageMainTab + 1) +
                         "|Sub=" + (_storageSubTab + 1) +
-                        "|Name=" + chart.FullName +
-                        "|LocalId=" + chart.LocalId +
-                        "|Before=" + beforeCount +
+                        "|Name=" + _storagePendingChartName +
+                        "|LocalId=" + _storagePendingChartKey +
+                        "|Before=" + _storagePendingBeforeCount +
                         "|After=" + afterCount +
-                        "|BeforeUnits=" + beforeUnits +
+                        "|BeforeUnits=" + _storagePendingBeforeUnits +
                         "|AfterUnits=" + afterUnits +
-                        "|Mode=CtrlClick" +
-                        "|NextDelayMs=" + delay);
+                        "|ElapsedMs=" + Math.Max(
+                            0,
+                            (int)(DateTime.UtcNow -
+                                _storageDepositIssuedUtc)
+                                .TotalMilliseconds) +
+                        "|PageReselected=False" +
+                        "|OneActionPerCycle=True");
+                    ClearPendingStorageDeposit();
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(25);
                     return true;
                 }
 
+                if (DateTime.UtcNow - _storageDepositIssuedUtc <
+                    TimeSpan.FromMilliseconds(650))
+                {
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(40);
+                    return true;
+                }
+
+                int rejectedChartKey = _storagePendingChartKey;
+                string rejectedChartName = _storagePendingChartName;
+                int rejectedBeforeUnits = _storagePendingBeforeUnits;
+                ClearPendingStorageDeposit();
+                if (_failedChartKey == rejectedChartKey)
+                {
+                    _failedAttempts++;
+                }
+                else
+                {
+                    _failedChartKey = rejectedChartKey;
+                    _failedAttempts = 1;
+                }
                 AllflameLog.Info(
                     "CHART_STORAGE_DEPOSIT_PAGE_REJECTED" +
                     "|Main=" + (_storageMainTab + 1) +
                     "|Sub=" + (_storageSubTab + 1) +
-                    "|Name=" + chart.FullName +
-                    "|InputSent=" + inputSent +
-                    "|BeforeUnits=" + beforeUnits +
+                    "|Name=" + rejectedChartName +
+                    "|InputSent=True" +
+                    "|BeforeUnits=" + rejectedBeforeUnits +
                     "|AfterUnits=" + afterUnits +
-                    "|Reason=" + (inputSent
-                        ? "TransferNotConfirmed"
-                        : "InputRejected") +
-                    "|NextAction=TryNextPage");
+                    "|Reason=TransferNotConfirmed" +
+                    "|Confirmation=" + _failedAttempts + "/2" +
+                    "|NextAction=" + (_failedAttempts >= 2
+                        ? "TryNextPage"
+                        : "RetrySamePage"));
+                if (_failedAttempts < 2)
+                {
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(80);
+                    return true;
+                }
+                int rejectedMain = _storageMainTab;
+                int rejectedSub = _storageSubTab;
                 if (!AdvanceStoragePage())
                 {
                     await MarkStorageUnavailable(
@@ -8517,13 +8225,85 @@ namespace AllflameBot
                         afterCount);
                     return true;
                 }
+                AllflameLog.Info(
+                    "CHART_STORAGE_FAST_DEPOSIT_PAGE_FULL" +
+                    "|Main=" + (rejectedMain + 1) +
+                    "|Sub=" + (rejectedSub + 1) +
+                    "|Confirmations=" + _failedAttempts +
+                    "|Action=AdvancePage");
+                _failedChartKey = 0;
+                _failedAttempts = 0;
+                _storagePageReady = false;
                 _storageControl = null;
                 _storageSlot = null;
                 _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(300);
+                    DateTime.UtcNow.AddMilliseconds(80);
                 return true;
             }
 
+            if (_storagePageReady)
+            {
+                Item chart = charts[0];
+                int chartKey =
+                    chart.LocalId != 0 ? chart.LocalId : chart.Id;
+                int beforeCount = charts.Count;
+                int beforeUnits = CountInventoryChartUnits();
+                bool inputSent = await CtrlClickInventoryChart(
+                    chart,
+                    false,
+                    "CHART_STORAGE_DEPOSIT_INPUT_FAILED");
+                AllflameLog.Info(
+                    "CHART_STORAGE_FAST_DEPOSIT_ISSUED" +
+                    "|Main=" + (_storageMainTab + 1) +
+                    "|Sub=" + (_storageSubTab + 1) +
+                    "|Name=" + chart.FullName +
+                    "|LocalId=" + chartKey +
+                    "|BeforeUnits=" + beforeUnits +
+                    "|Ctrl=True" +
+                    "|InputSent=" + inputSent +
+                    "|OneActionPerCycle=True");
+                if (inputSent)
+                {
+                    _storageDepositPending = true;
+                    _storagePendingChartKey = chartKey;
+                    _storagePendingBeforeCount = beforeCount;
+                    _storagePendingBeforeUnits = beforeUnits;
+                    _storagePendingChartName = chart.FullName ?? String.Empty;
+                    _storageDepositIssuedUtc = DateTime.UtcNow;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(35);
+                    return true;
+                }
+
+                if (_failedChartKey == chartKey)
+                {
+                    _failedAttempts++;
+                }
+                else
+                {
+                    _failedChartKey = chartKey;
+                    _failedAttempts = 1;
+                }
+                if (_failedAttempts >= 2)
+                {
+                    if (!AdvanceStoragePage())
+                    {
+                        await MarkStorageUnavailable(
+                            "AllPagesRejected",
+                            beforeCount);
+                        return true;
+                    }
+                    _failedChartKey = 0;
+                    _failedAttempts = 0;
+                    _storagePageReady = false;
+                }
+                _retryAfterUtc =
+                    DateTime.UtcNow.AddMilliseconds(80);
+                return true;
+            }
+
+            InventoryControlWrapper resolvedControl;
+            InventorySlotUiElement resolvedSlot;
             if (ChartStorageUi.TryResolve(
                     _storageControl,
                     _storageSlot,
@@ -8535,14 +8315,43 @@ namespace AllflameBot
                 _storageOpenPending = false;
                 _storageOpenAttempts = 0;
                 _storageResolveAttempts = 0;
+                bool pageReady = ChartStorageUi.IsPageActive(
+                    _storageMainTab,
+                    _storageSubTab);
+                if (pageReady)
+                {
+                    _storagePageReady = true;
+                    _storageControl = null;
+                    _storageSlot = null;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_FAST_DEPOSIT_START" +
+                        "|Main=" + (_storageMainTab + 1) +
+                        "|Sub=" + (_storageSubTab + 1) +
+                        "|InventoryCharts=" + charts.Count +
+                        "|TabClicks=0" +
+                        "|Action=CtrlClickInventoryDirectly");
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(20);
+                    return true;
+                }
                 bool mainReady = ChartStorageUi.IsMainTabActive(
                     _storageMainTab);
-                bool mainClicked = mainReady ||
-                    ChartStorageUi.TryClickMainTab(_storageMainTab);
-                bool subClicked = mainClicked &&
-                    ChartStorageUi.TryClickSubTab(
+                bool mainClicked = false;
+                bool subClicked = false;
+                string action;
+                if (!mainReady)
+                {
+                    mainClicked =
+                        ChartStorageUi.TryClickMainTab(_storageMainTab);
+                    action = "SelectMain";
+                }
+                else
+                {
+                    subClicked = ChartStorageUi.TryClickSubTab(
                         _storageMainTab,
                         _storageSubTab);
+                    action = "SelectSub";
+                }
                 AllflameLog.Info(
                     "CHART_STORAGE_DEPOSIT_PAGE" +
                     "|Main=" + (_storageMainTab + 1) +
@@ -8550,11 +8359,12 @@ namespace AllflameBot
                     "|MainReady=" + mainReady +
                     "|MainClicked=" + mainClicked +
                     "|SubClicked=" + subClicked +
-                    "|Action=Select");
+                    "|Action=" + action +
+                    "|OneActionPerCycle=True");
                 _storageControl = null;
                 _storageSlot = null;
                 _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(450);
+                    DateTime.UtcNow.AddMilliseconds(120);
                 return true;
             }
 
@@ -8641,6 +8451,7 @@ namespace AllflameBot
 
         private bool AdvanceStoragePage()
         {
+            _storagePageReady = false;
             _storageSubTab++;
             if (_storageSubTab >= StorageSubTabCount)
             {
@@ -8675,7 +8486,19 @@ namespace AllflameBot
             _storageControl = null;
             _storageSlot = null;
             _storageOpenPending = false;
+            _storagePageReady = false;
+            ClearPendingStorageDeposit();
             _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(350);
+        }
+
+        private void ClearPendingStorageDeposit()
+        {
+            _storageDepositPending = false;
+            _storagePendingChartKey = 0;
+            _storagePendingBeforeCount = 0;
+            _storagePendingBeforeUnits = 0;
+            _storagePendingChartName = String.Empty;
+            _storageDepositIssuedUtc = DateTime.MinValue;
         }
 
         private async Task<bool> CompletePreStash(
@@ -8863,7 +8686,7 @@ namespace AllflameBot
                         .ClearAllKeyStates();
                     DreamPoeBot.BotFramework.MouseManager
                         .SetMousePosition(clickLocation, true);
-                    await LokiCoroutine.Sleep(10);
+                    await LokiCoroutine.Sleep(5);
                     LokiPoe.ProcessHookManager.SetKeyState(
                         System.Windows.Forms.Keys.ControlKey,
                         short.MinValue,
@@ -8877,10 +8700,9 @@ namespace AllflameBot
                             System.Windows.Forms.Keys.None);
                         shiftDown = true;
                     }
-                    await LokiCoroutine.Sleep(20);
+                    await LokiCoroutine.Sleep(5);
                     DreamPoeBot.BotFramework.MouseManager
                         .ClickLMB(0, 0);
-                    await LokiCoroutine.Sleep(45);
                     return true;
                 }
                 finally
@@ -8944,6 +8766,8 @@ namespace AllflameBot
             _storageOpenPending = false;
             _storageControl = null;
             _storageSlot = null;
+            _storagePageReady = false;
+            ClearPendingStorageDeposit();
         }
     }
 
@@ -23748,12 +23572,10 @@ namespace AllflameBot
             if (!encounter ||
                 !AllflameSettings.Instance.OpenKnownChestsFirst ||
                 (AllflameContext.Phase == AllflamePhase.ChartArea &&
-                 AllflameRunState.LanternsExhausted &&
-                 !AllflameRunState.ZeroLanternChestGraceActive) ||
+                 AllflameRunState.LanternsExhausted) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
                   (VoyageRunState.LanternsExhausted ||
-                   VoyageRunState.SurfaceTransferPending) &&
-                  !VoyageRunState.ZeroLanternChestGraceActive) ||
+                   VoyageRunState.SurfaceTransferPending)) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
                  VoyageRunState.ExitCapsuleSecuringRequired) ||
                 AllflameChestRoute.PendingCount <= 0 ||
@@ -23789,56 +23611,6 @@ namespace AllflameBot
             {
                 return Task.FromResult(false);
             }
-            bool zeroLanternGrace =
-                AllflameContext.Phase == AllflamePhase.Voyage
-                    ? VoyageRunState.ZeroLanternChestGraceActive
-                    : AllflameRunState.ZeroLanternChestGraceActive;
-            bool voyageGrace =
-                AllflameContext.Phase == AllflamePhase.Voyage;
-            if (zeroLanternGrace && voyageGrace)
-            {
-                ResetTarget();
-                AllflameLog.Throttled(
-                    "voyage_chest_grace_navigation_frozen",
-                    TimeSpan.FromSeconds(1),
-                    "CHEST_GRACE_NAVIGATION_FROZEN" +
-                    "|Runner=Voyage" +
-                    "|Id=" + id +
-                    "|Position=" + rememberedPosition +
-                    "|Reason=DoNotStartNewChestRouteAfterLanternZero");
-                return Task.FromResult(false);
-            }
-            if (zeroLanternGrace &&
-                !AllflameContext.LanternAuraActive)
-            {
-                ResetTarget();
-                ZeroLanternSafety.AbortChestAndLootWork(
-                    voyageGrace,
-                    "ChestNavigationLostAura",
-                    rememberedPosition);
-                return Task.FromResult(true);
-            }
-            if (zeroLanternGrace &&
-                !AllflameChestRoute.IsWithinLanternCoverage(
-                    rememberedPosition,
-                    voyageGrace))
-            {
-                AllflameChestRoute.MarkUnreachable(id);
-                ResetTarget();
-                AllflameLog.Info(
-                    "CHEST_GRACE_UNSAFE_BLOCKED" +
-                    "|Runner=" +
-                    (voyageGrace ? "Voyage" : "Chart") +
-                    "|Id=" + id +
-                    "|Position=" + rememberedPosition +
-                    "|Action=SkipAndResumeExit");
-                ZeroLanternSafety.AbortChestAndLootWork(
-                    voyageGrace,
-                    "ChestNavigationTargetOutsideCoverage",
-                    rememberedPosition);
-                return Task.FromResult(true);
-            }
-
             if (AllflameSettings.Instance.EnableGroundLoot &&
                 AllflameLootState.IsActive &&
                 !AllflameLootState.IsNearbyClusterPosition(
@@ -23973,12 +23745,10 @@ namespace AllflameBot
             if (!encounter ||
                 !AllflameSettings.Instance.OpenKnownChestsFirst ||
                 (AllflameContext.Phase == AllflamePhase.ChartArea &&
-                 AllflameRunState.LanternsExhausted &&
-                 !AllflameRunState.ZeroLanternChestGraceActive) ||
+                 AllflameRunState.LanternsExhausted) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
                   (VoyageRunState.LanternsExhausted ||
-                   VoyageRunState.SurfaceTransferPending) &&
-                  !VoyageRunState.ZeroLanternChestGraceActive) ||
+                   VoyageRunState.SurfaceTransferPending)) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
                  VoyageRunState.ExitCapsuleSecuringRequired) ||
                 AllflameChestRoute.PendingCount <= 0)
@@ -24006,41 +23776,6 @@ namespace AllflameBot
                     (chest.Metadata ?? String.Empty) +
                     "|Reason=EssenceDenyList" +
                     "|Action=BlockFinalInteraction");
-                return true;
-            }
-            bool zeroLanternGrace =
-                AllflameContext.Phase == AllflamePhase.Voyage
-                    ? VoyageRunState.ZeroLanternChestGraceActive
-                    : AllflameRunState.ZeroLanternChestGraceActive;
-            bool voyageGrace =
-                AllflameContext.Phase == AllflamePhase.Voyage;
-            if (zeroLanternGrace &&
-                !AllflameContext.LanternAuraActive)
-            {
-                AllflameChestRoute.MarkUnreachable(chest.Id);
-                ZeroLanternSafety.AbortChestAndLootWork(
-                    voyageGrace,
-                    "ChestClickLostAura",
-                    chest.Position);
-                return true;
-            }
-            if (zeroLanternGrace &&
-                !AllflameChestRoute.IsWithinLanternCoverage(
-                    chest.Position,
-                    voyageGrace))
-            {
-                AllflameChestRoute.MarkUnreachable(chest.Id);
-                AllflameLog.Info(
-                    "CHEST_GRACE_UNSAFE_BLOCKED" +
-                    "|Runner=" +
-                    (voyageGrace ? "Voyage" : "Chart") +
-                    "|Id=" + chest.Id +
-                    "|Position=" + chest.Position +
-                    "|Action=DoNotOpen");
-                ZeroLanternSafety.AbortChestAndLootWork(
-                    voyageGrace,
-                    "ChestClickTargetOutsideCoverage",
-                    chest.Position);
                 return true;
             }
             if (AllflameSettings.Instance.EnableGroundLoot &&
@@ -24530,6 +24265,21 @@ namespace AllflameBot
                 return false;
             }
 
+            bool voyage =
+                AllflameContext.IsVoyageMapArea &&
+                AllflameContext.Phase == AllflamePhase.Voyage;
+            if (ZeroLanternSafety.IsExhausted(voyage))
+            {
+                ClearPendingPickup();
+                ZeroLanternSafety.AbortChestAndLootWork(
+                    voyage,
+                    "LootTaskBlockedAtZeroLantern",
+                    LokiPoe.Me == null
+                        ? new Vector2i()
+                        : LokiPoe.Me.Position);
+                return false;
+            }
+
             if (!settings.EnableGroundLoot || !AllflameLootState.IsActive)
             {
                 return false;
@@ -24567,13 +24317,6 @@ namespace AllflameBot
                     "ground_loot_unsafe",
                     TimeSpan.FromSeconds(2),
                     "GROUND_LOOT_WAIT|Reason=NearbyMonster");
-                return false;
-            }
-
-            if (!EnsureZeroLanternLootSafe(
-                    null,
-                    "LootScanLostAura"))
-            {
                 return false;
             }
 
@@ -24623,13 +24366,6 @@ namespace AllflameBot
                     return false;
                 }
                 return true;
-            }
-
-            if (!EnsureZeroLanternLootSafe(
-                    target,
-                    "LootMovementSafetyCheck"))
-            {
-                return false;
             }
 
             Item targetItem = SafeItem(target);
@@ -24740,12 +24476,6 @@ namespace AllflameBot
                 (item == null
                     ? target.Id.ToString()
                     : item.FullName));
-            if (!EnsureZeroLanternLootSafe(
-                    target,
-                    "LootClickSafetyCheck"))
-            {
-                return false;
-            }
             bool interactionAccepted =
                 await Coroutines.InteractWith(target);
             _pendingPickupActive = true;
@@ -25032,40 +24762,6 @@ namespace AllflameBot
             {
                 return false;
             }
-        }
-
-        private static bool EnsureZeroLanternLootSafe(
-            WorldItem target,
-            string source)
-        {
-            bool voyage =
-                AllflameContext.IsVoyageMapArea &&
-                AllflameContext.Phase == AllflamePhase.Voyage;
-            if (!ZeroLanternSafety.IsExhausted(voyage))
-            {
-                return true;
-            }
-
-            Vector2i targetPosition =
-                target == null
-                    ? (LokiPoe.Me == null
-                        ? new Vector2i()
-                        : LokiPoe.Me.Position)
-                    : target.Position;
-            if (AllflameContext.LanternAuraActive &&
-                (target == null ||
-                 AllflameChestRoute.IsWithinLanternCoverage(
-                     targetPosition,
-                     voyage)))
-            {
-                return true;
-            }
-
-            ZeroLanternSafety.AbortChestAndLootWork(
-                voyage,
-                source,
-                targetPosition);
-            return false;
         }
 
         private static string BuildDropSignature(
@@ -36432,38 +36128,6 @@ namespace AllflameBot
             if (DateTime.UtcNow < _waitForAreaTransitionUntilUtc)
             {
                 return true;
-            }
-
-            if (lanternsExhausted &&
-                AllflameRunState.ZeroLanternChestGraceActive)
-            {
-                AllflameLog.Throttled(
-                    "chart_zero_lantern_chest_grace",
-                    TimeSpan.FromSeconds(1),
-                    "ZERO_LANTERN_CHEST_GRACE_WAIT|Runner=Chart" +
-                    "|RemainingSeconds=" +
-                    AllflameRunState
-                        .ZeroLanternChestGraceRemainingSeconds +
-                    "|PendingChests=" +
-                    AllflameChestRoute.PendingCount +
-                    "|LootActive=" +
-                    AllflameLootState.IsActive +
-                    "|BlockedTask=" + Name);
-                return false;
-            }
-
-            // After the bounded chest grace expires, return has priority over
-            // every unopened chest. The only remaining exception is an
-            // already-dropped, filter-accepted item meeting the configured
-            // Divine threshold.
-            if (lanternsExhausted &&
-                AllflameLootState.HasValuableRequiredDropAtOrAbove(
-                    Math.Max(
-                        1,
-                        AllflameSettings.Instance
-                            .ZeroLanternLootMinDivines)))
-            {
-                return false;
             }
 
             string reason = lanternsExhausted

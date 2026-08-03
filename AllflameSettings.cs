@@ -55,8 +55,6 @@ namespace AllflameBot
         public bool OpenKnownChestsFirst { get; set; }
         public bool UseGameAutoLantern { get; set; }
         public bool UseVForLantern { get; set; }
-        public bool FinishSmallChartWhenLanternsEmpty { get; set; }
-        public int ZeroLanternChestGraceSeconds { get; set; }
         public int MaxMinutesPerChart { get; set; }
         public int ChartExplorePercent { get; set; }
         public int InteractDistance { get; set; }
@@ -121,7 +119,6 @@ namespace AllflameBot
         public int LootActionDelayMilliseconds { get; set; }
         public int LootRetryDelayMilliseconds { get; set; }
         public int MaxLootAttempts { get; set; }
-        public int ZeroLanternLootMinDivines { get; set; }
         public bool PickupEverything { get; set; }
         public bool PickupSeasonalRewards { get; set; }
         public bool PickupCurrency { get; set; }
@@ -334,10 +331,6 @@ namespace AllflameBot
                 {
                     TagEveryoneForValuableItems = false;
                 }
-                if (oldSchema < 25)
-                {
-                    ZeroLanternLootMinDivines = 1;
-                }
                 if (oldSchema < 26)
                 {
                     EnableEnduringCry = true;
@@ -375,10 +368,6 @@ namespace AllflameBot
                     PriorityArcanistStrongbox = 90;
                     MinimumUniqueValueDivines = 0d;
                     MinimumGemValueDivines = 0d;
-                }
-                if (oldSchema < 32)
-                {
-                    ZeroLanternChestGraceSeconds = 15;
                 }
                 if (oldSchema < 34)
                 {
@@ -650,8 +639,6 @@ namespace AllflameBot
             OpenKnownChestsFirst = true;
             UseGameAutoLantern = true;
             UseVForLantern = true;
-            FinishSmallChartWhenLanternsEmpty = true;
-            ZeroLanternChestGraceSeconds = 15;
             MaxMinutesPerChart = 8;
 
             AutoPlanVoyage = false;
@@ -757,7 +744,6 @@ namespace AllflameBot
             LootActionDelayMilliseconds = 160;
             LootRetryDelayMilliseconds = 300;
             MaxLootAttempts = 3;
-            ZeroLanternLootMinDivines = 1;
             ApplyPickitDefaults();
         }
 

@@ -2,6 +2,23 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.134 - 2026-08-04
+
+- Accelerate pre-Voyage Chart Storage deposits with a persistent fast-deposit
+  page state: after the initial page selection, each cycle Ctrl-clicks one
+  fresh inventory Chart without clicking Main/Sub tabs again.
+- Confirm each Chart transfer from a later inventory snapshot, remove the
+  per-item forced context refresh and reduce modifier-click input latency.
+- Require two bounded transfer rejections before treating a storage page as
+  full and advancing to the next page.
+- Make confirmed `0/x` Lantern state an unconditional return trigger in both
+  Chart Areas and Voyages, cancelling all pending chest and ground-loot work.
+- Remove zero-Lantern chest grace, valuable-loot exceptions and their GUI
+  settings; Chart Areas immediately prioritize extraction while Voyages
+  immediately prioritize mandatory Capsule rescue.
+- Add `CHART_STORAGE_FAST_DEPOSIT_*` and
+  `ZERO_LANTERN_MANDATORY_RETURN` diagnostics for runtime verification.
+
 ## 0.23.133 - 2026-08-04
 
 - Recover when portal interaction reopens an empty Chart Device after Descend:
