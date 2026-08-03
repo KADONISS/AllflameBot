@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.109";
+        public const string Current = "0.23.115";
     }
 
     public sealed class AllflameBot : IBot
@@ -11110,13 +11110,13 @@ namespace AllflameBot
                 {
                     AllflameLog.Info(
                         "CHART_STORAGE_DEBUG_FAILED" +
-                        "|Reason=InventoryControlNotResolved" +
+                        "|Reason=PageLayerNotResolved" +
                         "|Detector=ChartStorageUi");
                     AllflameChartStorageDebug.Complete(
                         false,
                         0,
                         0,
-                        "UI opened but its inventory grid could not be resolved.");
+                        "UI opened but its active Chart page could not be resolved.");
                     await Coroutines.CloseBlockingWindows();
                     Reset();
                     return true;
@@ -11141,15 +11141,19 @@ namespace AllflameBot
                         .Where(item => item != null && item.IsValid)
                         .ToList();
             List<Item> charts =
-                items.Where(AllflameContext.IsChartItem).ToList();
+                new List<Item>();
             List<KeyValuePair<int, Element>> rawCharts =
-                storageInventory == null
-                    ? ChartStorageUi.GetRawItemElements(_storageSlot)
-                    : new List<KeyValuePair<int, Element>>();
-            int chartStacks =
-                storageInventory == null
-                    ? rawCharts.Count
-                    : charts.Sum(item => Math.Max(1, item.StackCount));
+                ChartStorageUi.GetRawItemElements(_storageSlot);
+            var visibleKeys = new HashSet<int>(
+                rawCharts.Select(pair => pair.Key));
+            charts = items
+                .Where(item =>
+                    AllflameContext.IsChartItem(item) &&
+                    visibleKeys.Contains(item.LocalId))
+                .ToList();
+            int chartStacks = storageInventory == null
+                ? rawCharts.Count
+                : charts.Sum(item => Math.Max(1, item.StackCount));
 
             AllflameLog.Info(
                 "CHART_STORAGE_DEBUG_RESULT" +
@@ -11169,9 +11173,8 @@ namespace AllflameBot
                 "|AllItems=" + (storageInventory == null
                     ? rawCharts.Count
                     : items.Count) +
-                "|ChartItems=" + (storageInventory == null
-                    ? rawCharts.Count
-                    : charts.Count) +
+                "|VisibleRawItems=" + rawCharts.Count +
+                "|ChartItems=" + charts.Count +
                 "|ChartStacks=" + chartStacks +
                 "|ReadOnly=True");
             foreach (Item item in items)
@@ -11415,7 +11418,11 @@ namespace AllflameBot
             // A Voyage Stash withdrawal is a batch operation. Once a batch has
             // been taken, consume every remaining Chart before opening the
             // stash again. Do not top 19 back up to 20 after each run.
-            if (AllflameContext.InventoryChartCount > 0)
+            bool chartStorageTopUpPending =
+                AllflameRunState.ChartStorageProbeCompleted &&
+                !AllflameRunState.ChartStorageChecked;
+            if (AllflameContext.InventoryChartCount > 0 &&
+                !chartStorageTopUpPending)
             {
                 AllflameRunState.MarkVoyageStashProbeCompleted();
                 AllflameRunState.MarkStorageChecked();
@@ -11427,6 +11434,20 @@ namespace AllflameBot
                 ResetApproachTracking();
                 AllflameProgressWatchdog.Clear(Name);
                 return false;
+            }
+            if (chartStorageTopUpPending &&
+                AllflameContext.InventoryChartCount > 0)
+            {
+                AllflameLog.Info(
+                    "VOYAGE_STASH_TOP_UP" +
+                    "|Reason=ChartStorageBelowTarget" +
+                    "|InventoryCharts=" +
+                    AllflameContext.InventoryChartCount +
+                    "|Target=" + TargetInventoryCharts +
+                    "|Needed=" + Math.Max(
+                        0,
+                        TargetInventoryCharts -
+                        AllflameContext.InventoryChartCount));
             }
 
             if (DateTime.UtcNow < _retryAfterUtc)
@@ -12334,7 +12355,7 @@ namespace AllflameBot
                 return AllflameSettings.Instance.GetChartWithdrawalCount();
             }
         }
-        private const int FullPageChartCount = 60;
+        private const int FullPageChartCount = 12;
         private int _stage;
         private int _mainTab;
         private int _subTab;
@@ -12351,6 +12372,18 @@ namespace AllflameBot
         private readonly int[,] _pageCounts = new int[3, 5];
         private readonly HashSet<string> _seenChartKeys =
             new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _mappedChartKeys =
+            new HashSet<string>(StringComparer.Ordinal);
+        private readonly HashSet<string> _skippedChartKeys =
+            new HashSet<string>(StringComparer.Ordinal);
+        private int _visitedPages;
+        private int _withdrawnCharts;
+        private int _rawItemsSeen;
+        private int _nativeItems;
+        private int _nativeRequestedId = -1;
+        private bool _nativeBindFailed;
+        private bool _rawWithdrawFailed;
+        private bool _inventoryFull;
         private InventoryControlWrapper _storageControl;
         private InventorySlotUiElement _storageSlot;
 
@@ -12383,7 +12416,7 @@ namespace AllflameBot
         }
 
         public OpenChartStorageTask()
-            : base("OpenChartStorageTask", "Probes Chart pages forward and withdraws newest Charts in reverse.") { }
+            : base("OpenChartStorageTask", "Probes and withdraws Chart Storage pages in forward order.") { }
 
         public override void Start()
         {
@@ -12449,7 +12482,8 @@ namespace AllflameBot
             }
 
             AllflameContext.Refresh(true);
-            if (AllflameContext.InventoryChartCount > 0)
+            if (_stage == 0 &&
+                AllflameContext.InventoryChartCount > 0)
             {
                 AllflameRunState.MarkChartStorageProbeCompleted();
                 AllflameRunState.MarkStorageChecked();
@@ -12534,12 +12568,12 @@ namespace AllflameBot
                         "CHART_STORAGE_RETRY" +
                         "|Attempt=" + _resolveAttempts +
                         "|Maximum=3" +
-                        "|Reason=InventoryControlNotResolved" +
+                        "|Reason=PageLayerNotResolved" +
                         "|NextAction=ReopenStorage");
                     if (_resolveAttempts >= 3)
                     {
                         return await CompleteSourceFailure(
-                            "InventoryControlNotResolved");
+                            "PageLayerNotResolved");
                     }
                     _stage = 0;
                     _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
@@ -12549,12 +12583,6 @@ namespace AllflameBot
                 _resolveAttempts = 0;
                 BeginScan();
                 return true;
-            }
-
-            if (!TryResolveStorageUi())
-            {
-                return await CompleteSourceFailure(
-                    "InventoryControlLostDuringScan");
             }
 
             if (_stage == 2)
@@ -12581,6 +12609,16 @@ namespace AllflameBot
             _activeMainTab = -1;
             _activeSubTab = -1;
             _seenChartKeys.Clear();
+            _mappedChartKeys.Clear();
+            _skippedChartKeys.Clear();
+            _visitedPages = 0;
+            _withdrawnCharts = 0;
+            _rawItemsSeen = 0;
+            _nativeItems = 0;
+            _nativeRequestedId = -1;
+            _nativeBindFailed = false;
+            _rawWithdrawFailed = false;
+            _inventoryFull = false;
             for (int main = 0; main < 3; main++)
             {
                 _lastUsedSubTab[main] = -1;
@@ -12619,18 +12657,28 @@ namespace AllflameBot
             _tabFailures = 0;
             List<StorageChartEntry> charts = ReadCurrentStorageCharts();
             RememberPage(_mainTab, _subTab, charts);
+            _visitedPages++;
+            _rawItemsSeen += charts.Count;
 
             bool isFull = charts.Count >= FullPageChartCount;
+            int mapped = charts.Count(chart => chart.Item != null);
             AllflameLog.Info(
-                "CHART_STORAGE_PAGE_SCAN|Main=" + (_mainTab + 1) +
+                "CHART_STORAGE_RAW_PAGE_SCAN|Main=" + (_mainTab + 1) +
                 "|Sub=" + (_subTab + 1) +
-                "|Charts=" + charts.Count +
+                "|RawItems=" + charts.Count +
+                "|MappedCharts=" + mapped +
                 "|Mode=" + (HasNativeStorageInventory()
                     ? "ServerInventory"
                     : "RawGrid") +
                 "|Full=" + isFull +
                 "|Sequence=" + (_mainTab * 5 + _subTab + 1) +
                 "/15");
+
+            if (!await WithdrawRawChartsFromCurrentPage())
+            {
+                await FinishScan();
+                return;
+            }
 
             if (_subTab < 4)
             {
@@ -12646,33 +12694,130 @@ namespace AllflameBot
                 return;
             }
 
-            AllflameContext.Refresh(true);
-            if (AllflameContext.InventoryChartCount >= TargetInventoryCharts)
-            {
-                await FinishScan();
-                return;
-            }
+            await FinishScan();
+        }
 
-            _withdrawMainTab = 2;
-            _withdrawSubTab = _lastUsedSubTab[_withdrawMainTab];
-            _stage = 3;
-            AllflameLog.Info(
-                "CHART_WITHDRAW_BEGIN|Direction=5_TO_1|InventoryCharts=" +
-                AllflameContext.InventoryChartCount);
+        private async Task<bool> WithdrawRawChartsFromCurrentPage()
+        {
+            int failedAttempts = 0;
+            while (true)
+            {
+                AllflameContext.Refresh(true);
+                if (AllflameContext.InventoryChartCount >=
+                    TargetInventoryCharts)
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_RAW_WITHDRAW_STOP" +
+                        "|Reason=TargetReached" +
+                        "|Target=" + TargetInventoryCharts +
+                        "|InventoryCharts=" +
+                        AllflameContext.InventoryChartCount +
+                        "|Withdrawn=" + _withdrawnCharts);
+                    return false;
+                }
+                if (AllflameContext.InventoryFreeSquares <= 0)
+                {
+                    _inventoryFull = true;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_RAW_WITHDRAW_STOP" +
+                        "|Reason=InventoryFull" +
+                        "|Main=" + (_mainTab + 1) +
+                        "|Sub=" + (_subTab + 1) +
+                        "|Withdrawn=" + _withdrawnCharts);
+                    return false;
+                }
+
+                if (!TryResolveStorageUi(_mainTab, _subTab))
+                {
+                    failedAttempts++;
+                    if (failedAttempts >= 3)
+                    {
+                        _rawWithdrawFailed = true;
+                        AllflameLog.Info(
+                            "CHART_STORAGE_RAW_WITHDRAW_STOP" +
+                            "|Reason=PageLayerResolveFailed" +
+                            "|Main=" + (_mainTab + 1) +
+                            "|Sub=" + (_subTab + 1) +
+                            "|Attempts=" + failedAttempts);
+                        return false;
+                    }
+                    await LokiCoroutine.Sleep(150);
+                    continue;
+                }
+
+                List<KeyValuePair<int, Element>> rawItems =
+                    ChartStorageUi.GetRawItemElements(_storageSlot);
+                if (rawItems.Count == 0)
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_RAW_PAGE_EMPTY" +
+                        "|Main=" + (_mainTab + 1) +
+                        "|Sub=" + (_subTab + 1) +
+                        "|Withdrawn=" + _withdrawnCharts);
+                    return true;
+                }
+
+                KeyValuePair<int, Element> rawItem = rawItems[0];
+                int beforeCount = rawItems.Count;
+                bool clicked = await CtrlClickRawChart(rawItem.Value);
+                await LokiCoroutine.Sleep(250);
+
+                bool resolved = false;
+                var afterItems =
+                    new List<KeyValuePair<int, Element>>();
+                for (int poll = 0; poll < 5; poll++)
+                {
+                    resolved = TryResolveStorageUi(_mainTab, _subTab);
+                    if (resolved)
+                    {
+                        afterItems = ChartStorageUi.GetRawItemElements(
+                            _storageSlot);
+                        break;
+                    }
+                    await LokiCoroutine.Sleep(100);
+                }
+                bool moved = clicked && resolved &&
+                    (afterItems.Count < beforeCount ||
+                     !afterItems.Any(pair => pair.Key == rawItem.Key));
+                AllflameLog.Info(
+                    "CHART_STORAGE_RAW_WITHDRAW" +
+                    "|Main=" + (_mainTab + 1) +
+                    "|Sub=" + (_subTab + 1) +
+                    "|RawKey=" + rawItem.Key +
+                    "|Attempt=" + (failedAttempts + 1) +
+                    "|Before=" + beforeCount +
+                    "|After=" + afterItems.Count +
+                    "|Clicked=" + clicked +
+                    "|Resolved=" + resolved +
+                    "|Confirmed=" + moved);
+                if (moved)
+                {
+                    _withdrawnCharts++;
+                    failedAttempts = 0;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "ChartStorageRawChartTransferred");
+                    continue;
+                }
+
+                failedAttempts++;
+                if (failedAttempts >= 3)
+                {
+                    _rawWithdrawFailed = true;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_RAW_WITHDRAW_STOP" +
+                        "|Reason=RawClickRejectedThreeTimes" +
+                        "|Main=" + (_mainTab + 1) +
+                        "|Sub=" + (_subTab + 1) +
+                        "|RawKey=" + rawItem.Key);
+                    return false;
+                }
+                await LokiCoroutine.Sleep(150);
+            }
         }
 
         private async Task WithdrawCurrentPage()
         {
-            while (_withdrawMainTab >= 0 && _withdrawSubTab < 0)
-            {
-                _withdrawMainTab--;
-                if (_withdrawMainTab >= 0)
-                {
-                    _withdrawSubTab = _lastUsedSubTab[_withdrawMainTab];
-                }
-            }
-
-            if (_withdrawMainTab < 0)
+            if (_withdrawMainTab >= 3)
             {
                 await FinishScan();
                 return;
@@ -12691,12 +12836,22 @@ namespace AllflameBot
                 return;
             }
             _tabFailures = 0;
+            if (!HasNativeStorageInventory() &&
+                !await WaitForNativeBinding())
+            {
+                _nativeBindFailed = true;
+                await FinishScan();
+                return;
+            }
             List<StorageChartEntry> charts = ReadCurrentStorageCharts();
             RememberPage(_withdrawMainTab, _withdrawSubTab, charts);
 
             AllflameContext.Refresh(true);
             int needed = Math.Max(0, TargetInventoryCharts - AllflameContext.InventoryChartCount);
-            foreach (StorageChartEntry chart in charts.Take(needed).ToList())
+            foreach (StorageChartEntry chart in charts
+                .Where(entry => entry.Item != null)
+                .Take(needed)
+                .ToList())
             {
                 string chartKey = chart.StableKey;
                 int beforeInventory = AllflameContext.InventoryChartCount;
@@ -12704,27 +12859,15 @@ namespace AllflameBot
                 for (int attempt = 1; attempt <= 3; attempt++)
                 {
                     string result;
-                    string transferMode = chart.Item != null &&
-                        HasNativeStorageInventory()
-                            ? "FastMove"
-                            : "RawCtrlClick";
-                    if (transferMode == "FastMove")
+                    const string transferMode = "FastMove";
+                    try
                     {
-                        try
-                        {
-                            result = _storageControl.FastMove(
-                                chart.Item.LocalId).ToString();
-                        }
-                        catch (Exception ex)
-                        {
-                            result = "Exception:" + ex.GetType().Name;
-                        }
+                        result = _storageControl.FastMove(
+                            chart.Item.LocalId).ToString();
                     }
-                    else
+                    catch (Exception ex)
                     {
-                        bool clicked = await CtrlClickRawChart(
-                            chart.RawElement);
-                        result = clicked ? "Clicked" : "ClickRejected";
+                        result = "Exception:" + ex.GetType().Name;
                     }
                     await LokiCoroutine.Sleep(220);
                     AllflameContext.Refresh(true);
@@ -12755,6 +12898,7 @@ namespace AllflameBot
                         "|Confirmed=" + transferred);
                     if (transferred)
                     {
+                        _withdrawnCharts++;
                         break;
                     }
                 }
@@ -12771,7 +12915,12 @@ namespace AllflameBot
                 }
             }
 
-            _withdrawSubTab--;
+            _withdrawSubTab++;
+            if (_withdrawSubTab >= 5)
+            {
+                _withdrawMainTab++;
+                _withdrawSubTab = 0;
+            }
         }
 
         private void RememberPage(
@@ -12793,42 +12942,301 @@ namespace AllflameBot
 
         private List<StorageChartEntry> ReadCurrentStorageCharts()
         {
-            List<Item> items =
+            List<KeyValuePair<int, Element>> rawItems =
+                ChartStorageUi.GetRawItemElements(_storageSlot);
+            List<Item> nativeItems =
                 _storageControl == null ||
-                _storageControl.Inventory == null
-                    ? null
+                _storageControl.Inventory == null ||
+                _storageControl.Inventory.Items == null
+                    ? new List<Item>()
                     : _storageControl.Inventory.Items;
-            if (items != null)
+            bool nativeAvailable = HasNativeStorageInventory();
+            var output = new List<StorageChartEntry>();
+            foreach (KeyValuePair<int, Element> rawItem in rawItems)
             {
-                return items
-                    .Where(AllflameContext.IsChartItem)
-                    .Select(item => new StorageChartEntry { Item = item })
-                    .ToList();
-            }
-
-            return ChartStorageUi.GetRawItemElements(_storageSlot)
-                .Select(pair => new StorageChartEntry
+                Item nativeItem = nativeItems.FirstOrDefault(item =>
+                    item != null &&
+                    item.IsValid &&
+                    item.LocalId == rawItem.Key &&
+                    AllflameContext.IsChartItem(item));
+                if (nativeItem == null)
                 {
-                    RawKey = pair.Key,
-                    RawElement = pair.Value
-                })
-                .ToList();
+                    if (nativeAvailable)
+                    {
+                        _skippedChartKeys.Add(
+                            _activeMainTab + ":" +
+                            _activeSubTab + ":" + rawItem.Key);
+                        AllflameLog.Throttled(
+                            "chart_storage_unmatched_" + rawItem.Key,
+                            TimeSpan.FromSeconds(3),
+                            "CHART_STORAGE_ITEM_SKIPPED" +
+                            "|Reason=NativeLocalIdNotMatched" +
+                            "|RawKey=" + rawItem.Key +
+                            "|Main=" + (_activeMainTab + 1) +
+                            "|Sub=" + (_activeSubTab + 1));
+                    }
+                    output.Add(new StorageChartEntry
+                    {
+                        RawKey = rawItem.Key,
+                        RawElement = rawItem.Value
+                    });
+                    continue;
+                }
+                string pageKey = _activeMainTab + ":" +
+                    _activeSubTab + ":" + rawItem.Key;
+                _mappedChartKeys.Add(pageKey);
+                AllflameLog.Throttled(
+                    "chart_storage_mapped_" + pageKey,
+                    TimeSpan.FromSeconds(10),
+                    "CHART_STORAGE_ITEM_MAPPED" +
+                    "|Main=" + (_activeMainTab + 1) +
+                    "|Sub=" + (_activeSubTab + 1) +
+                    "|RawKey=" + rawItem.Key +
+                    "|LocalId=" + nativeItem.LocalId +
+                    "|Metadata=" + nativeItem.Metadata);
+                output.Add(new StorageChartEntry
+                {
+                    Item = nativeItem,
+                    RawKey = rawItem.Key,
+                    RawElement = rawItem.Value
+                });
+            }
+            return output;
         }
 
         private bool HasNativeStorageInventory()
         {
             try
             {
-                return _storageControl != null &&
+                bool valid = _storageControl != null &&
                     _storageControl.Inventory != null &&
                     _storageControl.Inventory.IsValid &&
                     ChartStorageUi.IsStorageInventoryShape(
                         _storageControl.Inventory);
+                if (valid)
+                {
+                    _nativeRequestedId =
+                        ChartStorageUi.BoundRequestedInventoryId;
+                    _nativeItems = _storageControl.Inventory.Items == null
+                        ? 0
+                        : _storageControl.Inventory.Items.Count;
+                }
+                return valid;
             }
             catch
             {
                 return false;
             }
+        }
+
+        private async Task<bool> SelectStorageTab(int mainTab, int subTab)
+        {
+            string previousSignature = _storageSlot == null
+                ? null
+                : CurrentStoragePageSignature();
+            bool selectionChanged = false;
+            if (_activeMainTab != mainTab ||
+                !ChartStorageUi.IsMainTabActive(mainTab))
+            {
+                if (!ChartStorageUi.TryClickMainTab(mainTab))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_FAILED" +
+                        "|Reason=MainTabMissing" +
+                        "|Main=" + (mainTab + 1));
+                    return false;
+                }
+                if (!await WaitForMainTab(mainTab))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_FAILED" +
+                        "|Reason=MainTabNotActive" +
+                        "|Main=" + (mainTab + 1));
+                    return false;
+                }
+                _activeMainTab = mainTab;
+                _activeSubTab = -1;
+                selectionChanged = true;
+            }
+
+            if (_activeSubTab != subTab ||
+                !ChartStorageUi.IsPageActive(mainTab, subTab))
+            {
+                if (!ChartStorageUi.TryClickSubTab(mainTab, subTab))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_FAILED" +
+                        "|Reason=SubTabMissing" +
+                        "|Main=" + (mainTab + 1) +
+                        "|Sub=" + (subTab + 1));
+                    return false;
+                }
+                if (!await WaitForStoragePage(mainTab, subTab))
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_FAILED" +
+                        "|Reason=PageNotActive" +
+                        "|Main=" + (mainTab + 1) +
+                        "|Sub=" + (subTab + 1));
+                    return false;
+                }
+                _activeSubTab = subTab;
+                selectionChanged = true;
+            }
+
+            if (selectionChanged)
+            {
+                await LokiCoroutine.Sleep(350);
+            }
+
+            string signature = null;
+            string lastResolvedSignature = null;
+            int resolveAttempts = 0;
+            int stableReads = 0;
+            bool pageActive = false;
+            bool pageLayerResolved = false;
+            DateTime emptyConfirmAfter =
+                DateTime.UtcNow.AddMilliseconds(450);
+            DateTime deadline = DateTime.UtcNow.AddSeconds(3);
+            do
+            {
+                pageActive = ChartStorageUi.IsPageActive(
+                    mainTab,
+                    subTab);
+                if (!pageActive)
+                {
+                    await LokiCoroutine.Sleep(100);
+                    continue;
+                }
+
+                resolveAttempts++;
+                if (TryResolveStorageUi(mainTab, subTab))
+                {
+                    pageLayerResolved = _storageSlot != null;
+                    if (pageLayerResolved)
+                    {
+                        signature = CurrentStoragePageSignature();
+                        stableReads = String.Equals(
+                            signature,
+                            lastResolvedSignature,
+                            StringComparison.Ordinal)
+                                ? stableReads + 1
+                                : 1;
+                        lastResolvedSignature = signature;
+                        if (stableReads >= 2 &&
+                            (signature.Length > 0 ||
+                             DateTime.UtcNow >= emptyConfirmAfter))
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                await LokiCoroutine.Sleep(150);
+            }
+            while (DateTime.UtcNow < deadline);
+
+            bool confirmed = pageActive &&
+                pageLayerResolved &&
+                stableReads >= 2 &&
+                (signature != null &&
+                 (signature.Length > 0 ||
+                  DateTime.UtcNow >= emptyConfirmAfter));
+            AllflameLog.Info(
+                "CHART_STORAGE_TAB_CONFIRMED|Main=" + (mainTab + 1) +
+                "|Sub=" + (subTab + 1) +
+                "|Mode=" + (HasNativeStorageInventory()
+                    ? "ServerInventory"
+                    : "RawGrid") +
+                "|Control=" +
+                (_storageControl == null ? "Missing" : "Resolved") +
+                "|PageActive=" + pageActive +
+                "|PageLayerResolved=" + pageLayerResolved +
+                "|ResolveAttempts=" + resolveAttempts +
+                "|StableReads=" + stableReads +
+                "|Signature=" + SanitizeStorageSignature(signature) +
+                "|PreviousSignature=" +
+                SanitizeStorageSignature(previousSignature) +
+                "|" + ChartStorageUi.GetSelectionDiagnostics(
+                    mainTab,
+                    subTab) +
+                "|SelectionRetained=" +
+                (_activeMainTab == mainTab &&
+                 _activeSubTab == subTab) +
+                "|Confirmed=" + confirmed);
+            return confirmed;
+        }
+
+        private static async Task<bool> WaitForMainTab(int mainTab)
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            do
+            {
+                if (ChartStorageUi.IsMainTabActive(mainTab))
+                {
+                    return true;
+                }
+                await LokiCoroutine.Sleep(100);
+            }
+            while (DateTime.UtcNow < deadline);
+            return false;
+        }
+
+        private static async Task<bool> WaitForStoragePage(
+            int mainTab,
+            int subTab)
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            do
+            {
+                if (ChartStorageUi.IsPageActive(mainTab, subTab))
+                {
+                    return true;
+                }
+                await LokiCoroutine.Sleep(100);
+            }
+            while (DateTime.UtcNow < deadline);
+            return false;
+        }
+
+        private async Task<bool> WaitForNativeBinding()
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(3);
+            do
+            {
+                if (TryResolveStorageUi(
+                        _activeMainTab,
+                        _activeSubTab) &&
+                    HasNativeStorageInventory())
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_NATIVE_BOUND" +
+                        "|RequestedId=" + _nativeRequestedId +
+                        "|Items=" + _nativeItems +
+                        "|WaitCompleted=True");
+                    return true;
+                }
+                await LokiCoroutine.Sleep(200);
+            }
+            while (DateTime.UtcNow < deadline);
+
+            AllflameLog.Info(
+                "CHART_STORAGE_NATIVE_BIND_TIMEOUT" +
+                "|WaitSeconds=3" +
+                "|PagesVisited=" + _visitedPages +
+                "|RawItemsSeen=" + _rawItemsSeen +
+                "|Action=FallbackWithoutClickingItems");
+            return false;
+        }
+
+        private string CurrentStoragePageSignature()
+        {
+            return String.Join(
+                ";",
+                ChartStorageUi.GetRawItemElements(_storageSlot)
+                    .Select(pair => pair.Key)
+                    .OrderBy(key => key)
+                    .ToArray());
         }
 
         private static async Task<bool> CtrlClickRawChart(Element element)
@@ -12868,6 +13276,7 @@ namespace AllflameBot
                             (short)0,
                             System.Windows.Forms.Keys.None);
                     }
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 }
             }
             catch (Exception ex)
@@ -12875,114 +13284,59 @@ namespace AllflameBot
                 AllflameLog.Info(
                     "CHART_STORAGE_RAW_CLICK_FAILED|" +
                     ex.GetType().Name + "|" +
-                    ex.Message.Replace("|", "/"));
+                    (ex.Message ?? String.Empty).Replace("|", "/"));
                 return false;
             }
         }
 
-        private async Task<bool> SelectStorageTab(int mainTab, int subTab)
+        private static string SanitizeStorageSignature(string signature)
         {
-            if (_activeMainTab != mainTab)
+            if (signature == null)
             {
-                if (!ChartStorageUi.TryClickMainTab(mainTab))
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TAB_FAILED" +
-                        "|Reason=MainTabMissing" +
-                        "|Main=" + (mainTab + 1));
-                    return false;
-                }
-                _activeMainTab = mainTab;
-                _activeSubTab = -1;
-                await LokiCoroutine.Sleep(300);
+                return "<none>";
             }
-
-            if (_activeSubTab != subTab)
+            if (signature.Length == 0)
             {
-                if (!ChartStorageUi.TryClickSubTab(mainTab, subTab))
-                {
-                    AllflameLog.Info(
-                        "CHART_STORAGE_TAB_FAILED" +
-                        "|Reason=SubTabMissing" +
-                        "|Main=" + (mainTab + 1) +
-                        "|Sub=" + (subTab + 1));
-                    return false;
-                }
-                _activeSubTab = subTab;
-                await LokiCoroutine.Sleep(400);
+                return "<empty>";
             }
-
-            string previousSignature = null;
-            int stableReads = 0;
-            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
-            while (DateTime.UtcNow < deadline && stableReads < 2)
-            {
-                _storageControl = null;
-                _storageSlot = null;
-                if (!TryResolveStorageUi())
-                {
-                    stableReads = 0;
-                    await LokiCoroutine.Sleep(150);
-                    continue;
-                }
-                string signature = CurrentStoragePageSignature();
-                if (String.Equals(
-                        signature,
-                        previousSignature,
-                        StringComparison.Ordinal))
-                {
-                    stableReads++;
-                }
-                else
-                {
-                    previousSignature = signature;
-                    stableReads = 1;
-                }
-                if (stableReads < 2)
-                {
-                    await LokiCoroutine.Sleep(150);
-                }
-            }
-            bool confirmed = _storageSlot != null && stableReads >= 2;
-            AllflameLog.Info(
-                "CHART_STORAGE_TAB_CONFIRMED|Main=" + (mainTab + 1) +
-                "|Sub=" + (subTab + 1) +
-                "|Mode=" + (HasNativeStorageInventory()
-                    ? "ServerInventory"
-                    : "RawGrid") +
-                "|Control=" +
-                (_storageControl == null ? "Missing" : "Resolved") +
-                "|StableReads=" + stableReads +
-                "|SelectionRetained=" +
-                (_activeMainTab == mainTab &&
-                 _activeSubTab == subTab) +
-                "|Confirmed=" + confirmed);
-            return confirmed;
-        }
-
-        private string CurrentStoragePageSignature()
-        {
-            return String.Join(
-                ";",
-                ReadCurrentStorageCharts()
-                    .Select(item => item.StableKey)
-                    .OrderBy(key => key, StringComparer.Ordinal)
-                    .ToArray());
+            return signature.Replace("|", "/");
         }
 
         private bool TryResolveStorageUi()
         {
+            InventoryControlWrapper resolvedControl;
+            InventorySlotUiElement resolvedSlot;
             if (ChartStorageUi.TryResolve(
                 _storageControl,
                 _storageSlot,
-                out _storageControl,
-                out _storageSlot))
+                out resolvedControl,
+                out resolvedSlot))
             {
+                _storageControl = resolvedControl;
+                _storageSlot = resolvedSlot;
                 return true;
             }
 
-            _storageControl = null;
-            _storageSlot = null;
+            return false;
+        }
+
+        private bool TryResolveStorageUi(int mainTab, int subTab)
+        {
+            InventoryControlWrapper resolvedControl;
+            InventorySlotUiElement resolvedSlot;
+            if (ChartStorageUi.TryResolve(
+                mainTab,
+                subTab,
+                _storageControl,
+                _storageSlot,
+                out resolvedControl,
+                out resolvedSlot))
+            {
+                _storageControl = resolvedControl;
+                _storageSlot = resolvedSlot;
+                return true;
+            }
+
             return false;
         }
 
@@ -13015,21 +13369,42 @@ namespace AllflameBot
 
             AllflameLog.Info(
                 "CHART_STORAGE_SCAN_DONE|StoredUnique=" + _seenChartKeys.Count +
+                "|MainTabsVisited=" + CountVisitedMainTabs() +
+                "|PagesVisited=" + _visitedPages + "/15" +
+                "|RawItemsSeen=" + _rawItemsSeen +
+                "|NativeRequestedId=" + _nativeRequestedId +
+                "|NativeItems=" + _nativeItems +
+                "|ChartsMatched=" + _mappedChartKeys.Count +
+                "|ChartsSkipped=" + _skippedChartKeys.Count +
+                "|ChartsWithdrawn=" + _withdrawnCharts +
                 "|InventoryCharts=" + AllflameContext.InventoryChartCount +
                 "|Target=" + TargetInventoryCharts +
-                "|Mode=ProbeForwardWithdrawReverse" +
+                "|NativeBindFailed=" + _nativeBindFailed +
+                "|RawWithdrawFailed=" + _rawWithdrawFailed +
+                "|InventoryFull=" + _inventoryFull +
+                "|Mode=RawGridWithdrawForward" +
                 "|Tabs=" + settings.LastChartStorageScan);
 
             await Coroutines.CloseBlockingWindows();
             AllflameRunState.MarkChartStorageProbeCompleted();
-            if (AllflameContext.InventoryChartCount > 0)
+            bool hasInventoryCharts =
+                AllflameContext.InventoryChartCount > 0;
+            bool reachedTarget =
+                AllflameContext.InventoryChartCount >= TargetInventoryCharts;
+            bool stashTopUpEnabled =
+                settings.CheckVoyageStashFirst &&
+                !_inventoryFull;
+            if (hasInventoryCharts && reachedTarget)
             {
                 AllflameRunState.MarkStorageChecked();
                 AllflameLog.Info(
                     "CHART_STORAGE_SOURCE_RESULT" +
-                    "|Result=Success" +
-                    "|Withdrawn=" +
-                    AllflameContext.InventoryChartCount +
+                    "|Result=" + (_inventoryFull
+                        ? "PartialInventoryFull"
+                        : (_rawWithdrawFailed
+                            ? "PartialRawWithdrawFailed"
+                            : "Success")) +
+                    "|Withdrawn=" + _withdrawnCharts +
                     "|NextSource=None");
                 AllflameLog.Info(
                     "CHART_SUPPLY_SUCCESS" +
@@ -13037,11 +13412,54 @@ namespace AllflameBot
                     "|InventoryCharts=" +
                     AllflameContext.InventoryChartCount);
             }
+            else if (hasInventoryCharts && stashTopUpEnabled)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_SOURCE_RESULT" +
+                    "|Result=PartialNeedsVoyageStash" +
+                    "|Withdrawn=" + _withdrawnCharts +
+                    "|InventoryCharts=" +
+                    AllflameContext.InventoryChartCount +
+                    "|Target=" + TargetInventoryCharts +
+                    "|NextSource=VoyageStash");
+                AllflameLog.Info(
+                    "CHART_SUPPLY_FALLBACK" +
+                    "|From=ChartStorage" +
+                    "|To=VoyageStash" +
+                    "|Reason=BelowTarget" +
+                    "|Needed=" + Math.Max(
+                        0,
+                        TargetInventoryCharts -
+                        AllflameContext.InventoryChartCount));
+            }
+            else if (hasInventoryCharts)
+            {
+                AllflameRunState.MarkStorageChecked();
+                AllflameLog.Info(
+                    "CHART_STORAGE_SOURCE_RESULT" +
+                    "|Result=PartialSuccess" +
+                    "|Withdrawn=" + _withdrawnCharts +
+                    "|InventoryCharts=" +
+                    AllflameContext.InventoryChartCount +
+                    "|Target=" + TargetInventoryCharts +
+                    "|NextSource=None");
+            }
+            else if (_inventoryFull)
+            {
+                AllflameRunState.MarkStorageChecked();
+                AllflameLog.Info(
+                    "CHART_STORAGE_SOURCE_RESULT" +
+                    "|Result=InventoryFull" +
+                    "|Withdrawn=0" +
+                    "|NextSource=None");
+            }
             else
             {
                 AllflameLog.Info(
                     "CHART_STORAGE_SOURCE_RESULT" +
-                    "|Result=Empty" +
+                    "|Result=" + (_rawWithdrawFailed
+                        ? "RawWithdrawFailed"
+                        : "Empty") +
                     "|Withdrawn=0" +
                     "|NextSource=" +
                     (AllflameSettings.Instance.CheckVoyageStashFirst
@@ -13053,10 +13471,34 @@ namespace AllflameBot
                         "CHART_SUPPLY_FALLBACK" +
                         "|From=ChartStorage" +
                         "|To=VoyageStash" +
-                        "|Reason=Empty");
+                        "|Reason=" + (_rawWithdrawFailed
+                            ? "RawWithdrawFailed"
+                            : "Empty"));
                 }
             }
             ResetScan();
+        }
+
+        private int CountVisitedMainTabs()
+        {
+            int count = 0;
+            for (int main = 0; main < 3; main++)
+            {
+                bool visited = false;
+                for (int sub = 0; sub < 5; sub++)
+                {
+                    if (_pageCounts[main, sub] >= 0)
+                    {
+                        visited = true;
+                        break;
+                    }
+                }
+                if (visited)
+                {
+                    count++;
+                }
+            }
+            return count;
         }
 
         private async Task<bool> CompleteSourceFailure(string reason)
@@ -13102,6 +13544,8 @@ namespace AllflameBot
             _withdrawMainTab = -1;
             _withdrawSubTab = -1;
             _seenChartKeys.Clear();
+            _mappedChartKeys.Clear();
+            _skippedChartKeys.Clear();
             _storageControl = null;
             _storageSlot = null;
             _scanAfterUtc = DateTime.MinValue;
@@ -13111,6 +13555,14 @@ namespace AllflameBot
             _tabFailures = 0;
             _activeMainTab = -1;
             _activeSubTab = -1;
+            _visitedPages = 0;
+            _withdrawnCharts = 0;
+            _rawItemsSeen = 0;
+            _nativeItems = 0;
+            _nativeRequestedId = -1;
+            _nativeBindFailed = false;
+            _rawWithdrawFailed = false;
+            _inventoryFull = false;
         }
     }
 
@@ -14246,24 +14698,29 @@ namespace AllflameBot
 
     internal static class ChartStorageUi
     {
-        private const int MaximumVisitedElements = 600;
-
-        private sealed class StorageGridCandidate
-        {
-            public float Left;
-            public InventoryControlWrapper Control;
-            public InventorySlotUiElement Slot;
-            public string Path;
-            public int Score;
-            public int RawItems;
-            public HashSet<int> RawKeys;
-        }
-
-        private static int _cachedServerInventoryId = -1;
-        private static DateTime _nextServerInventoryProbeUtc = DateTime.MinValue;
-        private static int _lastServerProbeRawItems = -1;
+        private const int ChartStorageServerInventoryId = 151;
+        private static int _cachedRequestedInventoryId = -1;
+        private static DateTime _nextDynamicInventoryProbeUtc =
+            DateTime.MinValue;
 
         public static bool TryResolve(
+            InventoryControlWrapper cachedControl,
+            InventorySlotUiElement cachedSlot,
+            out InventoryControlWrapper control,
+            out InventorySlotUiElement slot)
+        {
+            return TryResolve(
+                -1,
+                -1,
+                cachedControl,
+                cachedSlot,
+                out control,
+                out slot);
+        }
+
+        public static bool TryResolve(
+            int mainTab,
+            int subTab,
             InventoryControlWrapper cachedControl,
             InventorySlotUiElement cachedSlot,
             out InventoryControlWrapper control,
@@ -14272,7 +14729,10 @@ namespace AllflameBot
             control = null;
             slot = null;
 
-            if (IsUsable(cachedControl, cachedSlot))
+            if (mainTab < 0 &&
+                subTab < 0 &&
+                cachedControl != null &&
+                IsUsable(cachedSlot))
             {
                 control = cachedControl;
                 slot = cachedSlot;
@@ -14285,68 +14745,84 @@ namespace AllflameBot
                 return false;
             }
 
-            var candidates = new List<StorageGridCandidate>();
-            var addresses = new HashSet<long>();
-            var signatures = new List<string>();
-            int visited = 0;
-            int rawSlotAttempts = 0;
-            int validRawSlots = 0;
-            Vector2i rootCenter = storageRoot.CenterClickLocation();
-            CollectCandidates(
-                storageRoot,
-                "root",
-                candidates,
-                addresses,
-                signatures,
-                rootCenter,
-                ref visited,
-                ref rawSlotAttempts,
-                ref validRawSlots);
-
-            var best = candidates
-                .OrderByDescending(candidate =>
-                    candidate.Score)
-                .ThenBy(candidate => candidate.Left)
-                .FirstOrDefault();
-            if (best == null)
+            int resolvedMain;
+            int resolvedSub;
+            Element pageLayer;
+            if (!TryFindPageLayer(
+                    storageRoot,
+                    mainTab,
+                    subTab,
+                    out resolvedMain,
+                    out resolvedSub,
+                    out pageLayer))
             {
                 AllflameLog.Throttled(
                     "chart_storage_control_missing",
                     TimeSpan.FromSeconds(3),
-                    "CHART_STORAGE_GRID_RESOLVE_FAILED" +
-                    "|Visited=" + visited +
-                    "|RawSlotAttempts=" + rawSlotAttempts +
-                    "|ValidRawSlots=" + validRawSlots +
-                    "|Candidates=0" +
+                    "CHART_STORAGE_PAGE_RESOLVE_FAILED" +
+                    "|RequestedMain=" + (mainTab + 1) +
+                    "|RequestedSub=" + (subTab + 1) +
                     "|Window=ChartStorage" +
-                    "|Signatures=" +
-                    String.Join(",", signatures.ToArray()));
+                    "|Root=" + FormatAddress(storageRoot));
                 return false;
             }
 
-            control = best.Control;
-            slot = best.Slot;
-            Inventory serverInventory;
-            bool nativeBound = TryBindServerInventory(
-                control,
-                best.RawKeys,
-                out serverInventory);
+            try
+            {
+                slot = new InventorySlotUiElement(
+                    pageLayer.Address,
+                    StashType.NormalStash);
+                if (slot == null || !slot.IsValid || !slot.IsVisible)
+                {
+                    control = null;
+                    slot = null;
+                    return false;
+                }
+                control = new InventoryControlWrapper();
+                control.SetInventorySlotUi(slot, StashType.NormalStash);
+            }
+            catch
+            {
+                control = null;
+                slot = null;
+                return false;
+            }
+
+            List<KeyValuePair<int, Element>> rawItems =
+                GetRawItemElements(slot);
+            int dictionaryEntries = GetRawDictionaryCount(slot);
+            Inventory serverInventory = null;
+            const bool nativeBound = false;
             AllflameLog.Throttled(
                 "chart_storage_control_found",
                 TimeSpan.FromSeconds(3),
-                "CHART_STORAGE_RAW_GRID|Found=True|Address=0x" +
+                "CHART_STORAGE_PAGE_LAYER|Found=True|Address=0x" +
                 slot.Address.ToString("X") +
                 "|Size=" + slot.Size.X + "x" + slot.Size.Y +
-                "|RawItems=" + best.RawItems +
+                "|Main=" + (resolvedMain + 1) +
+                "|Sub=" + (resolvedSub + 1) +
+                "|RawItems=" + rawItems.Count +
+                "|DictionaryEntries=" + dictionaryEntries +
+                "|AcceptedRawItems=" + rawItems.Count +
+                "|RejectedInvalid=" +
+                Math.Max(0, dictionaryEntries - rawItems.Count) +
+                "|RejectedSize=0" +
                 "|NativeBound=" + nativeBound +
-                "|ServerInventoryId=" + (serverInventory == null
+                "|RequestedInventoryId=" +
+                ChartStorageServerInventoryId +
+                "|ResolvedInventoryId=" + (serverInventory == null
                     ? -1
                     : serverInventory.Id) +
-                "|Candidates=" + candidates.Count +
-                "|Path=" + best.Path +
-                "|Slot=" + (int)slot.Width + "x" + (int)slot.Height +
-                "|Score=" + best.Score);
+                "|Path=2/0/1/" + resolvedMain +
+                "/0/1/" + resolvedSub + "/0" +
+                "|Slot=" + (int)slot.Width + "x" +
+                (int)slot.Height);
             return true;
+        }
+
+        public static int BoundRequestedInventoryId
+        {
+            get { return _cachedRequestedInventoryId; }
         }
 
         public static List<KeyValuePair<int, Element>> GetRawItemElements(
@@ -14363,9 +14839,6 @@ namespace AllflameBot
                     return output;
                 }
 
-                Vector2i center = slot.CenterClickLocation();
-                float halfWidth = Math.Max(1f, slot.Width / 2f);
-                float halfHeight = Math.Max(1f, slot.Height / 2f);
                 foreach (KeyValuePair<int, Element> pair in
                     slot.DictionaryIdElements)
                 {
@@ -14376,14 +14849,7 @@ namespace AllflameBot
                     {
                         continue;
                     }
-                    Vector2i itemCenter = element.CenterClickLocation();
-                    if (itemCenter.X < center.X - halfWidth ||
-                        itemCenter.X > center.X + halfWidth ||
-                        itemCenter.Y < center.Y - halfHeight ||
-                        itemCenter.Y > center.Y + halfHeight)
-                    {
-                        continue;
-                    }
+                    element.CenterClickLocation();
                     output.Add(pair);
                 }
             }
@@ -14409,7 +14875,7 @@ namespace AllflameBot
 
             Element button = SafeChild(
                 root,
-                2, 0, 0, 0, 0, mainTab);
+                2, 0, 0, 0, mainTab);
             bool clicked = Click(button);
             AllflameLog.Info(
                 "CHART_STORAGE_TAB_CLICK" +
@@ -14436,31 +14902,137 @@ namespace AllflameBot
                 return false;
             }
 
-            Element numericButton;
-            if (TryFindNumericTabButton(
+            Element button;
+            if (!TryFindSubTabButton(
                     root,
-                    5,
+                    mainTab,
                     subTab,
-                    false,
-                    out numericButton))
+                    out button))
             {
-                bool numericClicked = Click(numericButton);
                 AllflameLog.Info(
                     "CHART_STORAGE_TAB_CLICK" +
                     "|Level=Sub" +
                     "|Main=" + (mainTab + 1) +
                     "|Sub=" + (subTab + 1) +
-                    "|Mode=NumericRow" +
-                    "|Clicked=" + numericClicked +
-                    "|Address=" + FormatAddress(numericButton) +
-                    "|Geometry=" + FormatGeometry(numericButton));
-                return numericClicked;
+                    "|Mode=Unresolved" +
+                    "|Clicked=False|Address=0x0");
+                return false;
+            }
+
+            bool clicked = Click(button);
+            AllflameLog.Info(
+                "CHART_STORAGE_TAB_CLICK" +
+                "|Level=Sub" +
+                "|Main=" + (mainTab + 1) +
+                "|Sub=" + (subTab + 1) +
+                "|Mode=MainPageButtonsContainer" +
+                "|Clicked=" + clicked +
+                "|Address=" + FormatAddress(button));
+            return clicked;
+        }
+
+        public static bool IsMainTabActive(int mainTab)
+        {
+            if (mainTab < 0 || mainTab > 2)
+            {
+                return false;
+            }
+            Element root;
+            return TryFindStorageRoot(out root) &&
+                IsMainTabActive(root, mainTab);
+        }
+
+        public static bool IsPageActive(int mainTab, int subTab)
+        {
+            if (mainTab < 0 || mainTab > 2 ||
+                subTab < 0 || subTab > 4)
+            {
+                return false;
+            }
+            Element root;
+            if (!TryFindStorageRoot(out root))
+            {
+                return false;
+            }
+            return IsMainTabActive(root, mainTab) &&
+                IsSubTabActive(root, mainTab, subTab);
+        }
+
+        public static string GetSelectionDiagnostics(
+            int mainTab,
+            int subTab)
+        {
+            Element root;
+            if (!TryFindStorageRoot(out root))
+            {
+                return "MainEnabled=False" +
+                    "|SelectedSubAddress=0x0" +
+                    "|ExpectedSubAddress=0x0";
+            }
+
+            Element expected;
+            TryFindSubTabButton(
+                root,
+                mainTab,
+                subTab,
+                out expected);
+            Element selected = SafeChild(
+                root,
+                2, 0, 1, mainTab, 0, 0, 5);
+            return "MainEnabled=" +
+                IsMainTabActive(root, mainTab) +
+                "|SelectedSubAddress=" + FormatAddress(selected) +
+                "|ExpectedSubAddress=" + FormatAddress(expected);
+        }
+
+        private static bool IsMainTabActive(
+            Element root,
+            int mainTab)
+        {
+            return IsEnabled(SafeChild(
+                root,
+                2, 0, 0, 0, mainTab));
+        }
+
+        private static bool IsSubTabActive(
+            Element root,
+            int mainTab,
+            int subTab)
+        {
+            Element expected;
+            if (!IsMainTabActive(root, mainTab) ||
+                !TryFindSubTabButton(
+                    root,
+                    mainTab,
+                    subTab,
+                    out expected))
+            {
+                return false;
+            }
+
+            Element selected = SafeChild(
+                root,
+                2, 0, 1, mainTab, 0, 0, 5);
+            return SameAddress(expected, selected);
+        }
+
+        private static bool TryFindSubTabButton(
+            Element root,
+            int mainTab,
+            int subTab,
+            out Element button)
+        {
+            button = null;
+            if (root == null ||
+                mainTab < 0 || mainTab > 2 ||
+                subTab < 0 || subTab > 4)
+            {
+                return false;
             }
 
             Element container = SafeChild(
                 root,
                 2, 0, 1, mainTab, 0, 0);
-            string wanted = (subTab + 1).ToString();
             List<Element> buttons;
             try
             {
@@ -14472,43 +15044,79 @@ namespace AllflameBot
             {
                 return false;
             }
-
             if (buttons == null)
             {
                 return false;
             }
 
-            foreach (Element button in buttons)
+            string wanted = (subTab + 1).ToString();
+            foreach (Element candidate in buttons)
             {
                 try
                 {
-                    Element label =
-                        button.FindTextInElementChildrens(wanted);
-                    if (label != null && Click(button))
+                    if (candidate != null &&
+                        candidate.IsValid &&
+                        candidate.FindTextInElementChildrens(wanted) != null)
                     {
-                        AllflameLog.Info(
-                            "CHART_STORAGE_TAB_CLICK" +
-                            "|Level=Sub" +
-                            "|Main=" + (mainTab + 1) +
-                            "|Sub=" + (subTab + 1) +
-                            "|Mode=DirectPath" +
-                            "|Clicked=True" +
-                            "|Address=" + FormatAddress(button));
+                        button = candidate;
                         return true;
                     }
                 }
                 catch
                 {
-                    // Ignore malformed button branches.
+                    // Ignore the fade bar and malformed button branches.
                 }
             }
-            AllflameLog.Info(
-                "CHART_STORAGE_TAB_CLICK" +
-                "|Level=Sub" +
-                "|Main=" + (mainTab + 1) +
-                "|Sub=" + (subTab + 1) +
-                "|Mode=Unresolved" +
-                "|Clicked=False|Address=0x0");
+            return false;
+        }
+
+        private static bool TryFindPageLayer(
+            Element root,
+            int requestedMain,
+            int requestedSub,
+            out int mainTab,
+            out int subTab,
+            out Element pageLayer)
+        {
+            mainTab = -1;
+            subTab = -1;
+            pageLayer = null;
+            int firstMain = requestedMain >= 0 ? requestedMain : 0;
+            int lastMain = requestedMain >= 0 ? requestedMain : 2;
+            int firstSub = requestedSub >= 0 ? requestedSub : 0;
+            int lastSub = requestedSub >= 0 ? requestedSub : 4;
+            for (int main = firstMain; main <= lastMain; main++)
+            {
+                if (!IsMainTabActive(root, main))
+                {
+                    continue;
+                }
+                Element pagesContainer = SafeChild(
+                    root,
+                    2, 0, 1, main, 0, 1);
+                if (!HasChildCount(pagesContainer, 5))
+                {
+                    continue;
+                }
+                for (int sub = firstSub; sub <= lastSub; sub++)
+                {
+                    if (!IsSubTabActive(root, main, sub))
+                    {
+                        continue;
+                    }
+                    Element layer = SafeChild(
+                        root,
+                        2, 0, 1, main, 0, 1, sub, 0);
+                    if (!IsVisible(layer))
+                    {
+                        continue;
+                    }
+                    mainTab = main;
+                    subTab = sub;
+                    pageLayer = layer;
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -14521,12 +15129,30 @@ namespace AllflameBot
                 return false;
             }
 
+            var seenAddresses = new HashSet<string>(
+                StringComparer.Ordinal);
             // Only inspect each top-level element and its direct children.
             // The Chart Storage window exposes child 1 as
             // id=label_title, text=Chart Storage.
             foreach (Element root in roots)
             {
                 if (root == null)
+                {
+                    continue;
+                }
+                if (!seenAddresses.Add(FormatAddress(root)))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (!root.IsValid || !root.IsVisible)
+                    {
+                        continue;
+                    }
+                }
+                catch
                 {
                     continue;
                 }
@@ -14561,6 +15187,15 @@ namespace AllflameBot
                                 "Chart Storage",
                                 StringComparison.OrdinalIgnoreCase))
                         {
+                            Element clientArea = SafeChild(root, 2);
+                            if (clientArea == null ||
+                                !String.Equals(
+                                    clientArea.IdLabel,
+                                    "client_area",
+                                    StringComparison.OrdinalIgnoreCase))
+                            {
+                                continue;
+                            }
                             storageRoot = root;
                             return true;
                         }
@@ -14574,114 +15209,81 @@ namespace AllflameBot
             return false;
         }
 
-        private static bool TryFindNumericTabButton(
-            Element root,
-            int expectedCount,
-            int selectedIndex,
-            bool upperRow,
-            out Element button)
+        private static int GetRawDictionaryCount(
+            InventorySlotUiElement slot)
         {
-            button = null;
-            var labels = new List<Tuple<int, Element, Vector2i>>();
-            var queue = new Queue<Element>();
-            var addresses = new HashSet<long>();
-            queue.Enqueue(root);
-            int visited = 0;
-            while (queue.Count > 0 && visited < MaximumVisitedElements)
+            try
             {
-                Element element = queue.Dequeue();
-                if (element == null)
-                {
-                    continue;
-                }
-                visited++;
-                try
-                {
-                    if (element.IsValid &&
-                        element.IsVisible &&
-                        addresses.Add(element.Address))
-                    {
-                        int number;
-                        string text =
-                            (element.Text ?? String.Empty).Trim();
-                        if (Int32.TryParse(text, out number) &&
-                            number >= 1 &&
-                            number <= expectedCount)
-                        {
-                            Vector2i center =
-                                element.CenterClickLocation();
-                            bool duplicate = labels.Any(candidate =>
-                                candidate.Item1 == number &&
-                                candidate.Item3.DistanceF(center) <= 4f);
-                            if (!duplicate)
-                            {
-                                labels.Add(
-                                    Tuple.Create(number, element, center));
-                            }
-                        }
-                    }
-                }
-                catch
-                {
-                    // Continue through malformed UI branches.
-                }
-
-                List<Element> children = null;
-                try
-                {
-                    children = element.Children;
-                }
-                catch
-                {
-                    children = null;
-                }
-                if (children != null)
-                {
-                    foreach (Element child in children)
-                    {
-                        queue.Enqueue(child);
-                    }
-                }
+                return slot == null ||
+                    slot.DictionaryIdElements == null
+                        ? 0
+                        : slot.DictionaryIdElements.Count;
             }
-
-            var rows = new List<List<Tuple<int, Element, Vector2i>>>();
-            foreach (Tuple<int, Element, Vector2i> label in
-                labels.OrderBy(candidate => candidate.Item3.Y))
+            catch
             {
-                List<Tuple<int, Element, Vector2i>> row =
-                    rows.FirstOrDefault(candidate =>
-                        Math.Abs(
-                            candidate.Average(item => item.Item3.Y) -
-                            label.Item3.Y) <= 24f);
-                if (row == null)
-                {
-                    row = new List<Tuple<int, Element, Vector2i>>();
-                    rows.Add(row);
-                }
-                row.Add(label);
+                return 0;
             }
+        }
 
-            List<Tuple<int, Element, Vector2i>> selectedRow = rows
-                .Where(row =>
-                    row.Select(candidate => candidate.Item1)
-                        .Distinct()
-                        .Count() == expectedCount)
-                .OrderBy(row => upperRow
-                    ? row.Average(candidate => candidate.Item3.Y)
-                    : -row.Average(candidate => candidate.Item3.Y))
-                .FirstOrDefault();
-            if (selectedRow == null)
+        private static bool IsEnabled(Element element)
+        {
+            try
+            {
+                return element != null &&
+                    element.IsValid &&
+                    element.IsVisible &&
+                    element.IsEnable;
+            }
+            catch
             {
                 return false;
             }
+        }
 
-            int wanted = selectedIndex + 1;
-            Tuple<int, Element, Vector2i> selected = selectedRow
-                .Where(candidate => candidate.Item1 == wanted)
-                .OrderBy(candidate => candidate.Item3.X)
-                .FirstOrDefault();
-            button = selected == null ? null : selected.Item2;
-            return button != null;
+        private static bool SameAddress(
+            Element first,
+            Element second)
+        {
+            try
+            {
+                return first != null &&
+                    second != null &&
+                    first.IsValid &&
+                    second.IsValid &&
+                    first.Address == second.Address;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsVisible(Element element)
+        {
+            try
+            {
+                return element != null &&
+                    element.IsValid &&
+                    element.IsVisible;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool HasChildCount(Element element, int expected)
+        {
+            try
+            {
+                return IsVisible(element) &&
+                    element.Children != null &&
+                    element.Children.Count == expected;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static string FormatAddress(Element element)
@@ -14756,155 +15358,14 @@ namespace AllflameBot
             }
         }
 
-        private static void CollectCandidates(
-            Element element,
-            string path,
-            IList<StorageGridCandidate> candidates,
-            ISet<long> addresses,
-            IList<string> signatures,
-            Vector2i rootCenter,
-            ref int visited,
-            ref int rawSlotAttempts,
-            ref int validRawSlots)
-        {
-            if (element == null ||
-                visited >= MaximumVisitedElements)
-            {
-                return;
-            }
-
-            visited++;
-            try
-            {
-                if (element.IsValid)
-                {
-                    rawSlotAttempts++;
-                    var rawSlot = new InventorySlotUiElement(
-                        element.Address,
-                        StashType.NormalStash);
-                    if (rawSlot.IsValid && rawSlot.IsVisible)
-                    {
-                        validRawSlots++;
-                        Vector2i size = rawSlot.Size;
-                        bool storageShape =
-                            (size.X == 12 && size.Y == 5) ||
-                            (size.X == 5 && size.Y == 12);
-                        List<KeyValuePair<int, Element>> rawItems =
-                            storageShape
-                                ? GetRawItemElements(rawSlot)
-                                : new List<KeyValuePair<int, Element>>();
-                        if (storageShape && signatures.Count < 20)
-                        {
-                            signatures.Add(
-                                "0x" + rawSlot.Address.ToString("X") +
-                                "@" + path +
-                                ":size=" + size.X + "x" + size.Y +
-                                ":pixels=" + (int)rawSlot.Width + "x" +
-                                (int)rawSlot.Height +
-                                ":items=" + rawItems.Count);
-                        }
-                        if (storageShape &&
-                            rawSlot.DictionaryIdElements != null &&
-                            addresses.Add(rawSlot.Address))
-                        {
-                            Vector2i center =
-                                rawSlot.CenterClickLocation();
-                            float left =
-                                center.X - rawSlot.Width / 2f;
-                            float aspect =
-                                rawSlot.Width /
-                                Math.Max(1f, rawSlot.Height);
-                            bool expectedGeometry =
-                                rawSlot.Width >= 260f &&
-                                rawSlot.Width <= 1100f &&
-                                rawSlot.Height >= 100f &&
-                                rawSlot.Height <= 600f &&
-                                aspect >= 1.7f &&
-                                aspect <= 3.4f;
-                            if (expectedGeometry)
-                            {
-                                var wrapper = new InventoryControlWrapper();
-                                wrapper.SetInventorySlotUi(
-                                    rawSlot,
-                                    StashType.NormalStash);
-                                candidates.Add(
-                                    new StorageGridCandidate
-                                    {
-                                        Left = left,
-                                        Control = wrapper,
-                                        Slot = rawSlot,
-                                        Path = path,
-                                        RawItems = rawItems.Count,
-                                        RawKeys = new HashSet<int>(
-                                            rawItems.Select(pair => pair.Key)),
-                                        Score =
-                                            1000 +
-                                            (center.Y <= rootCenter.Y ? 100 : 0) +
-                                            rawItems.Count * 20 +
-                                            (size.X == 12 && size.Y == 5
-                                                ? 200
-                                                : 0)
-                                    });
-                            }
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // Most GUI elements are not inventory controls.
-            }
-
-            List<Element> children = null;
-            try
-            {
-                children = element.Children;
-            }
-            catch
-            {
-                children = null;
-            }
-
-            if (children == null)
-            {
-                return;
-            }
-
-            for (int index = 0; index < children.Count; index++)
-            {
-                Element child = children[index];
-                CollectCandidates(
-                    child,
-                    path + "/" + index,
-                    candidates,
-                    addresses,
-                    signatures,
-                    rootCenter,
-                    ref visited,
-                    ref rawSlotAttempts,
-                    ref validRawSlots);
-                if (visited >= MaximumVisitedElements)
-                {
-                    return;
-                }
-            }
-        }
-
-        private static bool IsUsable(
-            InventoryControlWrapper control,
-            InventorySlotUiElement slot)
+        private static bool IsUsable(InventorySlotUiElement slot)
         {
             try
             {
-                return control != null &&
-                       slot != null &&
+                return slot != null &&
                        slot.IsValid &&
                        slot.IsVisible &&
-                       ((slot.Size.X == 12 && slot.Size.Y == 5) ||
-                        (slot.Size.X == 5 && slot.Size.Y == 12)) &&
-                       slot.Width >= 260f &&
-                       slot.Height >= 100f &&
-                       slot.Width / Math.Max(1f, slot.Height) >= 1.7f;
+                       slot.DictionaryIdElements != null;
             }
             catch
             {
@@ -14918,106 +15379,186 @@ namespace AllflameBot
             out Inventory inventory)
         {
             inventory = null;
-            int rawItemCount = rawKeys == null ? 0 : rawKeys.Count;
             if (control == null)
             {
                 return false;
             }
 
-            if (_cachedServerInventoryId >= 0)
+            var preferredIds = new List<int>();
+            if (_cachedRequestedInventoryId >= 0)
             {
-                Inventory cached = GetPlayerInventoryById(
-                    _cachedServerInventoryId);
-                if (MatchesRawGrid(cached, rawKeys))
+                preferredIds.Add(_cachedRequestedInventoryId);
+            }
+            if (!preferredIds.Contains(ChartStorageServerInventoryId))
+            {
+                preferredIds.Add(ChartStorageServerInventoryId);
+            }
+
+            foreach (int requestedId in preferredIds)
+            {
+                Inventory preferred;
+                if (TryAcceptInventory(
+                        requestedId,
+                        rawKeys,
+                        true,
+                        out preferred))
                 {
-                    control.SetInventory(cached);
-                    inventory = cached;
+                    _cachedRequestedInventoryId = requestedId;
+                    control.SetInventory(preferred);
+                    inventory = preferred;
                     return true;
+                }
+                if (requestedId == _cachedRequestedInventoryId)
+                {
+                    _cachedRequestedInventoryId = -1;
                 }
             }
 
-            bool gainedUsefulRawData = rawItemCount > 0 &&
-                _lastServerProbeRawItems <= 0;
-            if (!gainedUsefulRawData &&
-                DateTime.UtcNow < _nextServerInventoryProbeUtc)
+            if (DateTime.UtcNow < _nextDynamicInventoryProbeUtc)
             {
                 return false;
             }
-            _nextServerInventoryProbeUtc = DateTime.UtcNow.AddSeconds(2);
-            _lastServerProbeRawItems = rawItemCount;
-
-            int playerInventoryId = -1;
-            try
-            {
-                InventoryControlWrapper playerControl =
-                    LokiPoe.InGameState.InventoryUi.InventoryControl_Main;
-                if (playerControl != null &&
-                    playerControl.Inventory != null)
-                {
-                    playerInventoryId = playerControl.Inventory.Id;
-                }
-            }
-            catch
-            {
-                playerInventoryId = -1;
-            }
+            _nextDynamicInventoryProbeUtc =
+                DateTime.UtcNow.AddSeconds(2);
 
             Inventory best = null;
+            int bestRequestedId = -1;
             int bestScore = Int32.MinValue;
-            for (int id = 0; id <= 255; id++)
+            for (int requestedId = 0; requestedId <= 255; requestedId++)
             {
-                Inventory candidate = GetPlayerInventoryById(id);
-                if (candidate == null ||
-                    !candidate.IsValid ||
-                    candidate.Id == playerInventoryId ||
-                    !IsStorageInventoryShape(candidate))
+                Inventory candidate;
+                int score;
+                if (!TryAcceptInventory(
+                        requestedId,
+                        rawKeys,
+                        false,
+                        out candidate,
+                        out score) ||
+                    score <= bestScore)
                 {
                     continue;
                 }
-
-                List<Item> items = candidate.Items ?? new List<Item>();
-                int charts = items.Count(AllflameContext.IsChartItem);
-                int keyMatches = CountRawKeyMatches(items, rawKeys);
-                AllflameLog.Info(
-                    "CHART_STORAGE_SERVER_INVENTORY_PROBE" +
-                    "|Id=" + candidate.Id +
-                    "|Requested=" + candidate.IsRequested +
-                    "|Rows=" + candidate.Rows +
-                    "|Columns=" + candidate.Columns +
-                    "|Items=" + items.Count +
-                    "|Charts=" + charts +
-                    "|KeyMatches=" + keyMatches +
-                    "|RawItems=" + rawItemCount);
-
-                if (rawItemCount <= 0 ||
-                    items.Count != rawItemCount ||
-                    charts != items.Count ||
-                    keyMatches <= 0)
-                {
-                    continue;
-                }
-                int score =
-                    (candidate.IsRequested ? 1000 : 0) +
-                    keyMatches * 100 +
-                    charts * 20 +
-                    (candidate.Rows == 5 && candidate.Columns == 12
-                        ? 100
-                        : 0);
-                if (score > bestScore)
-                {
-                    best = candidate;
-                    bestScore = score;
-                }
+                best = candidate;
+                bestRequestedId = requestedId;
+                bestScore = score;
             }
 
             if (best == null)
             {
+                AllflameLog.Info(
+                    "CHART_STORAGE_NATIVE_BIND_TIMEOUT" +
+                    "|Scanned=0-255" +
+                    "|RawItems=" + (rawKeys == null
+                        ? 0
+                        : rawKeys.Count));
                 return false;
             }
-            _cachedServerInventoryId = best.Id;
+
+            _cachedRequestedInventoryId = bestRequestedId;
             control.SetInventory(best);
             inventory = best;
+            AllflameLog.Info(
+                "CHART_STORAGE_NATIVE_BOUND" +
+                "|RequestedId=" + bestRequestedId +
+                "|ResolvedId=" + best.Id +
+                "|Mode=DynamicScan" +
+                "|Items=" + (best.Items == null ? 0 : best.Items.Count));
             return true;
+        }
+
+        private static bool TryAcceptInventory(
+            int requestedId,
+            ISet<int> rawKeys,
+            bool logRejected,
+            out Inventory inventory)
+        {
+            int ignoredScore;
+            return TryAcceptInventory(
+                requestedId,
+                rawKeys,
+                logRejected,
+                out inventory,
+                out ignoredScore);
+        }
+
+        private static bool TryAcceptInventory(
+            int requestedId,
+            ISet<int> rawKeys,
+            bool logRejected,
+            out Inventory inventory,
+            out int score)
+        {
+            inventory = GetPlayerInventoryById(requestedId);
+            score = Int32.MinValue;
+            try
+            {
+                List<Item> items = inventory == null ||
+                    inventory.Items == null
+                        ? new List<Item>()
+                        : inventory.Items;
+                int rawItemCount = rawKeys == null ? 0 : rawKeys.Count;
+                int charts = items.Count(AllflameContext.IsChartItem);
+                int keyMatches = CountRawKeyMatches(items, rawKeys);
+                bool valid = inventory != null && inventory.IsValid;
+                bool shape = valid && IsStorageInventoryShape(inventory);
+                bool onlyCharts = items.Count > 0 && charts == items.Count;
+                bool keysMatched = rawItemCount == 0 ||
+                    keyMatches == rawItemCount;
+                bool accepted = valid &&
+                    shape &&
+                    onlyCharts &&
+                    keysMatched;
+                if (logRejected || shape)
+                {
+                    AllflameLog.Info(
+                        (accepted
+                            ? "CHART_STORAGE_NATIVE_PROBE"
+                            : "CHART_STORAGE_NATIVE_CANDIDATE_REJECTED") +
+                        "|RequestedId=" + requestedId +
+                        "|CandidateNull=" + (inventory == null) +
+                        "|ResolvedId=" + (inventory == null
+                            ? -1
+                            : inventory.Id) +
+                        "|Valid=" + valid +
+                        "|Requested=" + (inventory != null &&
+                            inventory.IsRequested) +
+                        "|Rows=" + (inventory == null
+                            ? -1
+                            : inventory.Rows) +
+                        "|Columns=" + (inventory == null
+                            ? -1
+                            : inventory.Columns) +
+                        "|Items=" + items.Count +
+                        "|Charts=" + charts +
+                        "|KeyMatches=" + keyMatches +
+                        "|RawItems=" + rawItemCount +
+                        "|Accepted=" + accepted);
+                }
+                if (!accepted)
+                {
+                    inventory = null;
+                    return false;
+                }
+                score =
+                    (inventory.IsRequested ? 1000 : 0) +
+                    keyMatches * 100 +
+                    items.Count;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (logRejected)
+                {
+                    AllflameLog.Info(
+                        "CHART_STORAGE_NATIVE_CANDIDATE_REJECTED" +
+                        "|RequestedId=" + requestedId +
+                        "|Reason=" + ex.GetType().Name +
+                        "|Message=" +
+                        (ex.Message ?? String.Empty).Replace("|", "/"));
+                }
+                inventory = null;
+                return false;
+            }
         }
 
         private static Inventory GetPlayerInventoryById(int id)
@@ -15032,31 +15573,6 @@ namespace AllflameBot
             }
         }
 
-        private static bool MatchesRawGrid(
-            Inventory inventory,
-            ISet<int> rawKeys)
-        {
-            try
-            {
-                int rawItemCount = rawKeys == null ? 0 : rawKeys.Count;
-                if (inventory == null ||
-                    !inventory.IsValid ||
-                    !IsStorageInventoryShape(inventory) ||
-                    inventory.Items == null ||
-                    inventory.Items.Count != rawItemCount)
-                {
-                    return false;
-                }
-                return rawItemCount == 0 ||
-                    (inventory.Items.All(AllflameContext.IsChartItem) &&
-                     CountRawKeyMatches(inventory.Items, rawKeys) > 0);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         private static int CountRawKeyMatches(
             IEnumerable<Item> items,
             ISet<int> rawKeys)
@@ -15067,17 +15583,15 @@ namespace AllflameBot
             }
             return items.Count(item =>
                 item != null &&
-                (rawKeys.Contains(item.LocalId) ||
-                 rawKeys.Contains(item.Id)));
+                item.LocalId != 0 &&
+                rawKeys.Contains(item.LocalId));
         }
 
         public static bool IsStorageInventoryShape(Inventory inventory)
         {
             return inventory != null &&
-                ((inventory.Rows == 5 &&
-                  inventory.Columns == 12) ||
-                 (inventory.Rows == 12 &&
-                  inventory.Columns == 5));
+                inventory.Rows == 1 &&
+                inventory.Columns == 60;
         }
 
     }
