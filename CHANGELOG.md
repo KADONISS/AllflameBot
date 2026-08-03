@@ -2,6 +2,47 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.137 - 2026-08-04
+
+- Replace the exhausted-Lantern coverage, reserved-Capsule and breadcrumb
+  rescue routes with an immutable return chain built only from Capsules the
+  player actually approached within 25 units during exploration.
+- Order the return chain from the nearest cached Capsule toward the Capsule
+  nearest the Voyage spawn, keeping the spawn Capsule as the final attempt.
+- Interact with each cached Capsule exactly once, inspect only new chat lines
+  for the `Capsule ... not lit` response and advance permanently to the next
+  cached target when rejected or when no UI outcome is observed.
+- Preserve the existing Capsule UI, Call Bathysphere and extraction handling
+  after a cached Capsule opens successfully, while bypassing all Lantern
+  coverage checks for the return chain and its confirmed UI.
+- Bound each approach with convergence tracking and at most two pather reloads,
+  bound the complete return chain to 120 seconds and create a controlled
+  `VoyageCapsuleReturnExhausted` recovery stop when no cached Capsule succeeds.
+- Add `CAPSULE_CACHE_*` and `CAPSULE_RETURN_*` diagnostics for discovery,
+  confirmation, frozen ordering, movement, one-shot interaction, chat outcome,
+  recovery, success and exhaustion.
+
+## 0.23.136 - 2026-08-04
+
+- Accelerate Chart Storage reads by advancing through already-active Main and
+  Sub tabs in the same observation cycle, starting page-signature validation
+  immediately and shortening the stable-empty confirmation window.
+- Move normal stash items through DPB `InventoryControlWrapper.FastMove`,
+  confirm transfers from a fresh inventory snapshot and retain bounded
+  Ctrl-right-click fallback for rejected API transfers.
+- Reduce verified stash open, tab-switch and default per-item transfer delays;
+  migrate only the previous untouched `250-380 ms` defaults so custom user
+  timings remain unchanged.
+- Prepare and warm up the pather before Deepwater chest movement, ignore path
+  failures during that window and adopt a pather loaded by an earlier task
+  instead of reloading it a second time.
+- Rate-limit chest path-failure counting and perform at most two pather/mover
+  recoveries before an actually unreachable chest is skipped, preventing a
+  newly discovered `Message in a Bottle` from being discarded within a few
+  hundred milliseconds of entering a Chart Area.
+- Add `CHEST_PATHFINDER_*`, `CHEST_PATH_RECOVERY` and
+  `STASH_ITEM_TRANSFER_ISSUED` diagnostics for runtime verification.
+
 ## 0.23.135 - 2026-08-04
 
 - Add a mandatory final Capsule approach for exhausted-Lantern Voyages when a

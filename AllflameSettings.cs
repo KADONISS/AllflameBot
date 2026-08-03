@@ -218,7 +218,7 @@ namespace AllflameBot
             {
                 ApplyRecommendedDefaults();
             }
-            else if (SettingsSchemaVersion < 40)
+            else if (SettingsSchemaVersion < 41)
             {
                 int oldSchema = SettingsSchemaVersion;
                 if (oldSchema < 3)
@@ -400,7 +400,14 @@ namespace AllflameBot
                 {
                     NotifySecretBottleRewards = true;
                 }
-                SettingsSchemaVersion = 40;
+                if (oldSchema < 41 &&
+                    ItemTransferDelayMinMilliseconds == 250 &&
+                    ItemTransferDelayMaxMilliseconds == 380)
+                {
+                    ItemTransferDelayMinMilliseconds = 80;
+                    ItemTransferDelayMaxMilliseconds = 140;
+                }
+                SettingsSchemaVersion = 41;
                 Save();
             }
         }
@@ -715,8 +722,8 @@ namespace AllflameBot
             StashAfterCollectLoot = true;
             StashWhenFreeSlotsAtOrBelow = 8;
             StashBeforeVoyage = true;
-            ItemTransferDelayMinMilliseconds = 250;
-            ItemTransferDelayMaxMilliseconds = 380;
+            ItemTransferDelayMinMilliseconds = 80;
+            ItemTransferDelayMaxMilliseconds = 140;
             SettingsSchemaVersion = 22;
         }
 
@@ -784,7 +791,7 @@ namespace AllflameBot
             NotifyMapStarted = true;
             NotifyMapCompleted = true;
             NotifySulphurCollected = true;
-            SettingsSchemaVersion = 40;
+            SettingsSchemaVersion = 41;
         }
 
         private void ApplySecretBottleDefaults()

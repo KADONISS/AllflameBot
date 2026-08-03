@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.135";
+        public const string Current = "0.23.137";
     }
 
     public sealed class AllflameBot : IBot
@@ -2140,7 +2140,7 @@ namespace AllflameBot
 
     internal static class VoyageRunState
     {
-        public const float CapsuleTraversalRadius = 55f;
+        public const float CapsuleTraversalRadius = 25f;
         public const float CapsuleSafeLanternDistance = 120f;
         public const float CapsuleNearbyExitDistance = 150f;
         private const float CapsuleMaximumLanternDistance = 150f;
@@ -2369,28 +2369,6 @@ namespace AllflameBot
                 _positiveLanternCounterObserved = true;
                 _lanternCounterEmptySinceUtc = DateTime.MinValue;
                 _lanternCounterEmptySnapshots = 0;
-                if (current == 1 &&
-                    LokiPoe.Me != null &&
-                    !HasReservedExitCapsule)
-                {
-                    Vector2i reserved;
-                    float lanternDistance;
-                    if (TryGetBestCapsule(
-                        LokiPoe.Me.Position,
-                        out reserved,
-                        out lanternDistance))
-                    {
-                        ReservedExitCapsule = reserved;
-                        HasReservedExitCapsule = true;
-                        AllflameLog.Info(
-                            "CAPSULE_EXIT_RESERVED" +
-                            "|Counter=1/" + maximum +
-                            "|Position=" + reserved +
-                            "|NearestLanternDistance=" +
-                            lanternDistance.ToString("0.0") +
-                            "|Action=PreferWhenExtractionBegins");
-                    }
-                }
                 return;
             }
 
@@ -2471,7 +2449,6 @@ namespace AllflameBot
                 "VOYAGE_SECTOR_ANCHOR|Index=" + LanternAnchors.Count +
                 "|Position=" + position +
                 "|Revision=" + SectorRevision);
-            TryReserveBestExitCapsule("LanternCoverageObserved");
         }
 
         public static void ObserveSafeBreadcrumb(Vector2i position)
@@ -2558,6 +2535,11 @@ namespace AllflameBot
                     "CAPSULE_REGISTRY_ADD|Index=" +
                     CapsuleAnchors.Count +
                     "|Position=" + position);
+                AllflameLog.Info(
+                    "CAPSULE_CACHE_DISCOVERED" +
+                    "|Index=" + CapsuleAnchors.Count +
+                    "|Position=" + position +
+                    "|Confirmed=False");
             }
         }
 
@@ -2596,6 +2578,56 @@ namespace AllflameBot
                 "|TraversedCapsules=" +
                 TraversedCapsuleAnchors.Count +
                 "|Action=EligibleForFutureReturn");
+            AllflameLog.Info(
+                "CAPSULE_CACHE_CONFIRMED" +
+                "|Index=" + TraversedCapsuleAnchors.Count +
+                "|Position=" + position +
+                "|Source=" + (source ?? String.Empty) +
+                "|DistanceToSpawn=" +
+                (HasSpawn
+                    ? position.DistanceF(Spawn).ToString("0.0")
+                    : "Unavailable") +
+                "|ConfirmationRadius=" +
+                CapsuleTraversalRadius.ToString("0"));
+        }
+
+        public static List<Vector2i> BuildCapsuleReturnChain(
+            Vector2i player)
+        {
+            var remaining = new List<Vector2i>(
+                TraversedCapsuleAnchors);
+            var result = new List<Vector2i>();
+            if (remaining.Count == 0)
+            {
+                return result;
+            }
+
+            Vector2i spawnCapsule = HasSpawn
+                ? remaining.OrderBy(anchor => anchor.DistanceF(Spawn)).First()
+                : new Vector2i();
+            if (HasSpawn && remaining.Count > 1)
+            {
+                remaining.RemoveAll(anchor =>
+                    anchor.DistanceF(spawnCapsule) <= 25f);
+            }
+
+            Vector2i cursor = player;
+            while (remaining.Count > 0)
+            {
+                Vector2i next = remaining
+                    .OrderBy(anchor => anchor.DistanceF(cursor))
+                    .First();
+                result.Add(next);
+                remaining.Remove(next);
+                cursor = next;
+            }
+            if (HasSpawn &&
+                !result.Any(anchor =>
+                    anchor.DistanceF(spawnCapsule) <= 25f))
+            {
+                result.Add(spawnCapsule);
+            }
+            return result;
         }
 
         public static bool IsCapsuleTraversed(Vector2i position)
@@ -2688,17 +2720,8 @@ namespace AllflameBot
             var nearestCandidate = CapsuleAnchors
                 .Where(anchor =>
                     !IsCapsuleTraversed(anchor) &&
-                    !UnusableCapsuleAnchors.Any(unusable =>
-                        unusable.DistanceF(anchor) <= 25f) &&
                     !DeferredCapsuleVisitUntil.Keys.Any(deferred =>
-                        deferred.DistanceF(anchor) <= 25f) &&
-                    // Never steer directly to an untraversed Capsule
-                    // outside the currently covered lantern area.  The
-                    // previous selector ignored coverage, bypassing the
-                    // CAPSULE_VISIT_WAIT guard and sending the player into
-                    // darkness while searching for an exit.
-                    GetNearestLanternDistance(anchor) <=
-                        CapsuleSafeLanternDistance)
+                        deferred.DistanceF(anchor) <= 25f))
                 .OrderBy(anchor => anchor.DistanceF(player))
                 .FirstOrDefault();
             if (nearestCandidate == default(Vector2i))
@@ -14789,21 +14812,23 @@ namespace AllflameBot
                     _activeMainTab = mainTab;
                     _activeSubTab = -1;
                     _tabSelectionStage = 2;
-                    return StorageTabSelectionResult.Pending;
                 }
-                bool clicked = ChartStorageUi.TryClickMainTab(mainTab);
-                _tabSelectionDeadlineUtc =
-                    now.AddSeconds(2);
-                _tabSelectionStage = clicked ? 1 : 0;
-                AllflameLog.Info(
-                    "CHART_STORAGE_TAB_ACTION" +
-                    "|Action=SelectMain" +
-                    "|Main=" + (mainTab + 1) +
-                    "|Clicked=" + clicked +
-                    "|OneActionPerCycle=True");
-                return clicked
-                    ? StorageTabSelectionResult.Pending
-                    : FailTabSelection("MainTabMissing");
+                else
+                {
+                    bool clicked = ChartStorageUi.TryClickMainTab(mainTab);
+                    _tabSelectionDeadlineUtc =
+                        now.AddSeconds(2);
+                    _tabSelectionStage = clicked ? 1 : 0;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_ACTION" +
+                        "|Action=SelectMain" +
+                        "|Main=" + (mainTab + 1) +
+                        "|Clicked=" + clicked +
+                        "|OneActionPerCycle=True");
+                    return clicked
+                        ? StorageTabSelectionResult.Pending
+                        : FailTabSelection("MainTabMissing");
+                }
             }
 
             if (_tabSelectionStage == 1)
@@ -14813,11 +14838,13 @@ namespace AllflameBot
                     _activeMainTab = mainTab;
                     _activeSubTab = -1;
                     _tabSelectionStage = 2;
-                    return StorageTabSelectionResult.Pending;
                 }
-                return now < _tabSelectionDeadlineUtc
-                    ? StorageTabSelectionResult.Pending
-                    : FailTabSelection("MainTabNotActive");
+                else
+                {
+                    return now < _tabSelectionDeadlineUtc
+                        ? StorageTabSelectionResult.Pending
+                        : FailTabSelection("MainTabNotActive");
+                }
             }
 
             if (_tabSelectionStage == 2)
@@ -14826,24 +14853,26 @@ namespace AllflameBot
                 {
                     _activeSubTab = subTab;
                     BeginTabStabilityObservation(now);
-                    return StorageTabSelectionResult.Pending;
                 }
-                bool clicked = ChartStorageUi.TryClickSubTab(
-                    mainTab,
-                    subTab);
-                _tabSelectionDeadlineUtc =
-                    now.AddSeconds(2);
-                _tabSelectionStage = clicked ? 3 : 2;
-                AllflameLog.Info(
-                    "CHART_STORAGE_TAB_ACTION" +
-                    "|Action=SelectSub" +
-                    "|Main=" + (mainTab + 1) +
-                    "|Sub=" + (subTab + 1) +
-                    "|Clicked=" + clicked +
-                    "|OneActionPerCycle=True");
-                return clicked
-                    ? StorageTabSelectionResult.Pending
-                    : FailTabSelection("SubTabMissing");
+                else
+                {
+                    bool clicked = ChartStorageUi.TryClickSubTab(
+                        mainTab,
+                        subTab);
+                    _tabSelectionDeadlineUtc =
+                        now.AddSeconds(2);
+                    _tabSelectionStage = clicked ? 3 : 2;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_TAB_ACTION" +
+                        "|Action=SelectSub" +
+                        "|Main=" + (mainTab + 1) +
+                        "|Sub=" + (subTab + 1) +
+                        "|Clicked=" + clicked +
+                        "|OneActionPerCycle=True");
+                    return clicked
+                        ? StorageTabSelectionResult.Pending
+                        : FailTabSelection("SubTabMissing");
+                }
             }
 
             if (_tabSelectionStage == 3)
@@ -14852,11 +14881,13 @@ namespace AllflameBot
                 {
                     _activeSubTab = subTab;
                     BeginTabStabilityObservation(now);
-                    return StorageTabSelectionResult.Pending;
                 }
-                return now < _tabSelectionDeadlineUtc
-                    ? StorageTabSelectionResult.Pending
-                    : FailTabSelection("PageNotActive");
+                else
+                {
+                    return now < _tabSelectionDeadlineUtc
+                        ? StorageTabSelectionResult.Pending
+                        : FailTabSelection("PageNotActive");
+                }
             }
 
             if (!ChartStorageUi.IsPageActive(mainTab, subTab))
@@ -14913,8 +14944,8 @@ namespace AllflameBot
             _tabSelectionStableReads = 0;
             _tabSelectionLastSignature = null;
             _tabSelectionEmptyConfirmUtc =
-                now.AddMilliseconds(450);
-            _tabSelectionDeadlineUtc = now.AddSeconds(3);
+                now.AddMilliseconds(220);
+            _tabSelectionDeadlineUtc = now.AddSeconds(2);
         }
 
         private StorageTabSelectionResult FailTabSelection(
@@ -23029,6 +23060,20 @@ namespace AllflameBot
                 try
                 {
                     previousHash = ExilePather.AreaHash;
+                    if (previousHash == areaHash)
+                    {
+                        _pathfinderAreaHash = areaHash;
+                        _pathfinderReadyUtc = DateTime.UtcNow;
+                        _nextRecoveryReloadUtc =
+                            DateTime.UtcNow.AddSeconds(5);
+                        _consecutivePathFailures = 0;
+                        AllflameLog.Info(
+                            "PATHFINDER_AREA_READY" +
+                            "|Reason=LoadedByEarlierTask" +
+                            "|ChartHash=" + areaHash +
+                            "|LoadedHash=" + previousHash);
+                        return true;
+                    }
                     ExilePather.Reload(true);
                     _pathfinderAreaHash = areaHash;
                     _pathfinderReadyUtc =
@@ -23245,7 +23290,7 @@ namespace AllflameBot
                 _targetStartedUtc = DateTime.UtcNow;
                 _lastProgressUtc = DateTime.UtcNow;
                 AllflameLog.Info(
-                    "CAPSULE_VISIT_SELECTED" +
+                    "CAPSULE_CACHE_APPROACH" +
                     "|Position=" + _target +
                     "|Distance=" + _bestDistance.ToString("0.0") +
                     "|LanternCounter=" +
@@ -23265,31 +23310,6 @@ namespace AllflameBot
                     "PriorityVisitTask");
                 ClearTarget();
                 return Task.FromResult(true);
-            }
-
-            if (!VoyageRunState.IsPositionWithinLanternCoverage(
-                    _target,
-                    VoyageRunState.CapsuleSafeLanternDistance))
-            {
-                // Coverage extension is owned by InteractLantern/Explore.
-                // Do not charge that bounded work against the direct
-                // approach timeout once the Capsule becomes safe to visit.
-                _targetStartedUtc = DateTime.UtcNow;
-                _lastProgressUtc = DateTime.UtcNow;
-                AllflameLog.Throttled(
-                    "capsule_visit_wait_for_coverage",
-                    TimeSpan.FromSeconds(2),
-                    "CAPSULE_VISIT_WAIT" +
-                    "|Position=" + _target +
-                    "|Distance=" + distance.ToString("0.0") +
-                    "|NearestLanternDistance=" +
-                    VoyageRunState.GetNearestLanternDistance(
-                        _target).ToString("0.0") +
-                    "|RequiredCoverage=" +
-                    VoyageRunState.CapsuleSafeLanternDistance
-                        .ToString("0") +
-                    "|Action=DelegateSafeFrontierAndLanternPlacement");
-                return Task.FromResult(false);
             }
 
             if (_bestDistance - distance >= 6f)
@@ -23559,9 +23579,26 @@ namespace AllflameBot
         private float _lastDistance = Single.MaxValue;
         private DateTime _lastProgressUtc = DateTime.MinValue;
         private DateTime _arrivedWithoutObjectUtc = DateTime.MinValue;
+        private uint _pathfinderAreaHash;
+        private DateTime _pathfinderReadyUtc = DateTime.MinValue;
+        private DateTime _nextPathFailureUtc = DateTime.MinValue;
+        private int _pathfinderRecoveries;
+        private int _pathfinderSetupFailures;
 
         public MoveToDeepwaterChestTask()
             : base("MoveToDeepwaterChestTask", "Navigates to the next configured Deepwater reward chest.") { }
+
+        public override void Start()
+        {
+            ResetTarget();
+            ResetPathfinder();
+        }
+
+        public override void Stop()
+        {
+            ResetTarget();
+            ResetPathfinder();
+        }
 
         public override Task<bool> Run()
         {
@@ -23569,8 +23606,13 @@ namespace AllflameBot
                 AllflameContext.IsChartMapArea ||
                 (AllflameContext.IsVoyageMapArea &&
                  AllflameContext.Phase == AllflamePhase.Voyage);
-            if (!encounter ||
-                !AllflameSettings.Instance.OpenKnownChestsFirst ||
+            if (!encounter)
+            {
+                ResetTarget();
+                ResetPathfinder();
+                return Task.FromResult(false);
+            }
+            if (!AllflameSettings.Instance.OpenKnownChestsFirst ||
                 (AllflameContext.Phase == AllflamePhase.ChartArea &&
                  AllflameRunState.LanternsExhausted) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
@@ -23582,6 +23624,11 @@ namespace AllflameBot
                 LokiPoe.Me == null)
             {
                 return Task.FromResult(false);
+            }
+
+            if (!EnsurePathfinderReady())
+            {
+                return Task.FromResult(true);
             }
 
             int requiredLootDebt =
@@ -23633,6 +23680,8 @@ namespace AllflameBot
                 _lastDistance = distance;
                 _lastProgressUtc = DateTime.UtcNow;
                 _arrivedWithoutObjectUtc = DateTime.MinValue;
+                _nextPathFailureUtc = DateTime.MinValue;
+                _pathfinderRecoveries = 0;
                 AllflameLog.Info(
                     "CHEST_PHASE|Phase=Navigate|Id=" + id +
                     "|Name=" + rememberedName +
@@ -23691,9 +23740,21 @@ namespace AllflameBot
             bool moving = MoveTowardsInteraction(
                 targetPosition,
                 Name);
-            if (!moving)
+            if (!moving &&
+                DateTime.UtcNow >= _nextPathFailureUtc)
             {
                 _failures++;
+                _nextPathFailureUtc =
+                    DateTime.UtcNow.AddMilliseconds(750);
+            }
+
+            if (_failures >= 2 && _pathfinderRecoveries < 2)
+            {
+                ReloadPathfinderForChest(
+                    id,
+                    targetPosition,
+                    distance);
+                return Task.FromResult(true);
             }
 
             if (_failures >= 3)
@@ -23716,6 +23777,138 @@ namespace AllflameBot
             return Task.FromResult(true);
         }
 
+        private bool EnsurePathfinderReady()
+        {
+            uint areaHash = AllflameContext.AreaHash;
+            if (areaHash == 0)
+            {
+                return false;
+            }
+
+            uint loadedHash = 0;
+            try
+            {
+                loadedHash = ExilePather.AreaHash;
+            }
+            catch
+            {
+            }
+
+            bool loadedAreaMismatch =
+                loadedHash != areaHash &&
+                _pathfinderSetupFailures < 2;
+            if (_pathfinderAreaHash != areaHash || loadedAreaMismatch)
+            {
+                ResetTarget();
+                if (loadedHash == areaHash)
+                {
+                    _pathfinderAreaHash = areaHash;
+                    _pathfinderReadyUtc = DateTime.UtcNow;
+                    _pathfinderSetupFailures = 0;
+                    AllflameLog.Info(
+                        "CHEST_PATHFINDER_READY" +
+                        "|Reason=AlreadyLoaded" +
+                        "|AreaHash=" + areaHash);
+                    return true;
+                }
+
+                try
+                {
+                    ExilePather.Reload(true);
+                    _pathfinderAreaHash = areaHash;
+                    _pathfinderReadyUtc =
+                        DateTime.UtcNow.AddMilliseconds(250);
+                    _pathfinderSetupFailures = 0;
+                    AllflameLog.Info(
+                        "CHEST_PATHFINDER_RELOAD" +
+                        "|Reason=AreaChanged" +
+                        "|PreviousHash=" + loadedHash +
+                        "|AreaHash=" + areaHash +
+                        "|LoadedHash=" + ExilePather.AreaHash +
+                        "|WarmupMs=250");
+                }
+                catch (Exception ex)
+                {
+                    _pathfinderSetupFailures++;
+                    _pathfinderAreaHash =
+                        _pathfinderSetupFailures >= 2
+                            ? areaHash
+                            : 0;
+                    _pathfinderReadyUtc =
+                        _pathfinderSetupFailures >= 2
+                            ? DateTime.UtcNow
+                            : DateTime.UtcNow.AddMilliseconds(250);
+                    AllflameLog.Info(
+                        "CHEST_PATHFINDER_RELOAD_FAILED" +
+                        "|Reason=AreaChanged" +
+                        "|AreaHash=" + areaHash +
+                        "|Attempt=" + _pathfinderSetupFailures +
+                        "|Maximum=2" +
+                        "|Action=" + (_pathfinderSetupFailures >= 2
+                            ? "ProceedToBoundedMovement"
+                            : "Retry") +
+                        "|Error=" + ex.GetType().Name +
+                        ":" + ex.Message.Replace("|", "/"));
+                }
+                return false;
+            }
+
+            if (DateTime.UtcNow < _pathfinderReadyUtc)
+            {
+                AllflameLog.Throttled(
+                    "chest_pathfinder_warmup_" + areaHash,
+                    TimeSpan.FromMilliseconds(500),
+                    "CHEST_PATHFINDER_WAIT" +
+                    "|AreaHash=" + areaHash +
+                    "|Reason=Warmup" +
+                    "|FailuresIgnored=True");
+                return false;
+            }
+            return true;
+        }
+
+        private void ReloadPathfinderForChest(
+            int id,
+            Vector2i targetPosition,
+            float distance)
+        {
+            _pathfinderRecoveries++;
+            _failures = 0;
+            _nextPathFailureUtc =
+                DateTime.UtcNow.AddMilliseconds(750);
+            try
+            {
+                ExilePather.Reload(true);
+                _pathfinderAreaHash = AllflameContext.AreaHash;
+                _pathfinderReadyUtc =
+                    DateTime.UtcNow.AddMilliseconds(250);
+                AllflameMover mover =
+                    PlayerMoverManager.Current as AllflameMover;
+                if (mover != null)
+                {
+                    mover.ResetApproachState();
+                }
+                AllflameLog.Info(
+                    "CHEST_PATH_RECOVERY" +
+                    "|Id=" + id +
+                    "|Target=" + targetPosition +
+                    "|Distance=" + distance.ToString("0.0") +
+                    "|Recovery=" + _pathfinderRecoveries +
+                    "|Maximum=2" +
+                    "|Action=ReloadPatherAndResetMover");
+            }
+            catch (Exception ex)
+            {
+                _pathfinderReadyUtc = DateTime.UtcNow;
+                AllflameLog.Info(
+                    "CHEST_PATH_RECOVERY_FAILED" +
+                    "|Id=" + id +
+                    "|Recovery=" + _pathfinderRecoveries +
+                    "|Error=" + ex.GetType().Name +
+                    ":" + ex.Message.Replace("|", "/"));
+            }
+        }
+
         private void ResetTarget()
         {
             _targetId = 0;
@@ -23723,6 +23916,15 @@ namespace AllflameBot
             _lastDistance = Single.MaxValue;
             _lastProgressUtc = DateTime.MinValue;
             _arrivedWithoutObjectUtc = DateTime.MinValue;
+            _nextPathFailureUtc = DateTime.MinValue;
+            _pathfinderRecoveries = 0;
+        }
+
+        private void ResetPathfinder()
+        {
+            _pathfinderAreaHash = 0;
+            _pathfinderReadyUtc = DateTime.MinValue;
+            _pathfinderSetupFailures = 0;
         }
     }
 
@@ -24935,6 +25137,22 @@ namespace AllflameBot
         private int _coverageReentryBreadcrumbCursor;
         private int _coverageReentryLanternCursor;
         private bool _coverageReentryScanComplete;
+        private readonly List<Vector2i> _capsuleReturnChain =
+            new List<Vector2i>();
+        private readonly HashSet<string> _capsuleReturnInteracted =
+            new HashSet<string>(StringComparer.Ordinal);
+        private uint _capsuleReturnAreaHash;
+        private int _capsuleReturnIndex;
+        private DateTime _capsuleReturnStartedUtc = DateTime.MinValue;
+        private DateTime _capsuleReturnTargetStartedUtc = DateTime.MinValue;
+        private DateTime _capsuleReturnProgressUtc = DateTime.MinValue;
+        private DateTime _capsuleReturnInteractedUtc = DateTime.MinValue;
+        private DateTime _capsuleReturnReacquireUtc = DateTime.MinValue;
+        private float _capsuleReturnBestDistance = Single.MaxValue;
+        private int _capsuleReturnReloads;
+        private int _capsuleReturnChatCursor;
+        private bool _capsuleReturnInteractionIssued;
+        private bool _capsuleReturnUiConfirmed;
 
         private enum ZeroLanternExtractionStage
         {
@@ -25046,12 +25264,14 @@ namespace AllflameBot
         {
             ClearPendingTransfer();
             ResetZeroLanternRescue("TaskStart");
+            ResetCapsuleReturnChain("TaskStart");
         }
 
         public override void Stop()
         {
             ClearPendingTransfer();
             ResetZeroLanternRescue("TaskStop");
+            ResetCapsuleReturnChain("TaskStop");
             AllflameProgressWatchdog.Clear();
         }
 
@@ -25118,6 +25338,7 @@ namespace AllflameBot
                 DateTime.UtcNow >= _surfaceTransferBackoffUtc;
             bool extractionRequired =
                 VoyageRunState.LanternsExhausted;
+            bool cachedReturnUiReady = false;
             string extractionReason =
                 String.IsNullOrWhiteSpace(VoyageRunState.ExtractionReason)
                     ? "LanternsExhausted"
@@ -25194,6 +25415,16 @@ namespace AllflameBot
                         : new Vector2i());
             }
 
+            if (extractionRequired)
+            {
+                cachedReturnUiReady =
+                    await RunCachedCapsuleReturn(settings);
+                if (!cachedReturnUiReady)
+                {
+                    return true;
+                }
+            }
+
             if (extractionRequired &&
                 !AllflameContext.LanternAuraActive &&
                 _capsuleSearchHardFailsafeActive)
@@ -25265,6 +25496,9 @@ namespace AllflameBot
             }
 
             NetworkObject capsule = AllflameContext.CapsuleObject;
+            bool capsuleUiVisible = cachedReturnUiReady;
+            if (!cachedReturnUiReady)
+            {
             if (_hasConfirmedCapsuleAnchor &&
                 !_hasLockedExitAnchor &&
                 !VoyageRunState.IsCapsuleUsable(
@@ -25513,7 +25747,7 @@ namespace AllflameBot
                     : null;
             bool visualCapsuleUiVisible =
                 visualProbe != null && visualProbe.Confirmed;
-            bool capsuleUiVisible = visualCapsuleUiVisible;
+            capsuleUiVisible = visualCapsuleUiVisible;
             _visualCapsuleUiOpen = visualCapsuleUiVisible;
             if (visualCapsuleUiVisible)
             {
@@ -25545,8 +25779,9 @@ namespace AllflameBot
                     visualProbe.RequiredCorrelation.ToString("0.000") +
                     "|Action=TreatAsOpened");
             }
+            }
 
-            if (extractionRequired)
+            if (extractionRequired && !cachedReturnUiReady)
             {
                 AllflameContext.Refresh(true);
                 if (!AllflameContext.LanternAuraActive)
@@ -26471,8 +26706,11 @@ namespace AllflameBot
                                 _callAttempts = 0;
                                 _callRecoveryCycles++;
                                 LogUiRecoveryInPlace();
-                                await Coroutines
-                                    .CloseBlockingWindows();
+                                if (!_capsuleReturnUiConfirmed)
+                                {
+                                    await Coroutines
+                                        .CloseBlockingWindows();
+                                }
                                 _nextActionUtc =
                                     DateTime.UtcNow
                                         .AddMilliseconds(650);
@@ -26480,7 +26718,10 @@ namespace AllflameBot
                                     "CAPSULE_UI_RECOVERY" +
                                     "|Reason=" +
                                     "DirectCallNotAcknowledgedAfter3Attempts" +
-                                    "|Action=CloseAndReopen" +
+                                    "|Action=" +
+                                    (_capsuleReturnUiConfirmed
+                                        ? "KeepCachedCapsuleUiOpen"
+                                        : "CloseAndReopen") +
                                     "|RecoveryCycle=" +
                                     _callRecoveryCycles + "/" +
                                     MaximumRecoveryCycles);
@@ -26633,13 +26874,19 @@ namespace AllflameBot
                         _callAttempts = 0;
                         _callRecoveryCycles++;
                         LogUiRecoveryInPlace();
-                        await Coroutines.CloseBlockingWindows();
+                        if (!_capsuleReturnUiConfirmed)
+                        {
+                            await Coroutines.CloseBlockingWindows();
+                        }
                         _nextActionUtc =
                             DateTime.UtcNow.AddMilliseconds(650);
                         AllflameLog.Info(
                             "CAPSULE_UI_RECOVERY" +
                             "|Reason=CallNotAcknowledgedAfter3Attempts" +
-                            "|Action=CloseAndReopen" +
+                            "|Action=" +
+                            (_capsuleReturnUiConfirmed
+                                ? "KeepCachedCapsuleUiOpen"
+                                : "CloseAndReopen") +
                             "|RecoveryCycle=" +
                             _callRecoveryCycles + "/" +
                             MaximumRecoveryCycles);
@@ -26673,13 +26920,19 @@ namespace AllflameBot
                     _callAttempts = 0;
                     _callRecoveryCycles++;
                     LogUiRecoveryInPlace();
-                    await Coroutines.CloseBlockingWindows();
+                    if (!_capsuleReturnUiConfirmed)
+                    {
+                        await Coroutines.CloseBlockingWindows();
+                    }
                     _nextActionUtc =
                         DateTime.UtcNow.AddMilliseconds(650);
                     AllflameLog.Info(
                         "CAPSULE_UI_RECOVERY" +
                         "|Reason=CallButtonMissingFor3Seconds" +
-                        "|Action=CloseAndReopen" +
+                        "|Action=" +
+                        (_capsuleReturnUiConfirmed
+                            ? "KeepCachedCapsuleUiOpen"
+                            : "CloseAndReopen") +
                         "|RecoveryCycle=" +
                         _callRecoveryCycles + "/" +
                         MaximumRecoveryCycles);
@@ -28990,6 +29243,12 @@ namespace AllflameBot
         private bool CanUseLockedCapsuleUi(string action)
         {
             AllflameContext.Refresh(true);
+            if (_capsuleReturnUiConfirmed &&
+                _hasLockedExitAnchor &&
+                _lockedExitAreaHash == AllflameContext.AreaHash)
+            {
+                return true;
+            }
             if (!_hasLockedExitAnchor || LokiPoe.Me == null)
             {
                 AllflameLog.Info(
@@ -29951,6 +30210,16 @@ namespace AllflameBot
                 "|ActiveTask=UseAllflameCapsuleTask";
             if (VoyageRunState.LanternsExhausted)
             {
+                if (_capsuleReturnUiConfirmed)
+                {
+                    AllflameStopController.Stop(
+                        reason,
+                        (detail ?? String.Empty) +
+                        "|ActiveTask=" + Name +
+                        "|CachedCapsuleUi=True" +
+                        "|Action=RecoveryStopWithoutCapsuleReinteraction");
+                    return;
+                }
                 AllflameLog.Info(
                     "CAPSULE_SAFE_EXIT_UNAVAILABLE" +
                     "|" + detail +
@@ -30342,10 +30611,430 @@ namespace AllflameBot
             _pendingTransferIssuedUtc = DateTime.MinValue;
         }
 
+        private async Task<bool> RunCachedCapsuleReturn(
+            AllflameSettings settings)
+        {
+            if (_capsuleReturnUiConfirmed)
+            {
+                return true;
+            }
+            if (LokiPoe.Me == null)
+            {
+                return false;
+            }
+            if (_capsuleReturnAreaHash != AllflameContext.AreaHash ||
+                _capsuleReturnStartedUtc == DateTime.MinValue)
+            {
+                ResetCapsuleReturnChain("Initialize");
+                _capsuleReturnAreaHash = AllflameContext.AreaHash;
+                _capsuleReturnStartedUtc = DateTime.UtcNow;
+                _capsuleReturnChain.AddRange(
+                    VoyageRunState.BuildCapsuleReturnChain(
+                        LokiPoe.Me.Position));
+                AllflameLog.Info(
+                    "CAPSULE_RETURN_CHAIN_START" +
+                    "|AreaHash=" + _capsuleReturnAreaHash +
+                    "|Player=" + LokiPoe.Me.Position +
+                    "|ConfirmedCached=" +
+                    VoyageRunState.TraversedCapsuleCount +
+                    "|Targets=" + _capsuleReturnChain.Count +
+                    "|Spawn=" +
+                    (VoyageRunState.HasSpawn
+                        ? VoyageRunState.Spawn.ToString()
+                        : "Unavailable") +
+                    "|CoverageChecks=False");
+                if (_capsuleReturnChain.Count == 0)
+                {
+                    StopCapsuleReturn("NoConfirmedCachedCapsules");
+                    return false;
+                }
+                BeginCapsuleReturnTarget();
+            }
+
+            if (DateTime.UtcNow - _capsuleReturnStartedUtc >=
+                TimeSpan.FromSeconds(120))
+            {
+                StopCapsuleReturn("TotalTimeout120Seconds");
+                return false;
+            }
+            if (_capsuleReturnIndex >= _capsuleReturnChain.Count)
+            {
+                StopCapsuleReturn("AllCachedCapsulesTried");
+                return false;
+            }
+
+            Vector2i target = _capsuleReturnChain[_capsuleReturnIndex];
+            if (_capsuleReturnInteractionIssued)
+            {
+                AllflameContext.Refresh(true);
+                bool uiVisible = AllflameContext.CapsuleUiVisible;
+                VisualCallProbe probe = uiVisible
+                    ? null
+                    : await ProbeVisualCallButton();
+                uiVisible = uiVisible ||
+                    (probe != null && probe.Confirmed);
+                if (uiVisible)
+                {
+                    _capsuleReturnUiConfirmed = true;
+                    _visualCapsuleUiOpen = true;
+                    _confirmedCapsuleAnchor = target;
+                    _hasConfirmedCapsuleAnchor = true;
+                    LockExitAnchor(
+                        target,
+                        true,
+                        "CachedReturnUiConfirmed",
+                        true,
+                        true);
+                    VoyageRunState.MarkCapsuleProven(target);
+                    AllflameLog.Info(
+                        "CAPSULE_RETURN_SUCCESS" +
+                        "|Index=" + (_capsuleReturnIndex + 1) +
+                        "/" + _capsuleReturnChain.Count +
+                        "|Position=" + target +
+                        "|UiSource=" +
+                        (AllflameContext.CapsuleUiVisible
+                            ? "DpbUi"
+                            : "VisualFallback") +
+                        "|InteractionAttempts=1");
+                    return true;
+                }
+
+                string chatMessage;
+                if (TryReadCapsuleNotLitMessage(
+                    _capsuleReturnChatCursor,
+                    out chatMessage))
+                {
+                    AllflameLog.Info(
+                        "CAPSULE_RETURN_CHAT" +
+                        "|Index=" + (_capsuleReturnIndex + 1) +
+                        "|Position=" + target +
+                        "|Result=NotLit" +
+                        "|Message=" + SanitizeLogValue(chatMessage));
+                    AdvanceCapsuleReturnTarget("ChatNotLit");
+                    return false;
+                }
+                if (DateTime.UtcNow - _capsuleReturnInteractedUtc <
+                    TimeSpan.FromMilliseconds(2500))
+                {
+                    return false;
+                }
+
+                AllflameLog.Info(
+                    "CAPSULE_RETURN_RESULT" +
+                    "|Index=" + (_capsuleReturnIndex + 1) +
+                    "|Position=" + target +
+                    "|Result=NoUiOrChatOutcome" +
+                    "|InteractionAttempts=1");
+                AdvanceCapsuleReturnTarget("NoOutcome");
+                return false;
+            }
+
+            Vector2i player = LokiPoe.Me.Position;
+            float distance = player.DistanceF(target);
+            if (_capsuleReturnBestDistance - distance >= 3f)
+            {
+                float improvement = _capsuleReturnBestDistance - distance;
+                _capsuleReturnBestDistance = distance;
+                _capsuleReturnProgressUtc = DateTime.UtcNow;
+                AllflameProgressWatchdog.MarkProgress(
+                    "CachedCapsuleReturnConvergence");
+                AllflameLog.Info(
+                    "CAPSULE_RETURN_PROGRESS" +
+                    "|Index=" + (_capsuleReturnIndex + 1) +
+                    "|Position=" + target +
+                    "|Distance=" + distance.ToString("0.0") +
+                    "|BestDistance=" +
+                    _capsuleReturnBestDistance.ToString("0.0") +
+                    "|Improvement=" + improvement.ToString("0.0"));
+            }
+
+            float interactionRange = Math.Max(
+                35f,
+                settings.InteractDistance + 12f);
+            if (distance > interactionRange)
+            {
+                if (DateTime.UtcNow - _capsuleReturnProgressUtc >=
+                    TimeSpan.FromSeconds(5))
+                {
+                    if (_capsuleReturnReloads < 2)
+                    {
+                        _capsuleReturnReloads++;
+                        _capsuleReturnProgressUtc = DateTime.UtcNow;
+                        ResetMoverApproachState();
+                        try { ExilePather.Reload(true); } catch { }
+                        AllflameLog.Info(
+                            "CAPSULE_RETURN_RECOVERY" +
+                            "|Index=" + (_capsuleReturnIndex + 1) +
+                            "|Position=" + target +
+                            "|Attempt=" + _capsuleReturnReloads + "/2" +
+                            "|Reason=NoProgress5Seconds" +
+                            "|Action=ReloadPather");
+                        return false;
+                    }
+                    AdvanceCapsuleReturnTarget("ApproachNoProgress");
+                    return false;
+                }
+
+                bool moving = MoveTowardsInteraction(target, Name);
+                AllflameLog.Throttled(
+                    "capsule_return_move_" + _capsuleReturnIndex,
+                    TimeSpan.FromSeconds(1),
+                    "CAPSULE_RETURN_PROGRESS" +
+                    "|Index=" + (_capsuleReturnIndex + 1) +
+                    "|Position=" + target +
+                    "|Distance=" + distance.ToString("0.0") +
+                    "|BestDistance=" +
+                    _capsuleReturnBestDistance.ToString("0.0") +
+                    "|Moving=" + moving +
+                    "|CoverageChecks=False");
+                return false;
+            }
+
+            NetworkObject live = FindLiveCapsuleAt(target);
+            if (live == null || !live.IsValid || !live.IsTargetable)
+            {
+                if (_capsuleReturnReacquireUtc == DateTime.MinValue)
+                {
+                    _capsuleReturnReacquireUtc = DateTime.UtcNow;
+                    AllflameContext.Refresh(true);
+                }
+                if (DateTime.UtcNow - _capsuleReturnReacquireUtc <
+                    TimeSpan.FromMilliseconds(3500))
+                {
+                    return false;
+                }
+                AdvanceCapsuleReturnTarget("LiveObjectNotReacquired");
+                return false;
+            }
+
+            string targetKey = CapsuleReturnKey(target);
+            if (_capsuleReturnInteracted.Contains(targetKey))
+            {
+                AdvanceCapsuleReturnTarget("InteractionAlreadyIssued");
+                return false;
+            }
+            await FinishMovementBeforeInteraction("Allflame Capsule");
+            AllflameContext.Refresh(true);
+            live = FindLiveCapsuleAt(target);
+            if (live == null || !live.IsValid || !live.IsTargetable ||
+                LokiPoe.Me == null ||
+                LokiPoe.Me.Position.DistanceF(live.Position) >
+                    interactionRange)
+            {
+                _capsuleReturnReacquireUtc = DateTime.UtcNow;
+                return false;
+            }
+
+            _capsuleReturnChatCursor = GetChatMessageCount();
+            _capsuleReturnInteracted.Add(targetKey);
+            _capsuleReturnInteractionIssued = true;
+            _capsuleReturnInteractedUtc = DateTime.UtcNow;
+            bool accepted = await Coroutines.InteractWith(live);
+            AllflameLog.Info(
+                "CAPSULE_RETURN_INTERACT" +
+                "|Index=" + (_capsuleReturnIndex + 1) +
+                "/" + _capsuleReturnChain.Count +
+                "|ObjectId=" + live.Id +
+                "|Position=" + target +
+                "|Attempt=1" +
+                "|InputAccepted=" + accepted +
+                "|ChatCursor=" + _capsuleReturnChatCursor);
+            return false;
+        }
+
+        private void BeginCapsuleReturnTarget()
+        {
+            if (_capsuleReturnIndex >= _capsuleReturnChain.Count)
+            {
+                return;
+            }
+            Vector2i target = _capsuleReturnChain[_capsuleReturnIndex];
+            _capsuleReturnTargetStartedUtc = DateTime.UtcNow;
+            _capsuleReturnProgressUtc = DateTime.UtcNow;
+            _capsuleReturnInteractedUtc = DateTime.MinValue;
+            _capsuleReturnReacquireUtc = DateTime.MinValue;
+            _capsuleReturnBestDistance = LokiPoe.Me == null
+                ? Single.MaxValue
+                : LokiPoe.Me.Position.DistanceF(target);
+            _capsuleReturnReloads = 0;
+            _capsuleReturnInteractionIssued = false;
+            bool finalSpawnCapsule =
+                _capsuleReturnIndex == _capsuleReturnChain.Count - 1;
+            AllflameLog.Info(
+                "CAPSULE_RETURN_TARGET" +
+                "|Index=" + (_capsuleReturnIndex + 1) +
+                "/" + _capsuleReturnChain.Count +
+                "|Position=" + target +
+                "|PlayerDistance=" +
+                (_capsuleReturnBestDistance == Single.MaxValue
+                    ? "Unavailable"
+                    : _capsuleReturnBestDistance.ToString("0.0")) +
+                "|FinalSpawnCapsule=" + finalSpawnCapsule +
+                "|InteractionLimit=1");
+        }
+
+        private void AdvanceCapsuleReturnTarget(string reason)
+        {
+            Vector2i previous = _capsuleReturnIndex <
+                _capsuleReturnChain.Count
+                    ? _capsuleReturnChain[_capsuleReturnIndex]
+                    : new Vector2i();
+            AllflameLog.Info(
+                "CAPSULE_RETURN_RESULT" +
+                "|Index=" + (_capsuleReturnIndex + 1) +
+                "|Position=" + previous +
+                "|Result=Advance" +
+                "|Reason=" + (reason ?? String.Empty));
+            _capsuleReturnIndex++;
+            ResetMoverApproachState();
+            if (_capsuleReturnIndex >= _capsuleReturnChain.Count)
+            {
+                StopCapsuleReturn("AllCachedCapsulesTried:" + reason);
+                return;
+            }
+            BeginCapsuleReturnTarget();
+        }
+
+        private void StopCapsuleReturn(string reason)
+        {
+            string detail =
+                "ActiveTask=" + Name +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|Targets=" + _capsuleReturnChain.Count +
+                "|Tried=" + Math.Min(
+                    _capsuleReturnIndex + 1,
+                    _capsuleReturnChain.Count) +
+                "|Interactions=" + _capsuleReturnInteracted.Count +
+                "|ElapsedSeconds=" +
+                (_capsuleReturnStartedUtc == DateTime.MinValue
+                    ? 0
+                    : (int)(DateTime.UtcNow -
+                        _capsuleReturnStartedUtc).TotalSeconds);
+            AllflameLog.Info(
+                "CAPSULE_RETURN_EXHAUSTED|" + detail);
+            AllflameStopController.Stop(
+                "VoyageCapsuleReturnExhausted",
+                detail);
+        }
+
+        private static NetworkObject FindLiveCapsuleAt(Vector2i target)
+        {
+            try
+            {
+                return LokiPoe.ObjectManager.Objects
+                    .Where(obj =>
+                    {
+                        if (obj == null || !obj.IsValid ||
+                            obj.Position.DistanceF(target) > 30f)
+                        {
+                            return false;
+                        }
+                        string name = obj.Name ?? String.Empty;
+                        string metadata = obj.Metadata ?? String.Empty;
+                        return name.IndexOf(
+                                   "Allflame Capsule",
+                                   StringComparison.OrdinalIgnoreCase) >= 0 ||
+                               name.IndexOf(
+                                   "Deepwater Capsule",
+                                   StringComparison.OrdinalIgnoreCase) >= 0 ||
+                               metadata.IndexOf(
+                                   "AllflameCapsule",
+                                   StringComparison.OrdinalIgnoreCase) >= 0 ||
+                               metadata.IndexOf(
+                                   "DeepwaterCapsule",
+                                   StringComparison.OrdinalIgnoreCase) >= 0;
+                    })
+                    .OrderBy(obj => obj.Position.DistanceF(target))
+                    .FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int GetChatMessageCount()
+        {
+            try
+            {
+                var messages = LokiPoe.InGameState.ChatPanel.Messages;
+                return messages == null ? 0 : messages.Count;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        private static bool TryReadCapsuleNotLitMessage(
+            int cursor,
+            out string message)
+        {
+            message = String.Empty;
+            try
+            {
+                var messages = LokiPoe.InGameState.ChatPanel.Messages;
+                if (messages == null || messages.Count <= cursor)
+                {
+                    return false;
+                }
+                for (int i = Math.Max(0, cursor); i < messages.Count; i++)
+                {
+                    string text = messages[i].Message ?? String.Empty;
+                    string normalized = Regex.Replace(
+                        text.ToLowerInvariant(),
+                        "[^a-z]+",
+                        " ");
+                    if (normalized.IndexOf("capsul", StringComparison.Ordinal) >= 0 &&
+                        normalized.IndexOf("not lit", StringComparison.Ordinal) >= 0)
+                    {
+                        message = text;
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        private static string SanitizeLogValue(string value)
+        {
+            return (value ?? String.Empty)
+                .Replace("|", "/")
+                .Replace("\r", " ")
+                .Replace("\n", " ");
+        }
+
+        private static string CapsuleReturnKey(Vector2i position)
+        {
+            return position.X + ":" + position.Y;
+        }
+
+        private void ResetCapsuleReturnChain(string reason)
+        {
+            _capsuleReturnChain.Clear();
+            _capsuleReturnInteracted.Clear();
+            _capsuleReturnAreaHash = 0;
+            _capsuleReturnIndex = 0;
+            _capsuleReturnStartedUtc = DateTime.MinValue;
+            _capsuleReturnTargetStartedUtc = DateTime.MinValue;
+            _capsuleReturnProgressUtc = DateTime.MinValue;
+            _capsuleReturnInteractedUtc = DateTime.MinValue;
+            _capsuleReturnReacquireUtc = DateTime.MinValue;
+            _capsuleReturnBestDistance = Single.MaxValue;
+            _capsuleReturnReloads = 0;
+            _capsuleReturnChatCursor = 0;
+            _capsuleReturnInteractionIssued = false;
+            _capsuleReturnUiConfirmed = false;
+        }
+
         private void ResetRequest()
         {
             ClearPendingTransfer();
             ResetZeroLanternRescue("RequestReset");
+            ResetCapsuleReturnChain("RequestReset");
             _nextActionUtc = DateTime.MinValue;
             _requestActive = false;
             _batchHadItems = false;
@@ -35898,6 +36587,16 @@ namespace AllflameBot
         private DateTime _retryAfterUtc = DateTime.MinValue;
         private DateTime _nextPolicySessionUtc = DateTime.MinValue;
         private string _reason = String.Empty;
+        private bool _transferPending;
+        private int _pendingItemKey;
+        private int _pendingLocalId;
+        private Vector2i _pendingLocation;
+        private int _pendingBeforeStack;
+        private int _pendingTransferDelayMs;
+        private string _pendingItemName = String.Empty;
+        private string _pendingTab = String.Empty;
+        private string _pendingTransferMode = String.Empty;
+        private DateTime _transferIssuedUtc = DateTime.MinValue;
 
         public StashLootTask()
             : base(
@@ -35961,6 +36660,7 @@ namespace AllflameBot
                 _tabIndex = 0;
                 _attempts.Clear();
                 _tabs.Clear();
+                ResetPendingTransfer();
                 _reason = _debug
                     ? "DebugButton"
                     : (preVoyagePolicy
@@ -36026,7 +36726,7 @@ namespace AllflameBot
 
                 bool opened = await Coroutines.InteractWith(stash);
                 _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(
-                    opened ? 700 : 500);
+                    opened ? 300 : 350);
                 AllflameLog.Info(
                     "STASH_OPEN|Destination=" +
                     (_useGuild ? "Guild" : "Personal") +
@@ -36088,7 +36788,7 @@ namespace AllflameBot
             {
                 object result = SwitchToTab(targetTab);
                 _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(650);
+                    DateTime.UtcNow.AddMilliseconds(250);
                 AllflameLog.Info(
                     "STASH_TAB_SWITCH|Index=" + _tabIndex +
                     "|Tab=" + targetTab +
@@ -36104,6 +36804,90 @@ namespace AllflameBot
                 inventoryControl.Inventory.Items == null
                     ? new List<Item>()
                     : inventoryControl.Inventory.Items.ToList();
+
+            if (_transferPending)
+            {
+                Item remaining = inventoryItems.FirstOrDefault(candidate =>
+                    candidate != null &&
+                    candidate.IsValid &&
+                    ((candidate.LocalId != 0 &&
+                      candidate.LocalId == _pendingItemKey) ||
+                     (candidate.LocalId == 0 &&
+                      candidate.Id == _pendingItemKey) ||
+                     candidate.LocationTopLeft == _pendingLocation));
+                bool moved =
+                    remaining == null ||
+                    Math.Max(1, remaining.StackCount) <
+                        _pendingBeforeStack;
+                if (moved)
+                {
+                    int movedKey = _pendingItemKey;
+                    DateTime issuedUtc = _transferIssuedUtc;
+                    int delayMs = _pendingTransferDelayMs;
+                    _attempts.Remove(movedKey);
+                    AllflameLog.Info(
+                        "STASH_ITEM_MOVED|Tab=" + _pendingTab +
+                        "|Name=" + _pendingItemName +
+                        "|LocalId=" + _pendingLocalId +
+                        "|BeforeStack=" + _pendingBeforeStack +
+                        "|AfterStack=" +
+                        (remaining == null
+                            ? 0
+                            : remaining.StackCount) +
+                        "|Mode=" + _pendingTransferMode +
+                        "|NextDelayMs=" + delayMs +
+                        "|ConfirmedOnFreshCycle=True");
+                    ResetPendingTransfer();
+                    _retryAfterUtc =
+                        issuedUtc.AddMilliseconds(delayMs);
+                    if (_retryAfterUtc < DateTime.UtcNow)
+                    {
+                        _retryAfterUtc = DateTime.UtcNow;
+                    }
+                    return true;
+                }
+
+                if (DateTime.UtcNow - _transferIssuedUtc <
+                    TimeSpan.FromMilliseconds(650))
+                {
+                    return true;
+                }
+
+                int pendingAttempts;
+                _attempts.TryGetValue(
+                    _pendingItemKey,
+                    out pendingAttempts);
+                pendingAttempts++;
+                _attempts[_pendingItemKey] = pendingAttempts;
+                string failedName = _pendingItemName;
+                string failedTab = _pendingTab;
+                int failedLocalId = _pendingLocalId;
+                int failedKey = _pendingItemKey;
+                string failedMode = _pendingTransferMode;
+                ResetPendingTransfer();
+                AllflameLog.Info(
+                    "STASH_ITEM_RETRY|Tab=" + failedTab +
+                    "|Name=" + failedName +
+                    "|LocalId=" + failedLocalId +
+                    "|Attempt=" + pendingAttempts +
+                    "|Mode=" + failedMode +
+                    "|InputSent=True" +
+                    "|StillInInventory=True");
+                if (pendingAttempts >= 2)
+                {
+                    _attempts[failedKey] = 0;
+                    _tabIndex++;
+                    AllflameLog.Info(
+                        "STASH_TAB_FAILSAFE|FailedTab=" + failedTab +
+                        "|NextTabIndex=" + _tabIndex +
+                        "|Reason=TwoFailedTransfers" +
+                        "|Item=" + failedName);
+                }
+                _retryAfterUtc =
+                    DateTime.UtcNow.AddMilliseconds(120);
+                return true;
+            }
+
             Item item = inventoryItems.FirstOrDefault(candidate =>
                 candidate != null &&
                 candidate.IsValid &&
@@ -36122,42 +36906,57 @@ namespace AllflameBot
             int attempts;
             _attempts.TryGetValue(itemKey, out attempts);
             int beforeStack = Math.Max(1, item.StackCount);
-            DateTime transferStartedUtc = DateTime.UtcNow;
             int transferDelayMs =
                 AllflameTransferTiming.NextDelayMilliseconds(
                     settings);
-            bool inputSent =
-                await CtrlRightClickInventoryItem(
+            bool useMouseFallback = attempts > 0 || item.LocalId <= 0;
+            bool inputSent = false;
+            string transferMode;
+            string inputResult;
+            if (!useMouseFallback)
+            {
+                transferMode = "InventoryFastMove";
+                try
+                {
+                    FastMoveResult result =
+                        inventoryControl.FastMove(item.LocalId);
+                    inputResult = result.ToString();
+                    inputSent = result == FastMoveResult.None;
+                }
+                catch (Exception ex)
+                {
+                    inputResult = "Exception:" + ex.GetType().Name;
+                }
+            }
+            else
+            {
+                transferMode = "CtrlRightClickFallback";
+                inputSent = await CtrlRightClickInventoryItem(
                     inventoryControl,
                     item);
-            await LokiCoroutine.Sleep(70);
-            Item remaining = FindInventoryItem(itemKey, item);
-            bool moved =
-                inputSent &&
-                (remaining == null ||
-                 Math.Max(1, remaining.StackCount) < beforeStack);
+                inputResult = inputSent ? "Sent" : "Rejected";
+            }
 
-            if (moved)
+            if (inputSent)
             {
-                _attempts.Remove(itemKey);
+                _transferPending = true;
+                _pendingItemKey = itemKey;
+                _pendingLocalId = item.LocalId;
+                _pendingLocation = item.LocationTopLeft;
+                _pendingBeforeStack = beforeStack;
+                _pendingTransferDelayMs = transferDelayMs;
+                _pendingItemName = item.FullName ?? item.Name ?? String.Empty;
+                _pendingTab = targetTab;
+                _pendingTransferMode = transferMode;
+                _transferIssuedUtc = DateTime.UtcNow;
                 AllflameLog.Info(
-                    "STASH_ITEM_MOVED|Tab=" + targetTab +
-                    "|Name=" + item.FullName +
+                    "STASH_ITEM_TRANSFER_ISSUED|Tab=" + targetTab +
+                    "|Name=" + _pendingItemName +
                     "|LocalId=" + item.LocalId +
-                    "|BeforeStack=" + beforeStack +
-                    "|AfterStack=" +
-                    (remaining == null
-                        ? 0
-                        : remaining.StackCount) +
-                    "|Mode=CtrlRightClick" +
-                    "|NextDelayMs=" + transferDelayMs);
-                _retryAfterUtc =
-                    transferStartedUtc.AddMilliseconds(
-                        transferDelayMs);
-                if (_retryAfterUtc < DateTime.UtcNow)
-                {
-                    _retryAfterUtc = DateTime.UtcNow;
-                }
+                    "|Mode=" + transferMode +
+                    "|Result=" + inputResult +
+                    "|Action=ConfirmOnNextCycle" +
+                    "|OneActionPerCycle=True");
                 return true;
             }
 
@@ -36168,8 +36967,10 @@ namespace AllflameBot
                 "|Name=" + item.FullName +
                 "|LocalId=" + item.LocalId +
                 "|Attempt=" + attempts +
-                "|InputSent=" + inputSent +
-                "|StillInInventory=" + (remaining != null));
+                "|Mode=" + transferMode +
+                "|Result=" + inputResult +
+                "|InputSent=False" +
+                "|StillInInventory=True");
             if (attempts >= 2)
             {
                 _attempts[itemKey] = 0;
@@ -36181,7 +36982,7 @@ namespace AllflameBot
                     "|Item=" + item.FullName);
             }
             _retryAfterUtc =
-                DateTime.UtcNow.AddMilliseconds(250);
+                DateTime.UtcNow.AddMilliseconds(120);
             return true;
         }
 
@@ -36351,6 +37152,20 @@ namespace AllflameBot
             }
         }
 
+        private void ResetPendingTransfer()
+        {
+            _transferPending = false;
+            _pendingItemKey = 0;
+            _pendingLocalId = 0;
+            _pendingLocation = default(Vector2i);
+            _pendingBeforeStack = 0;
+            _pendingTransferDelayMs = 0;
+            _pendingItemName = String.Empty;
+            _pendingTab = String.Empty;
+            _pendingTransferMode = String.Empty;
+            _transferIssuedUtc = DateTime.MinValue;
+        }
+
         private static async Task<bool> CtrlRightClickInventoryItem(
             InventoryControlWrapper inventoryControl,
             Item item)
@@ -36466,6 +37281,7 @@ namespace AllflameBot
             _debug = false;
             _tabs.Clear();
             _attempts.Clear();
+            ResetPendingTransfer();
             _tabIndex = 0;
             _retryAfterUtc = DateTime.MinValue;
             _reason = String.Empty;
