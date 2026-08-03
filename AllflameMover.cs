@@ -73,6 +73,18 @@ namespace AllflameBot
 
         public bool MoveTowards(Vector2i position, params dynamic[] user)
         {
+            return MoveTowardsCore(position, false);
+        }
+
+        public bool MoveTowardsPrecise(Vector2i position, params dynamic[] user)
+        {
+            return MoveTowardsCore(position, true);
+        }
+
+        private bool MoveTowardsCore(
+            Vector2i position,
+            bool preciseInteraction)
+        {
             if (!LokiPoe.IsInGame || LokiPoe.Me == null)
                 return false;
 
@@ -140,7 +152,7 @@ namespace AllflameBot
                 return true;
             }
 
-            if (remainingDistance < 130f)
+            if (preciseInteraction && remainingDistance < 130f)
             {
                 // Near an interaction target, use a single click so a held
                 // Move input cannot carry the player through the target ring.

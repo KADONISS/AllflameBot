@@ -6,6 +6,8 @@ All notable changes to AllflameBot are documented in this file.
 
 - Use single-click movement near interaction targets instead of leaving
   `BeginUseAt` held, so the player stops inside the Allflame Capsule ring.
+- Keep normal exploration and covered-route travel on the original held-input
+  mover; precision clicks are scoped to objects, Capsules, and chest approach.
 - Clear movement input before and after DPB action synchronization and accept
   the full configured Capsule interaction range.
 

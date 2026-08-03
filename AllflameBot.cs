@@ -5321,7 +5321,9 @@ namespace AllflameBot
                         }
                     }
 
-                    bool moving = PlayerMoverManager.MoveTowards(obj.Position, Name);
+                    bool moving = MoveTowardsInteraction(
+                        obj.Position,
+                        Name);
                     if (_moveFailureObjectId != obj.Id)
                     {
                         _moveFailureObjectId = obj.Id;
@@ -5395,6 +5397,17 @@ namespace AllflameBot
                 AllflameLog.Error("ACTION_FAILED|Task=" + Name + "|Target=" + label, ex);
                 return true;
             }
+        }
+
+        protected static bool MoveTowardsInteraction(
+            Vector2i position,
+            string context)
+        {
+            AllflameMover mover =
+                PlayerMoverManager.Current as AllflameMover;
+            return mover != null
+                ? mover.MoveTowardsPrecise(position, context)
+                : PlayerMoverManager.MoveTowards(position, context);
         }
 
         protected async Task FinishMovementBeforeInteraction(
@@ -19272,7 +19285,7 @@ namespace AllflameBot
                 return Task.FromResult(false);
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = MoveTowardsInteraction(
                 _target,
                 Name);
             AllflameLog.Throttled(
@@ -19698,7 +19711,7 @@ namespace AllflameBot
                     "|Failures=" + _failures);
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = MoveTowardsInteraction(
                 targetPosition,
                 Name);
             if (!moving)
@@ -21599,7 +21612,7 @@ namespace AllflameBot
                         return true;
                     }
                     bool moving =
-                        PlayerMoverManager.MoveTowards(
+                        MoveTowardsInteraction(
                         capsule.Position,
                         Name);
                     AllflameLog.Throttled(
@@ -23098,7 +23111,7 @@ namespace AllflameBot
                 return true;
             }
             _rescueCooldownUntilUtc = DateTime.UtcNow.AddMilliseconds(325);
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = MoveTowardsInteraction(
                 _rescueCandidate.Position,
                 Name + " capsule approach ring");
             AllflameLog.Info(
@@ -24292,11 +24305,16 @@ namespace AllflameBot
                     player,
                     remembered,
                     out movementTarget);
-            bool moving = PlayerMoverManager.MoveTowards(
-                movementTarget,
-                Name + (usingLanternRoute
-                    ? " lantern route"
-                    : " remembered capsule"));
+            string movementContext = Name + (usingLanternRoute
+                ? " lantern route"
+                : " remembered capsule");
+            bool moving = usingLanternRoute
+                ? PlayerMoverManager.MoveTowards(
+                    movementTarget,
+                    movementContext)
+                : MoveTowardsInteraction(
+                    movementTarget,
+                    movementContext);
             AllflameLog.Throttled(
                 "capsule_registry_route",
                 TimeSpan.FromSeconds(2),
@@ -25238,9 +25256,17 @@ namespace AllflameBot
                         : new Vector2i());
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
-                waypoint,
-                Name + " " + mode);
+            bool preciseInteraction = String.Equals(
+                mode,
+                "LockedNearbyDirect",
+                StringComparison.Ordinal);
+            bool moving = preciseInteraction
+                ? MoveTowardsInteraction(
+                    waypoint,
+                    Name + " " + mode)
+                : PlayerMoverManager.MoveTowards(
+                    waypoint,
+                    Name + " " + mode);
             if (moving)
             {
                 _safeRouteMoveFailedUtc = DateTime.MinValue;
