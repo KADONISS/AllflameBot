@@ -1,0 +1,54 @@
+# Build output
+bin/
+obj/
+artifacts/
+TestResults/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Runtime data
+Logs/
+*.log
+*.tmp
+*.bak
+*.old
+
+# User settings and secrets
+Settings/
+config.json
+settings.json
+*.secret.json
+*.local.json
+.env
+.env.*
+
+# Price/runtime backups
+*PriceBackup*
+*price-backup*
+*.backup.json
+
+# Captured diagnostics
+frames/
+screenshots/
+videos/
+*.mp4
+*.avi
+*.mkv
+
+# DreamPoeBot binaries
+DreamPoeBot.exe
+DreamPoeBot.exe.config
+DreamPoeBot.Localization.dll
+Newtonsoft.Json.dll
+log4net.dll
+SharpDX*.dll
+RecastManaged.dll
+
+# Compiled assemblies
+*.dll
+*.pdb

@@ -1,0 +1,14 @@
+{
+  "AssemblyName": "AllflameBot",
+  "FileList": [
+    "AllflameBot.cs",
+    "AllflameSettings.cs",
+    "AllflamePrices.cs",
+    "AllflameNotifications.cs",
+    "AllflameBotGui.cs",
+    "AllflameMover.cs",
+    "AllflameUniqueResolver.cs"
+  ],
+  "Dependencies": [],
+  "References": []
+}
