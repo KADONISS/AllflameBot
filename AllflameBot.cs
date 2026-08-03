@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.129";
+        public const string Current = "0.23.130";
     }
 
     public sealed class AllflameBot : IBot
@@ -32921,6 +32921,7 @@ namespace AllflameBot
         private DateTime _nextSessionUtc = DateTime.MinValue;
         private uint _sessionAreaHash;
         private string _cycleSettingsSignature = String.Empty;
+        private string _snapshotCharacter = String.Empty;
 
         public SecretBottleProcessingTask()
             : base(
@@ -32929,10 +32930,11 @@ namespace AllflameBot
 
         public override void Start()
         {
-            ResetSessionState();
+            ResetSessionState(true);
             _cycleComplete = false;
             _nextSessionUtc = DateTime.MinValue;
             _cycleSettingsSignature = String.Empty;
+            _snapshotCharacter = String.Empty;
         }
 
         public override void Stop()
@@ -32948,8 +32950,9 @@ namespace AllflameBot
                     "|Fallback=True" +
                     "|Reason=TaskStopped");
             }
-            ResetSessionState();
+            ResetSessionState(true);
             _cycleComplete = false;
+            _snapshotCharacter = String.Empty;
         }
 
         public static bool IsBottleItem(Item item)
@@ -32981,6 +32984,9 @@ namespace AllflameBot
         {
             AllflameSettings settings = AllflameSettings.Instance;
             string settingsSignature = BottleCycleSettingsSignature(settings);
+            string character = LokiPoe.Me == null
+                ? String.Empty
+                : LokiPoe.Me.Name ?? String.Empty;
             if (!String.Equals(
                     _cycleSettingsSignature,
                     settingsSignature,
@@ -32988,10 +32994,22 @@ namespace AllflameBot
             {
                 if (!_active)
                 {
+                    ResetBottleSessionSnapshot("SettingsChanged");
                     _cycleComplete = false;
                     _nextSessionUtc = DateTime.MinValue;
+                    _cycleSettingsSignature = settingsSignature;
                 }
-                _cycleSettingsSignature = settingsSignature;
+            }
+            if (!_active &&
+                !String.IsNullOrWhiteSpace(_snapshotCharacter) &&
+                !String.Equals(
+                    _snapshotCharacter,
+                    character,
+                    StringComparison.Ordinal))
+            {
+                ResetBottleSessionSnapshot("CharacterChanged");
+                _cycleComplete = false;
+                _nextSessionUtc = DateTime.MinValue;
             }
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
@@ -33011,6 +33029,22 @@ namespace AllflameBot
                     _cycleComplete = false;
                     _cycleCompletionPending = false;
                 }
+                return false;
+            }
+            if (IsChartDeviceCycleActive())
+            {
+                AllflameLog.Throttled(
+                    "secret_bottle_chart_device_deferred",
+                    TimeSpan.FromSeconds(2),
+                    "SECRET_BOTTLE_DEFERRED" +
+                    "|Reason=ChartDeviceCycleActive" +
+                    "|ChartRequested=" +
+                    AllflameRunState.ChartRequested +
+                    "|NativeUi=" +
+                    NativeDeepwaterChartDeviceUi.IsOpened +
+                    "|StableUi=" +
+                    DeepwaterChartDeviceUi.IsStableWindowOpen +
+                    "|Active=" + _active);
                 return false;
             }
             if (_cycleComplete)
@@ -33034,6 +33068,30 @@ namespace AllflameBot
             List<Item> items = InventoryItems(inventoryControl);
             int bottleCount = BottleQuantity(items);
             int threshold = Math.Max(1, settings.SecretBottlesToOpen);
+            int cachedStashBottles = CachedStashBottleQuantity();
+            if (!_active && _scanComplete)
+            {
+                int knownSupply = bottleCount + cachedStashBottles;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_SUPPLY" +
+                    "|Inventory=" + bottleCount +
+                    "|CachedStash=" + cachedStashBottles +
+                    "|Combined=" + knownSupply +
+                    "|Required=" + threshold +
+                    "|SnapshotValid=True");
+                if (knownSupply < threshold)
+                {
+                    _cycleComplete = true;
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_SCAN_SKIPPED" +
+                        "|Reason=SessionSnapshotValid" +
+                        "|CachedStash=" + cachedStashBottles +
+                        "|Inventory=" + bottleCount +
+                        "|Required=" + threshold +
+                        "|Action=ProceedToMap");
+                    return false;
+                }
+            }
             if (!_active)
             {
                 if (DateTime.UtcNow < _nextSessionUtc)
@@ -33045,7 +33103,9 @@ namespace AllflameBot
                 int maximum = Math.Max(
                     1,
                     settings.SecretMaxBottlesPerSession);
-                if (bottleCount < maximum)
+                if (!_scanComplete ||
+                    (bottleCount < maximum &&
+                     cachedStashBottles > 0))
                 {
                     _stage = ProcessingStage.Withdraw;
                 }
@@ -33155,12 +33215,13 @@ namespace AllflameBot
             _vendorStartedUtc = DateTime.MinValue;
             _vendorAcceptDeadlineUtc = DateTime.MinValue;
             _cycleCompletionPending = false;
-            _scanComplete = false;
             _waitingForInventorySpace = false;
-            _scanIndex = 0;
-            _withdrawTarget = 0;
-            _bottleTabs.Clear();
-            _tabSwitchAttempts.Clear();
+            int maximum = Math.Max(
+                1,
+                AllflameSettings.Instance.SecretMaxBottlesPerSession);
+            _withdrawTarget = _scanComplete
+                ? Math.Min(maximum, bottleCount + CachedStashBottleQuantity())
+                : 0;
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
@@ -33168,6 +33229,12 @@ namespace AllflameBot
             _transferAttempts.Clear();
             _withdrawAttempts.Clear();
             _sessionAreaHash = AllflameContext.AreaHash;
+            if (String.IsNullOrWhiteSpace(_snapshotCharacter))
+            {
+                _snapshotCharacter = LokiPoe.Me == null
+                    ? String.Empty
+                    : LokiPoe.Me.Name ?? String.Empty;
+            }
             _cycleSettingsSignature =
                 BottleCycleSettingsSignature(AllflameSettings.Instance);
             AllflameLog.Info(
@@ -33175,9 +33242,9 @@ namespace AllflameBot
                 "|InventoryBottles=" + bottleCount +
                 "|Threshold=" + threshold +
                 "|MaxOpen=" +
-                Math.Max(
-                    1,
-                    AllflameSettings.Instance.SecretMaxBottlesPerSession) +
+                maximum +
+                "|SnapshotValid=" + _scanComplete +
+                "|CachedStash=" + CachedStashBottleQuantity() +
                 "|KeepMinDivines=" +
                 AllflameSettings.Instance.SecretBottleKeepMinDivines
                     .ToString("0.####", System.Globalization.CultureInfo.InvariantCulture));
@@ -33261,6 +33328,12 @@ namespace AllflameBot
                     "|Missing=" + String.Join(",", missing) +
                     "|Destination=" +
                     (useGuild ? "Guild" : "Personal"));
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_SESSION_SCAN_START" +
+                    "|Tabs=" + String.Join(",", resolved) +
+                    "|Destination=" +
+                    (useGuild ? "Guild" : "Personal") +
+                    "|Character=" + _snapshotCharacter);
                 if (_bottleTabs.Count == 0)
                 {
                     if (inventoryBottleCount >= threshold)
@@ -33317,6 +33390,13 @@ namespace AllflameBot
                     _bottleTabs.Count +
                     "|Bottles=" + count +
                     "|State=" + scanTab.State);
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_SESSION_SNAPSHOT" +
+                    "|Tab=" + scanTab.Name +
+                    "|Index=" + (_scanIndex + 1) + "/" +
+                    _bottleTabs.Count +
+                    "|Bottles=" + count +
+                    "|State=" + scanTab.State);
                 _scanIndex++;
                 return true;
             }
@@ -33324,6 +33404,9 @@ namespace AllflameBot
             if (!_scanComplete)
             {
                 _scanComplete = true;
+                _snapshotCharacter = LokiPoe.Me == null
+                    ? _snapshotCharacter
+                    : LokiPoe.Me.Name ?? String.Empty;
                 int stashTotal = _bottleTabs
                     .Where(tab => tab.State == BottleTabState.Available)
                     .Sum(tab => Math.Max(0, tab.Remaining));
@@ -34897,7 +34980,7 @@ namespace AllflameBot
                 "|Failed=" + _failed +
                 "|Fallback=" + fallback +
                 "|Reason=" + reason);
-            ResetSessionState();
+            ResetSessionState(false);
             if (completedCycle)
             {
                 _cycleComplete = true;
@@ -34916,7 +34999,7 @@ namespace AllflameBot
                 Math.Max(1, cooldownSeconds));
         }
 
-        private void ResetSessionState()
+        private void ResetSessionState(bool resetSnapshot = false)
         {
             _active = false;
             _stage = ProcessingStage.Opening;
@@ -34924,20 +35007,70 @@ namespace AllflameBot
             _vendorStartedUtc = DateTime.MinValue;
             _vendorAcceptDeadlineUtc = DateTime.MinValue;
             _cycleCompletionPending = false;
-            _scanComplete = false;
             _waitingForInventorySpace = false;
-            _scanIndex = 0;
             _withdrawTarget = 0;
-            _bottleTabs.Clear();
             _sellLocalIds.Clear();
             _transferredLocalIds.Clear();
             _triedNpcIds.Clear();
             _openAttempts.Clear();
             _transferAttempts.Clear();
             _withdrawAttempts.Clear();
-            _tabSwitchAttempts.Clear();
             _vendorAcceptAttempts = 0;
             _sessionAreaHash = 0;
+            if (resetSnapshot)
+            {
+                _scanComplete = false;
+                _scanIndex = 0;
+                _bottleTabs.Clear();
+                _tabSwitchAttempts.Clear();
+                _snapshotCharacter = String.Empty;
+            }
+        }
+
+        private void ResetBottleSessionSnapshot(string reason)
+        {
+            if (_scanComplete || _bottleTabs.Count > 0)
+            {
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_SESSION_SNAPSHOT_RESET" +
+                    "|Reason=" + reason +
+                    "|Tabs=" + _bottleTabs.Count +
+                    "|CachedStash=" + CachedStashBottleQuantity());
+            }
+            _scanComplete = false;
+            _scanIndex = 0;
+            _bottleTabs.Clear();
+            _tabSwitchAttempts.Clear();
+            _snapshotCharacter = String.Empty;
+        }
+
+        private int CachedStashBottleQuantity()
+        {
+            if (!_scanComplete)
+            {
+                return 0;
+            }
+            return _bottleTabs
+                .Where(tab => tab.State == BottleTabState.Available)
+                .Sum(tab => Math.Max(0, tab.Remaining));
+        }
+
+        private static bool IsChartDeviceCycleActive()
+        {
+            if (AllflameRunState.ChartRequested)
+            {
+                return true;
+            }
+            try
+            {
+                return LokiPoe.InGameState.MapDeviceUi.IsOpened ||
+                       NativeDeepwaterChartDeviceUi.IsOpened ||
+                       DeepwaterChartDeviceUi.IsStableWindowOpen;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private void BeginVendorAcceptWait()
@@ -35221,6 +35354,13 @@ namespace AllflameBot
                 "|Previous=" + previous +
                 "|Remaining=" + tab.Remaining +
                 "|State=" + tab.State +
+                "|Source=" + source);
+            AllflameLog.Info(
+                "SECRET_BOTTLE_CACHE_ADJUSTED" +
+                "|Tab=" + tab.Name +
+                "|Before=" + previous +
+                "|Withdrawn=" + Math.Max(0, previous - tab.Remaining) +
+                "|After=" + tab.Remaining +
                 "|Source=" + source);
         }
 

@@ -2,6 +2,20 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.130 - 2026-08-03
+
+- Scan configured Message in a Bottle stash tabs once per bot session and
+  preserve their logical counts across Hub, map and Voyage area transitions.
+- Reconcile only the selected tab after a withdrawal, skip repeated stash
+  checks when the cached combined supply is below the opening threshold, and
+  invalidate the snapshot on bot restart, character change or Bottle setting
+  changes.
+- Defer Bottle processing while a Chart Device request or native Deepwater
+  Chart Device window is active so it cannot close the loaded device before
+  Descend and portal entry complete.
+- Add session snapshot, cached supply, cache adjustment and Chart Device
+  deferral markers for runtime verification.
+
 ## 0.23.129 - 2026-08-03
 
 - Send valuable Message in a Bottle rewards through an immediate Discord
