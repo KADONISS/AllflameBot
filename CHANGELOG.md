@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.127 - 2026-08-03
+
+- Normalize and compare the DPB vendor Accept button text without case
+  sensitivity so the runtime value `accept` is treated as ready.
+- Keep `SellUi.TradeControl.Accept(true)` as the native action and continue
+  confirming completion from Sell UI closure or an empty offer inventory.
+- Log raw and normalized button text plus a dedicated confirmed-sale marker
+  for diagnosing future localization or UI-state differences.
+
 ## 0.23.126 - 2026-08-03
 
 - Prefer DPB's native `ResurrectToCheckPoint` API after the death UI grace

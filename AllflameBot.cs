@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.126";
+        public const string Current = "0.23.127";
     }
 
     public sealed class AllflameBot : IBot
@@ -34418,10 +34418,11 @@ namespace AllflameBot
             {
                 acceptText = "Exception:" + ex.GetType().Name;
             }
+            string normalizedAcceptText = acceptText.Trim();
             if (!String.Equals(
-                    acceptText,
+                    normalizedAcceptText,
                     "Accept",
-                    StringComparison.Ordinal))
+                    StringComparison.OrdinalIgnoreCase))
             {
                 if (DateTime.UtcNow < _vendorAcceptDeadlineUtc)
                 {
@@ -34430,7 +34431,10 @@ namespace AllflameBot
                         TimeSpan.FromMilliseconds(500),
                         "SECRET_BOTTLE_VENDOR" +
                         "|Action=WaitForAccept" +
-                        "|ButtonText=" + acceptText.Replace("|", "/") +
+                        "|RawButtonText=" +
+                        acceptText.Replace("|", "/") +
+                        "|NormalizedButtonText=" +
+                        normalizedAcceptText.Replace("|", "/") +
                         "|Items=" + _transferredLocalIds.Count +
                         "|RemainingMilliseconds=" +
                         Math.Max(
@@ -34473,6 +34477,11 @@ namespace AllflameBot
             AllflameLog.Info(
                 "SECRET_BOTTLE_VENDOR" +
                 "|Action=Accept" +
+                "|RawButtonText=" +
+                acceptText.Replace("|", "/") +
+                "|NormalizedButtonText=" +
+                normalizedAcceptText.Replace("|", "/") +
+                "|Source=DpbTradeControl" +
                 "|Attempt=" + _vendorAcceptAttempts +
                 "|Maximum=3" +
                 "|Items=" + _transferredLocalIds.Count +
@@ -34494,6 +34503,13 @@ namespace AllflameBot
                 await FallbackToStash("VendorAcceptRejected");
                 return false;
             }
+            AllflameLog.Info(
+                "SECRET_BOTTLE_VENDOR_ACCEPT_CONFIRMED" +
+                "|OfferBefore=" + offerBefore +
+                "|OfferAfter=" + offerAfter +
+                "|SellUiOpened=" + sellUiOpened +
+                "|Items=" + _transferredLocalIds.Count +
+                "|Result=" + result);
             _sold += _transferredLocalIds.Count;
             await Coroutines.CloseBlockingWindows();
             FinishSession("Completed", false, 2);
