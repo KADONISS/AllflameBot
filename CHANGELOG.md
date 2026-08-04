@@ -2,6 +2,40 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.139 - 2026-08-04
+
+- Replace Valerie alternate-approach movement success tracking with sampled
+  convergence and target-crossing checks; rotate candidates after four
+  seconds without real progress and bound the complete recovery to six
+  candidates, two pather reloads and 25 seconds.
+- Keep Chart Device portal entry in its confirmed-Descend state when a portal
+  interaction reopens the Chart UI, close the reopened window and reacquire
+  the portal instead of treating a transient loaded snapshot as a new map.
+- Reset stale custom Chart local IDs when the native device is empty and a
+  different inventory Chart is available, allowing the current Chart to load
+  instead of waiting forever with Descend disabled.
+- Add two bounded empty-device recoveries, a 30-second Chart Device transaction
+  timeout and explicit watchdog progress for load, Descend, portal appearance
+  and the first portal interaction.
+
+## 0.23.138 - 2026-08-04
+
+- Start object, inventory, visible-UI and Chart Storage cache windows after
+  their scans finish so a slow DPB memory read cannot immediately expire its
+  own cache and force another full scan.
+- Add per-stage milliseconds to `CONTEXT_REFRESH_TIMING` and a scoped
+  `INVENTORY_REFRESH_TIMING` marker for diagnosing client-specific memory and
+  UI slowdowns without guessing from complete task-cycle duration.
+- Stop forcing complete object, inventory and 1200-element UI scans on every
+  Chart Storage cycle; use the direct Chart Storage wrapper and inventory-only
+  snapshots for withdrawal confirmation, completion and source failure.
+- Replace the Voyage Stash pre-check full refresh with the same cached
+  inventory-only path while preserving full refreshes for actual UI and
+  pathfinder recovery boundaries.
+- Cache normal stash Chart summary scans independently for 350 ms, preserving
+  item counts while avoiding repeated `StashUi.AllItems` enumeration on every
+  context refresh.
+
 ## 0.23.137 - 2026-08-04
 
 - Replace the exhausted-Lantern coverage, reserved-Capsule and breadcrumb
