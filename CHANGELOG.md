@@ -2,6 +2,21 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.140 - 2026-08-04
+
+- Reset Valerie alternate-approach recovery state across task start, stop,
+  area exit, Voyage start, UI/dialog success, target replacement and completed
+  recovery so stale hard-timeout timestamps cannot stop a fresh attempt.
+- Preserve the originating task in controlled-stop markers when the progress
+  watchdog has already been cleared.
+- Transfer normal personal-stash loot with one explicit Ctrl+right-click per
+  cycle, confirm the inventory delta on a fresh cycle and always release input
+  state after the click.
+- Run Charts already present in inventory before probing or withdrawing Chart
+  Storage, with explicit source-selection diagnostics.
+- Delay pre-Voyage Chart storage until Begin Voyage has actually succeeded,
+  preventing startup Charts from being deposited and withdrawn again.
+
 ## 0.23.139 - 2026-08-04
 
 - Replace Valerie alternate-approach movement success tracking with sampled

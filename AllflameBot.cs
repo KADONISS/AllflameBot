@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.139";
+        public const string Current = "0.23.140";
     }
 
     public sealed class AllflameBot : IBot
@@ -5156,9 +5156,19 @@ namespace AllflameBot
             StopReason = reason ?? String.Empty;
             StopDetail = detail ?? String.Empty;
             AllflameNotifications.RecordStopReason(reason, detail);
+            string activeContext = AllflameProgressWatchdog.Describe();
+            if (activeContext.StartsWith(
+                    "ActiveTask=None",
+                    StringComparison.Ordinal) &&
+                !String.IsNullOrEmpty(detail) &&
+                detail.IndexOf(
+                    "ActiveTask=",
+                    StringComparison.Ordinal) >= 0)
+            {
+                activeContext = detail;
+            }
             AllflameLog.Info(
-                "STOP_REQUEST|Source=RecoveryStop|" +
-                AllflameProgressWatchdog.Describe());
+                "STOP_REQUEST|Source=RecoveryStop|" + activeContext);
             AllflameLog.Info(
                 "BOT_STOP_CONDITION|Reason=" + reason +
                 "|Detail=" + (detail ?? String.Empty));
@@ -5178,6 +5188,7 @@ namespace AllflameBot
         private int _valerieRecoveryStep;
         private bool _valerieRecoveryActive;
         private Vector2i _valerieRecoveryTarget;
+        private Vector2i _valerieRecoveryNpcPosition;
         private uint _valerieRecoveryAreaHash;
         private DateTime _valerieRecoveryStartedUtc = DateTime.MinValue;
         private DateTime _valerieRecoveryLastProgressUtc = DateTime.MinValue;
@@ -6978,7 +6989,7 @@ namespace AllflameBot
                 valerie.Id != _valerieRecoveryObjectId ||
                 LokiPoe.Me == null)
             {
-                _valerieRecoveryActive = false;
+                ResetValerieApproachRecovery(0, "TargetInvalid");
                 return false;
             }
 
@@ -7017,7 +7028,7 @@ namespace AllflameBot
             if (distance <= ValerieRecoveryArrivalDistance ||
                 crossedTarget || npcInRange)
             {
-                _valerieRecoveryActive = false;
+                Vector2i completedTarget = _valerieRecoveryTarget;
                 _valerieBestDistance = valerie.Distance;
                 _valerieProgressUtc = now;
                 AllflameProgressWatchdog.MarkProgress(
@@ -7030,7 +7041,7 @@ namespace AllflameBot
                     "VALERIE_APPROACH_RECOVERY" +
                     "|Task=" + Name +
                     "|State=Arrived" +
-                    "|Target=" + _valerieRecoveryTarget +
+                    "|Target=" + completedTarget +
                     "|CompletionMode=" +
                     (npcInRange
                         ? "NpcInteractionRange"
@@ -7039,6 +7050,9 @@ namespace AllflameBot
                             : "DirectTargetRadius")) +
                     "|NpcDistance=" +
                     valerie.Distance.ToString("0.0"));
+                ResetValerieApproachRecovery(
+                    valerie.Id,
+                    "RecoveryCompleted");
                 return false;
             }
 
@@ -7180,9 +7194,19 @@ namespace AllflameBot
                 return false;
             }
 
-            if (_valerieRecoveryObjectId != valerie.Id)
+            bool npcPositionChanged =
+                _valerieRecoveryStartedUtc != DateTime.MinValue &&
+                _valerieRecoveryNpcPosition != new Vector2i() &&
+                _valerieRecoveryNpcPosition.DistanceF(
+                    valerie.Position) > 5f;
+            if (_valerieRecoveryObjectId != valerie.Id ||
+                npcPositionChanged)
             {
-                ResetValerieApproachRecovery(valerie.Id);
+                ResetValerieApproachRecovery(
+                    valerie.Id,
+                    npcPositionChanged
+                        ? "TargetPositionChanged"
+                        : "TargetObjectChanged");
             }
 
             Vector2i player = LokiPoe.Me.Position;
@@ -7192,6 +7216,7 @@ namespace AllflameBot
                 _valerieRecoveryStartedUtc = now;
                 _valerieRecoveryLastProgressUtc = now;
                 _valerieRecoveryAreaHash = AllflameContext.AreaHash;
+                _valerieRecoveryNpcPosition = valerie.Position;
                 _valerieRecoveryCandidateFailures = 0;
                 _valerieRecoveryPatherReloads = 0;
                 AllflameProgressWatchdog.BeginExplicitProgress(
@@ -7459,8 +7484,15 @@ namespace AllflameBot
             return previousX * currentX + previousY * currentY <= 0;
         }
 
-        protected void ResetValerieApproachRecovery(int objectId)
+        protected void ResetValerieApproachRecovery(
+            int objectId,
+            string reason = null)
         {
+            bool hadState =
+                _valerieRecoveryStartedUtc != DateTime.MinValue ||
+                _valerieRecoveryActive ||
+                _valerieRecoveryCandidateFailures > 0 ||
+                _valerieRecoveryPatherReloads > 0;
             _valerieRecoveryObjectId = objectId;
             _valerieRecoveryStep = 0;
             _valerieRecoveryActive = false;
@@ -7471,10 +7503,20 @@ namespace AllflameBot
             _valerieRecoveryLastProgressUtc = DateTime.MinValue;
             _valerieRecoveryPreviousSampleUtc = DateTime.MinValue;
             _valerieRecoveryPreviousPosition = new Vector2i();
+            _valerieRecoveryTarget = new Vector2i();
+            _valerieRecoveryNpcPosition = new Vector2i();
             _valerieRecoveryBestTargetDistance = Single.MaxValue;
             _valerieRecoveryProgressBaselineDistance = Single.MaxValue;
             _valerieRecoveryCandidateFailures = 0;
             _valerieRecoveryPatherReloads = 0;
+            if (!String.IsNullOrEmpty(reason) && hadState)
+            {
+                AllflameLog.Info(
+                    "VALERIE_APPROACH_RESET" +
+                    "|Task=" + Name +
+                    "|Reason=" + reason +
+                    "|ObjectId=" + objectId);
+            }
         }
 
     }
@@ -8107,6 +8149,7 @@ namespace AllflameBot
                 AllflameContext.Phase == AllflamePhase.VoyagePlanning;
             bool required =
                 settings.StashBeforeVoyage &&
+                AllflameRunState.VoyageStarted &&
                 !AllflameRunState.VoyagePreStashCompleted;
             if (!required || !inHub)
             {
@@ -9310,6 +9353,7 @@ namespace AllflameBot
 
         public override void Start()
         {
+            ResetValerieApproachRecovery(0, "Start");
             ResetStablePlacement();
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
@@ -9325,6 +9369,7 @@ namespace AllflameBot
 
         public override void Stop()
         {
+            ResetValerieApproachRecovery(0, "Stop");
             ResetStablePlacement();
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
@@ -9349,6 +9394,9 @@ namespace AllflameBot
                 AllflameContext.Phase == AllflamePhase.VoyagePlanning;
             if (!enabled || !inHub)
             {
+                ResetValerieApproachRecovery(
+                    0,
+                    !enabled ? "Disabled" : "LeftHub");
                 AllflameProgressWatchdog.Clear();
                 _stage = 0;
                 _valerieEffectDeadlineUtc = DateTime.MinValue;
@@ -9363,6 +9411,7 @@ namespace AllflameBot
 
             if (AllflameRunState.VoyageStarted)
             {
+                ResetValerieApproachRecovery(0, "VoyageStarted");
                 AllflameProgressWatchdog.Clear();
                 AllflameLog.Throttled(
                     "voyage_started_wait",
@@ -9430,6 +9479,7 @@ namespace AllflameBot
                 VoyagePlanningUi.IsOpen();
             if (voyageOpen)
             {
+                ResetValerieApproachRecovery(0, "VoyageUiOpened");
                 AllflameProgressWatchdog.Begin(
                     Name,
                     0,
@@ -9493,6 +9543,9 @@ namespace AllflameBot
                     FindVoyageDialogOption();
                 if (LokiPoe.InGameState.NpcDialogUi.IsOpened)
                 {
+                    ResetValerieApproachRecovery(
+                        0,
+                        "ValerieDialogOpened");
                     _valerieEffectDeadlineUtc = DateTime.MinValue;
                     _valerieEffectFailures = 0;
                 }
@@ -14562,6 +14615,7 @@ namespace AllflameBot
         private bool _rawWithdrawFailed;
         private bool _inventoryFull;
         private bool _rawWithdrawAwaitingVerification;
+        private bool _inventoryFirstLogged;
         private int _rawWithdrawPendingKey;
         private int _rawWithdrawBeforeCount;
         private int _rawWithdrawFailures;
@@ -14607,6 +14661,7 @@ namespace AllflameBot
 
         public override void Start()
         {
+            _inventoryFirstLogged = false;
             ResetSessionPageCache();
             _observedDepositRevision = ChartStorageUi.DepositRevision;
             ResetScan();
@@ -14614,6 +14669,7 @@ namespace AllflameBot
 
         public override void Stop()
         {
+            _inventoryFirstLogged = false;
             ResetScan();
             ResetSessionPageCache();
         }
@@ -14683,6 +14739,25 @@ namespace AllflameBot
             if (_stage == 0 &&
                 AllflameContext.InventoryChartCount > 0)
             {
+                if (!_inventoryFirstLogged)
+                {
+                    _inventoryFirstLogged = true;
+                    AllflameLog.Info(
+                        "STARTUP_CHART_POLICY" +
+                        "|InventoryCharts=" +
+                        AllflameContext.InventoryChartCount +
+                        "|Action=RunInventoryFirst");
+                    AllflameLog.Info(
+                        "CHART_SOURCE_SELECTED" +
+                        "|Source=Inventory" +
+                        "|Count=" +
+                        AllflameContext.InventoryChartCount);
+                    AllflameLog.Info(
+                        "CHART_STORAGE_WITHDRAW_SKIPPED" +
+                        "|Reason=InventoryChartsAvailable" +
+                        "|Count=" +
+                        AllflameContext.InventoryChartCount);
+                }
                 AllflameRunState.MarkChartStorageProbeCompleted();
                 AllflameRunState.MarkStorageChecked();
                 ResetScan();
@@ -37416,33 +37491,13 @@ namespace AllflameBot
             int transferDelayMs =
                 AllflameTransferTiming.NextDelayMilliseconds(
                     settings);
-            bool useMouseFallback = attempts > 0 || item.LocalId <= 0;
             bool inputSent = false;
-            string transferMode;
+            string transferMode = "CtrlRightClick";
             string inputResult;
-            if (!useMouseFallback)
-            {
-                transferMode = "InventoryFastMove";
-                try
-                {
-                    FastMoveResult result =
-                        inventoryControl.FastMove(item.LocalId);
-                    inputResult = result.ToString();
-                    inputSent = result == FastMoveResult.None;
-                }
-                catch (Exception ex)
-                {
-                    inputResult = "Exception:" + ex.GetType().Name;
-                }
-            }
-            else
-            {
-                transferMode = "CtrlRightClickFallback";
-                inputSent = await CtrlRightClickInventoryItem(
-                    inventoryControl,
-                    item);
-                inputResult = inputSent ? "Sent" : "Rejected";
-            }
+            inputSent = await CtrlRightClickInventoryItem(
+                inventoryControl,
+                item);
+            inputResult = inputSent ? "Sent" : "Rejected";
 
             if (inputSent)
             {
@@ -37746,6 +37801,7 @@ namespace AllflameBot
                             (short)0,
                             System.Windows.Forms.Keys.None);
                     }
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 }
                 return true;
             }
