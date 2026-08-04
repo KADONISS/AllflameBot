@@ -16,14 +16,13 @@ using DreamPoeBot.Loki.Elements;
 using DreamPoeBot.Loki.Game;
 using DreamPoeBot.Loki.Game.Objects;
 using DreamPoeBot.Loki.Models.Enums;
-using DeepwaterVoyageUi = DreamPoeBot.Loki.Game.LokiPoe.InGameState.DeepwaterVoyageUi;
 using LokiCoroutine = DreamPoeBot.Loki.Coroutine.Coroutine;
 
 namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.143";
+        public const string Current = "0.23.144";
     }
 
     public sealed class AllflameBot : IBot
@@ -9721,15 +9720,6 @@ namespace AllflameBot
         private int _stablePlacementConfirmed;
         private int _stablePlacementFailures;
         private DateTime _stablePlacementIssuedUtc = DateTime.MinValue;
-        private int _dpbPlacementBatchIssued;
-        private bool _dpbClearPending;
-        private int _dpbClearBeforeAvailable;
-        private int _dpbClearBeforeBoard;
-        private DateTime _dpbClearIssuedUtc = DateTime.MinValue;
-        private bool _dpbBeginPending;
-        private int _dpbBeginAttempts;
-        private DateTime _dpbBeginIssuedUtc = DateTime.MinValue;
-        private DateTime _dpbFallbackUntilUtc = DateTime.MinValue;
 
         public PrepareVoyageTask()
             : base(
@@ -9740,7 +9730,6 @@ namespace AllflameBot
         {
             ResetValerieApproachRecovery(0, "Start");
             ResetStablePlacement();
-            ResetDpbVoyageState();
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
             _voyageUiExpectedUntilUtc = DateTime.MinValue;
@@ -9757,7 +9746,6 @@ namespace AllflameBot
         {
             ResetValerieApproachRecovery(0, "Stop");
             ResetStablePlacement();
-            ResetDpbVoyageState();
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
             _voyageUiExpectedUntilUtc = DateTime.MinValue;
@@ -9779,63 +9767,6 @@ namespace AllflameBot
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
                 AllflameContext.Phase == AllflamePhase.VoyagePlanning;
-            if (_dpbBeginPending && enabled)
-            {
-                bool apiStillOpen = VoyagePlanningUi.IsDpbOpen();
-                if (!inHub || !apiStillOpen)
-                {
-                    double elapsedMilliseconds =
-                        Math.Max(
-                            0,
-                            (DateTime.UtcNow - _dpbBeginIssuedUtc)
-                                .TotalMilliseconds);
-                    AllflameRunState.MarkVoyageStarted();
-                    AllflameLog.Info(
-                        "VOYAGE_DPB_BEGIN" +
-                        "|Attempt=" + _dpbBeginAttempts +
-                        "|Enabled=True" +
-                        "|InputSent=True" +
-                        "|Verified=True" +
-                        "|UiOpen=" + apiStillOpen +
-                        "|InHub=" + inHub +
-                        "|ElapsedMilliseconds=" +
-                        elapsedMilliseconds.ToString("0"));
-                    _dpbBeginPending = false;
-                    ResetStablePlacement();
-                    _stage = 0;
-                    _planningReadyAtOpen = false;
-                    _retryAfterUtc =
-                        DateTime.UtcNow.AddMilliseconds(500);
-                    return true;
-                }
-
-                if (DateTime.UtcNow - _dpbBeginIssuedUtc <
-                    TimeSpan.FromSeconds(2))
-                {
-                    return true;
-                }
-
-                AllflameLog.Info(
-                    "VOYAGE_DPB_BEGIN" +
-                    "|Attempt=" + _dpbBeginAttempts +
-                    "|InputSent=True" +
-                    "|Verified=False" +
-                    "|Reason=UiRemainedOpen" +
-                    "|Action=RefreshAndRetry");
-                _dpbBeginPending = false;
-                _stablePlacementFailures++;
-                if (_dpbBeginAttempts >= 3)
-                {
-                    _dpbFallbackUntilUtc =
-                        DateTime.UtcNow.AddSeconds(5);
-                    AllflameLog.Info(
-                        "VOYAGE_UI_FALLBACK" +
-                        "|From=DpbApi" +
-                        "|To=StableElement" +
-                        "|Reason=BeginPostconditionFailed" +
-                        "|Attempts=" + _dpbBeginAttempts);
-                }
-            }
             if (!enabled || !inHub)
             {
                 ResetValerieApproachRecovery(
@@ -9850,7 +9781,6 @@ namespace AllflameBot
                 _chartDetectionAttempts = 0;
                 _lastInsufficientChartCount = -1;
                 _stableInsufficientChartSnapshots = 0;
-                ResetDpbVoyageState();
                 return false;
             }
 
@@ -10150,60 +10080,17 @@ namespace AllflameBot
                     AllflameRunState.VoyageReadyForPlanning ||
                     AllflameRunState.VoyageReconcileRequired;
                 _chartDetectionAttempts = 0;
-                VoyagePlanningUi.DpbVoyageSnapshot dpbClear;
-                string dpbClearReason =
-                    DateTime.UtcNow < _dpbFallbackUntilUtc
-                        ? "FallbackCooldown"
-                        : "Unavailable";
-                if (DateTime.UtcNow >= _dpbFallbackUntilUtc &&
-                    VoyagePlanningUi.TryResolveDpb(
-                        out dpbClear,
-                        out dpbClearReason))
-                {
-                    _dpbClearBeforeAvailable =
-                        dpbClear.AvailableCharts.Count;
-                    _dpbClearBeforeBoard =
-                        dpbClear.BoardOccupied;
-                    bool inputSent = VoyagePlanningUi.TryDpbClearBoard(
-                        out dpbClearReason);
-                    _dpbClearPending = inputSent;
-                    _dpbClearIssuedUtc = DateTime.UtcNow;
-                    if (inputSent)
-                    {
-                        _stage = 1;
-                    }
-                    else
-                    {
-                        _dpbFallbackUntilUtc =
-                            DateTime.UtcNow.AddSeconds(5);
-                    }
-                    _retryAfterUtc =
-                        DateTime.UtcNow.AddMilliseconds(
-                            inputSent ? 180 : 300);
-                    AllflameLog.Info(
-                        "VOYAGE_DPB_CLEAR_BOARD" +
-                        "|Attempt=1" +
-                        "|BeforeAvailable=" +
-                        _dpbClearBeforeAvailable +
-                        "|BeforeBoard=" + _dpbClearBeforeBoard +
-                        "|BeforeState=" + dpbClear.BoardState +
-                        "|InputSent=" + inputSent +
-                        "|Verified=False" +
-                        "|Reason=" + dpbClearReason);
-                    return true;
-                }
-
                 VoyagePlanningUi.StableVoyageSnapshot stableClear;
                 if (VoyagePlanningUi.TryResolveStable(
                         out stableClear))
                 {
                     AllflameLog.Throttled(
-                        "voyage_dpb_to_stable_clear",
+                        "voyage_element_clear",
                         TimeSpan.FromSeconds(2),
                         "VOYAGE_UI_FALLBACK" +
-                        "|From=DpbApi" +
+                        "|From=ElementPrimary" +
                         "|To=StableElement" +
-                        "|Reason=" + dpbClearReason);
+                        "|Reason=PlanBoardOpen");
                     bool stableClicked =
                         VoyagePlanningUi.ClickStableElement(
                             stableClear.ClearBoardButton,
@@ -10230,12 +10117,12 @@ namespace AllflameBot
                 VoyagePlanningUi.VoyageVisualSnapshot
                     firstClearSnapshot;
                 AllflameLog.Throttled(
-                    "voyage_dpb_to_visual_clear",
+                    "voyage_element_to_visual_clear",
                     TimeSpan.FromSeconds(2),
                     "VOYAGE_UI_FALLBACK" +
-                    "|From=DpbApi" +
+                    "|From=StableElement" +
                     "|To=Visual" +
-                    "|Reason=" + dpbClearReason);
+                    "|Reason=StableElementUnavailable");
                 bool firstFound =
                     VoyagePlanningUi.TryAnalyze(
                         out firstClearSnapshot,
@@ -10359,65 +10246,17 @@ namespace AllflameBot
                 return true;
             }
 
-            VoyagePlanningUi.DpbVoyageSnapshot dpbSnapshot;
-            string dpbReason =
-                DateTime.UtcNow < _dpbFallbackUntilUtc
-                    ? "FallbackCooldown"
-                    : "Unavailable";
-            if (DateTime.UtcNow >= _dpbFallbackUntilUtc &&
-                VoyagePlanningUi.TryResolveDpb(
-                    out dpbSnapshot,
-                    out dpbReason))
-            {
-                if (_dpbClearPending)
-                {
-                    bool changed =
-                        dpbSnapshot.AvailableCharts.Count >
-                            _dpbClearBeforeAvailable ||
-                        dpbSnapshot.BoardOccupied <
-                            _dpbClearBeforeBoard ||
-                        (!dpbSnapshot.BeginEnabled &&
-                         _dpbClearBeforeBoard == 0);
-                    if (!changed &&
-                        DateTime.UtcNow - _dpbClearIssuedUtc <
-                            TimeSpan.FromMilliseconds(900))
-                    {
-                        return true;
-                    }
-
-                    AllflameLog.Info(
-                        "VOYAGE_DPB_CLEAR_BOARD" +
-                        "|BeforeAvailable=" +
-                        _dpbClearBeforeAvailable +
-                        "|AfterAvailable=" +
-                        dpbSnapshot.AvailableCharts.Count +
-                        "|BeforeBoard=" + _dpbClearBeforeBoard +
-                        "|AfterBoard=" +
-                        dpbSnapshot.BoardOccupied +
-                        "|AfterState=" + dpbSnapshot.BoardState +
-                        "|Verified=" + changed +
-                        "|Action=" + (changed
-                            ? "ContinuePlanning"
-                            : "ContinueWithFreshApiSnapshot"));
-                    _dpbClearPending = false;
-                }
-
-                return await RunDpbVoyagePlanner(
-                    settings,
-                    dpbSnapshot);
-            }
-
             VoyagePlanningUi.StableVoyageSnapshot stableSnapshot;
             if (VoyagePlanningUi.TryResolveStable(
                     out stableSnapshot))
             {
                 AllflameLog.Throttled(
-                    "voyage_dpb_to_stable",
+                    "voyage_element_primary",
                     TimeSpan.FromSeconds(2),
                     "VOYAGE_UI_FALLBACK" +
-                    "|From=DpbApi" +
+                    "|From=ElementPrimary" +
                     "|To=StableElement" +
-                    "|Reason=" + dpbReason);
+                    "|Reason=PlanBoardOpen");
                 return await RunStableVoyagePlanner(
                     settings,
                     stableSnapshot);
@@ -10425,12 +10264,12 @@ namespace AllflameBot
 
             VoyagePlanningUi.VoyageVisualSnapshot snapshot;
             AllflameLog.Throttled(
-                "voyage_dpb_to_visual",
+                "voyage_element_to_visual",
                 TimeSpan.FromSeconds(2),
                 "VOYAGE_UI_FALLBACK" +
-                "|From=DpbApi" +
+                "|From=StableElement" +
                 "|To=Visual" +
-                "|Reason=" + dpbReason);
+                "|Reason=StableElementUnavailable");
             if (!VoyagePlanningUi.TryAnalyze(
                     out snapshot,
                     true))
@@ -10445,32 +10284,8 @@ namespace AllflameBot
                 return true;
             }
 
-            // DPB 0.3.29.15 exposes the Deepwater inventory directly. Prefer
-            // that authoritative and fast path, while retaining the bounded
-            // visual detector for older/temporarily unavailable UI wrappers.
-            InventoryControlWrapper dpbChartControl;
-            List<Item> dpbCharts;
-            bool dpbInventoryAvailable =
-                VoyagePlanningUi.TryGetDpbAvailableCharts(
-                    out dpbChartControl,
-                    out dpbCharts);
             var chartLocations = snapshot.ChartLocations;
-            if (dpbInventoryAvailable &&
-                dpbCharts.Count == 0 &&
-                snapshot.AvailableChartCount > 0)
-            {
-                AllflameLog.Info(
-                    "VOYAGE_DPB_INVENTORY" +
-                    "|Available=False" +
-                    "|Reason=EmptyDpbInventoryConflictsWithVisualPool" +
-                    "|Visual=" + snapshot.AvailableChartCount +
-                    "|Action=UseVisualFallback");
-                dpbInventoryAvailable = false;
-            }
-            int availableCount =
-                dpbInventoryAvailable
-                    ? dpbCharts.Count
-                    : snapshot.AvailableChartCount;
+            int availableCount = snapshot.AvailableChartCount;
             int configuredTarget =
                 Math.Max(
                     0,
@@ -10495,18 +10310,9 @@ namespace AllflameBot
                     ? "ContinueVoyageChain"
                     : "BuildToConfiguredRequirement") +
                 "|Reconciliation=" + reconciliation +
-                "|Detection=" +
-                (dpbInventoryAvailable
-                    ? "DpbDeepwaterInventory"
-                    : "BeginButtonAnchoredGreenMarkers") +
-                "|DpbElements=" +
-                (dpbInventoryAvailable
-                    ? "Supported"
-                    : "Unavailable") +
-                "|ClickSource=" +
-                (dpbInventoryAvailable
-                    ? "DpbFastMove"
-                    : "VisualMarkers") +
+                "|Detection=BeginButtonAnchoredGreenMarkers" +
+                "|DpbElements=Removed" +
+                "|ClickSource=VisualMarkers" +
                 "|ShapeDetection=Disabled" +
                 "|BeginEnabled=" + snapshot.BeginVoyageEnabled +
                 "|ButtonCorrelation=" +
@@ -10602,10 +10408,7 @@ namespace AllflameBot
                     "|NextConsumption=9");
             }
 
-            int clickableChartCount =
-                dpbInventoryAvailable
-                    ? dpbCharts.Count
-                    : chartLocations.Count;
+            int clickableChartCount = chartLocations.Count;
             if (clickableChartCount < 9)
             {
                 _chartDetectionAttempts++;
@@ -10631,10 +10434,7 @@ namespace AllflameBot
                     "VOYAGE_CHART_WAIT|ProgressReady=True" +
                     "|Visual=" +
                     snapshot.ChartLocations.Count +
-                    "|Dpb=" +
-                    (dpbInventoryAvailable
-                        ? dpbCharts.Count.ToString()
-                        : "Unavailable") +
+                    "|Dpb=Removed" +
                     "|Attempt=" + _chartDetectionAttempts +
                     "|StableCount=" +
                     _stableInsufficientChartSnapshots + "/2" +
@@ -10683,10 +10483,7 @@ namespace AllflameBot
             _stableInsufficientChartSnapshots = 0;
             return await RunIncrementalVisualVoyagePlanner(
                 settings,
-                snapshot,
-                dpbInventoryAvailable,
-                dpbChartControl,
-                dpbCharts);
+                snapshot);
         }
 
         private Task<bool> RunStableVoyagePlanner(
@@ -10696,362 +10493,6 @@ namespace AllflameBot
             return RunIncrementalStableVoyagePlanner(
                 settings,
                 snapshot);
-        }
-
-        private async Task<bool> RunDpbVoyagePlanner(
-            AllflameSettings settings,
-            VoyagePlanningUi.DpbVoyageSnapshot snapshot)
-        {
-            int available = snapshot.AvailableCharts.Count;
-            int board = snapshot.BoardOccupied;
-            int totalCharts = available + board;
-            int configuredTarget = Math.Max(
-                0,
-                Math.Min(60, settings.ChartsRequiredForVoyage));
-            int effectiveTarget = AllflameRunState.VoyageChainActive
-                ? 9
-                : Math.Max(9, configuredTarget);
-
-            AllflameLog.Throttled(
-                "voyage_dpb_api_state",
-                TimeSpan.FromMilliseconds(500),
-                "VOYAGE_DPB_API_STATE" +
-                "|Opened=True" +
-                "|InventoryCharts=" + available +
-                "|BoardOccupied=" + board +
-                "|BoardState=" + snapshot.BoardState +
-                "|BoardCountSource=" + snapshot.BoardCountSource +
-                "|BeginEnabled=" + snapshot.BeginEnabled +
-                "|Confirmed=" + _stablePlacementConfirmed + "/9" +
-                "|AwaitingVerification=" +
-                _stablePlacementAwaitingVerification);
-
-            if (!_stablePlacementActive)
-            {
-                if (totalCharts == 0)
-                {
-                    _chartDetectionAttempts++;
-                    if (_chartDetectionAttempts < 2)
-                    {
-                        _retryAfterUtc =
-                            DateTime.UtcNow.AddMilliseconds(250);
-                        return true;
-                    }
-
-                    AllflameRunState.MarkVoyagePlanChecked(0);
-                    _stage = 0;
-                    _planningReadyAtOpen = false;
-                    _chartDetectionAttempts = 0;
-                    await Coroutines.CloseBlockingWindows();
-                    AllflameLog.Info(
-                        "VOYAGE_PLAN_EMPTY" +
-                        "|Available=0" +
-                        "|Detection=DpbDeepwaterVoyageUi" +
-                        "|ConfirmedSnapshots=2" +
-                        "|Action=ClosePlanAndContinueChartAreas");
-                    return false;
-                }
-
-                bool reconciliation =
-                    AllflameRunState.VoyageReconcileRequired;
-                bool ready = reconciliation
-                    ? totalCharts >= effectiveTarget
-                    : (_planningReadyAtOpen ||
-                       totalCharts >= effectiveTarget);
-                if (!ready)
-                {
-                    if (_lastInsufficientChartCount == totalCharts)
-                    {
-                        _stableInsufficientChartSnapshots++;
-                    }
-                    else
-                    {
-                        _lastInsufficientChartCount = totalCharts;
-                        _stableInsufficientChartSnapshots = 1;
-                    }
-                    if (_stableInsufficientChartSnapshots < 2)
-                    {
-                        _retryAfterUtc =
-                            DateTime.UtcNow.AddMilliseconds(250);
-                        return true;
-                    }
-
-                    AllflameRunState.MarkVoyagePlanChecked(totalCharts);
-                    _stage = 0;
-                    _planningReadyAtOpen = false;
-                    await Coroutines.CloseBlockingWindows();
-                    AllflameLog.Info(
-                        "VOYAGE_NOT_READY" +
-                        "|Available=" + totalCharts +
-                        "|Required=" + effectiveTarget +
-                        "|Detection=DpbDeepwaterVoyageUi" +
-                        "|Action=ContinueChartAreas");
-                    return false;
-                }
-
-                if (reconciliation)
-                {
-                    AllflameRunState.MarkVoyagePlanChecked(totalCharts);
-                }
-                _stablePlacementActive = true;
-                _stablePlacementBaselineAvailable = totalCharts;
-                _stablePlacementConfirmed = Math.Min(9, board);
-                _stablePlacementFailures = 0;
-                _chartDetectionAttempts = 0;
-                _lastInsufficientChartCount = -1;
-                _stableInsufficientChartSnapshots = 0;
-                AllflameLog.Info(
-                    "VOYAGE_PLACEMENT_SESSION" +
-                    "|State=Started" +
-                    "|Available=" + available +
-                    "|Board=" + board +
-                    "|Target=9" +
-                    "|Mode=DpbFastMoveBatch" +
-                    "|BatchSize=3");
-            }
-
-            if (_stablePlacementAwaitingVerification)
-            {
-                int boardDelta = Math.Max(
-                    0,
-                    board - _stablePlacementBeforeBoard);
-                // FastMove can leave the native inventory snapshot unchanged.
-                // Trust only the fresh stable board delta as placement proof.
-                int movedCount = boardDelta;
-                if (movedCount > 0)
-                {
-                    _stablePlacementConfirmed = Math.Min(
-                        9,
-                        Math.Max(
-                            board,
-                            _stablePlacementConfirmed + movedCount));
-                    _stablePlacementAwaitingVerification = false;
-                    _stablePlacementFailures = 0;
-                    AllflameProgressWatchdog.MarkProgress(
-                        "VoyageChartBatchPlaced");
-                    AllflameLog.Info(
-                        "VOYAGE_DPB_FAST_MOVE" +
-                        "|BatchIssued=" +
-                        _dpbPlacementBatchIssued +
-                        "|Moved=" + movedCount +
-                        "|BeforeCharts=" +
-                        _stablePlacementBeforeAvailable +
-                        "|AfterCharts=" + available +
-                        "|BoardDelta=" + boardDelta +
-                        "|BeforeBoard=" +
-                        _stablePlacementBeforeBoard +
-                        "|AfterBoard=" + board +
-                        "|Confirmed=" +
-                        _stablePlacementConfirmed + "/9" +
-                        "|Verified=True");
-                    _dpbPlacementBatchIssued = 0;
-                }
-                else if (DateTime.UtcNow - _stablePlacementIssuedUtc <
-                    TimeSpan.FromMilliseconds(900))
-                {
-                    return true;
-                }
-                else
-                {
-                    _stablePlacementAwaitingVerification = false;
-                    _stablePlacementFailures++;
-                    AllflameLog.Info(
-                        "VOYAGE_DPB_FAST_MOVE" +
-                        "|BatchIssued=" +
-                        _dpbPlacementBatchIssued +
-                        "|Moved=0" +
-                        "|BeforeCharts=" +
-                        _stablePlacementBeforeAvailable +
-                        "|AfterCharts=" + available +
-                        "|BoardDelta=" + boardDelta +
-                        "|Verified=False" +
-                        "|Failure=" +
-                        _stablePlacementFailures + "/3");
-                    AllflameLog.Info(
-                        "VOYAGE_PLACEMENT_POSTCONDITION_MISMATCH" +
-                        "|Mode=DpbFastMove" +
-                        "|BeforeBoard=" +
-                        _stablePlacementBeforeBoard +
-                        "|AfterBoard=" + board +
-                        "|BoardDelta=" + boardDelta +
-                        "|BeforeCharts=" +
-                        _stablePlacementBeforeAvailable +
-                        "|AfterCharts=" + available +
-                        "|Action=UseStableElementFallback");
-                    _dpbPlacementBatchIssued = 0;
-                    if (_stablePlacementFailures >= 3)
-                    {
-                        _dpbFallbackUntilUtc =
-                            DateTime.UtcNow.AddSeconds(5);
-                        ResetStablePlacement();
-                        AllflameLog.Info(
-                            "VOYAGE_UI_FALLBACK" +
-                            "|From=DpbApi" +
-                            "|To=StableElement" +
-                            "|Reason=FastMovePostconditionFailed");
-                    }
-                    return true;
-                }
-            }
-
-            if (snapshot.BeginEnabled)
-            {
-                if (!settings.StartVoyageWhenReady)
-                {
-                    _manualReady = true;
-                    return true;
-                }
-
-                string beginReason;
-                bool inputSent = VoyagePlanningUi.TryDpbBeginVoyage(
-                    out beginReason);
-                _dpbBeginAttempts++;
-                _dpbBeginPending = inputSent;
-                _dpbBeginIssuedUtc = DateTime.UtcNow;
-                _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(250);
-                AllflameLog.Info(
-                    "VOYAGE_DPB_BEGIN" +
-                    "|Attempt=" + _dpbBeginAttempts +
-                    "|Enabled=True" +
-                    "|InputSent=" + inputSent +
-                    "|Verified=False" +
-                    "|BoardState=" + snapshot.BoardState +
-                        "|Reason=" + beginReason);
-                if (!inputSent &&
-                    String.Equals(
-                        beginReason,
-                        "ButtonDisabled",
-                        StringComparison.Ordinal))
-                {
-                    VoyagePlanningUi.StableVoyageSnapshot stableBegin;
-                    if (VoyagePlanningUi.TryResolveStable(
-                            out stableBegin) &&
-                        stableBegin.BoardChartCount >= 9 &&
-                        stableBegin.BeginVoyageEnabled)
-                    {
-                        bool stableClicked =
-                            VoyagePlanningUi.ClickStableElement(
-                                stableBegin.BeginVoyageButton,
-                                "BeginVoyage");
-                        AllflameLog.Info(
-                            "VOYAGE_BEGIN_FALLBACK" +
-                            "|Mode=StableElement" +
-                            "|BoardCharts=" +
-                            stableBegin.BoardChartCount +
-                            "|Clicked=" + stableClicked +
-                            "|Reason=NativeButtonDisabled");
-                        if (stableClicked)
-                        {
-                            AllflameRunState.MarkVoyageStarted();
-                            ResetStablePlacement();
-                            _stage = 0;
-                            _planningReadyAtOpen = false;
-                        }
-                    }
-                }
-                if (!inputSent && _dpbBeginAttempts >= 3)
-                {
-                    _dpbFallbackUntilUtc =
-                        DateTime.UtcNow.AddSeconds(5);
-                }
-                return true;
-            }
-
-            if (_stablePlacementConfirmed >= 9 || board >= 9)
-            {
-                _stablePlacementFailures++;
-                AllflameLog.Info(
-                    "VOYAGE_DPB_BEGIN" +
-                    "|Enabled=False" +
-                    "|BoardOccupied=" + board +
-                    "|Confirmed=" + _stablePlacementConfirmed +
-                    "|Failure=" + _stablePlacementFailures + "/3" +
-                    "|Action=" + (_stablePlacementFailures >= 3
-                        ? "ClearAndRebuildBoard"
-                        : "RefreshApiState"));
-                if (_stablePlacementFailures >= 3)
-                {
-                    ResetStablePlacement();
-                    _stage = 0;
-                }
-                _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(300);
-                return true;
-            }
-
-            if (available == 0)
-            {
-                _stablePlacementFailures++;
-                if (_stablePlacementFailures >= 3)
-                {
-                    ResetStablePlacement();
-                    _stage = 0;
-                }
-                _retryAfterUtc =
-                    DateTime.UtcNow.AddMilliseconds(300);
-                return true;
-            }
-
-            int batchTarget = Math.Min(
-                3,
-                Math.Min(
-                    available,
-                    Math.Max(1, 9 - _stablePlacementConfirmed)));
-            int inputSentCount = 0;
-            _stablePlacementBeforeAvailable = available;
-            _stablePlacementBeforeBoard = board;
-            for (int index = 0; index < batchTarget; index++)
-            {
-                VoyagePlanningUi.DpbChartEntry entry =
-                    snapshot.AvailableCharts[index];
-                FastMoveResult result;
-                string moveReason;
-                bool inputSent = VoyagePlanningUi.TryDpbFastMove(
-                    entry,
-                    out result,
-                    out moveReason);
-                if (inputSent)
-                {
-                    inputSentCount++;
-                }
-                AllflameLog.Info(
-                    "VOYAGE_DPB_FAST_MOVE" +
-                    "|LocalId=" + entry.LocalId +
-                    "|Name=" + entry.Name +
-                    "|Result=" + result +
-                    "|InputSent=" + inputSent +
-                    "|BatchIndex=" + (index + 1) + "/" +
-                    batchTarget +
-                    "|BeforeCharts=" + available +
-                    "|Reason=" + moveReason);
-                if (!inputSent)
-                {
-                    break;
-                }
-                if (index + 1 < batchTarget)
-                {
-                    await LokiCoroutine.Sleep(35);
-                }
-            }
-
-            _dpbPlacementBatchIssued = inputSentCount;
-            _stablePlacementIssuedUtc = DateTime.UtcNow;
-            _stablePlacementAwaitingVerification =
-                inputSentCount > 0;
-            _retryAfterUtc =
-                DateTime.UtcNow.AddMilliseconds(100);
-            if (inputSentCount == 0)
-            {
-                _stablePlacementFailures++;
-                if (_stablePlacementFailures >= 3)
-                {
-                    _dpbFallbackUntilUtc =
-                        DateTime.UtcNow.AddSeconds(5);
-                    ResetStablePlacement();
-                }
-            }
-            return true;
         }
 
         private async Task<bool> RunIncrementalStableVoyagePlanner(
@@ -11312,32 +10753,13 @@ namespace AllflameBot
             _stablePlacementConfirmed = 0;
             _stablePlacementFailures = 0;
             _stablePlacementIssuedUtc = DateTime.MinValue;
-            _dpbPlacementBatchIssued = 0;
-        }
-
-        private void ResetDpbVoyageState()
-        {
-            _dpbPlacementBatchIssued = 0;
-            _dpbClearPending = false;
-            _dpbClearBeforeAvailable = 0;
-            _dpbClearBeforeBoard = 0;
-            _dpbClearIssuedUtc = DateTime.MinValue;
-            _dpbBeginPending = false;
-            _dpbBeginAttempts = 0;
-            _dpbBeginIssuedUtc = DateTime.MinValue;
-            _dpbFallbackUntilUtc = DateTime.MinValue;
         }
 
         private async Task<bool> RunIncrementalVisualVoyagePlanner(
             AllflameSettings settings,
-            VoyagePlanningUi.VoyageVisualSnapshot snapshot,
-            bool dpbInventoryAvailable,
-            InventoryControlWrapper dpbChartControl,
-            List<Item> dpbCharts)
+            VoyagePlanningUi.VoyageVisualSnapshot snapshot)
         {
-            int available = dpbInventoryAvailable
-                ? dpbCharts.Count
-                : snapshot.AvailableChartCount;
+            int available = snapshot.AvailableChartCount;
             if (!_stablePlacementActive)
             {
                 _stablePlacementActive = true;
@@ -11351,9 +10773,7 @@ namespace AllflameBot
                     "|Board=Unknown" +
                     "|Target=9" +
                     "|Mode=OneActionPerCycle" +
-                    "|Detection=" + (dpbInventoryAvailable
-                        ? "DpbDeepwaterInventory"
-                        : "VisualFallback"));
+                    "|Detection=VisualFallback");
             }
 
             if (_stablePlacementAwaitingVerification)
@@ -11375,9 +10795,7 @@ namespace AllflameBot
                         _stablePlacementBeforeAvailable +
                         "|AfterAvailable=" + available +
                         "|Placed=" + _stablePlacementConfirmed + "/9" +
-                        "|Detection=" + (dpbInventoryAvailable
-                            ? "DpbDeepwaterInventory"
-                            : "VisualFallback"));
+                        "|Detection=VisualFallback");
                 }
                 else if (DateTime.UtcNow - _stablePlacementIssuedUtc <
                     TimeSpan.FromMilliseconds(900))
@@ -11451,20 +10869,9 @@ namespace AllflameBot
             }
 
             bool inputSent = false;
-            int localId = 0;
             Vector2i location = new Vector2i();
             _stablePlacementBeforeAvailable = available;
-            if (dpbInventoryAvailable &&
-                dpbChartControl != null &&
-                dpbCharts.Count > 0)
-            {
-                Item chart = dpbCharts[0];
-                localId = chart.LocalId;
-                FastMoveResult fastMoveResult =
-                    dpbChartControl.FastMove(chart.LocalId);
-                inputSent = fastMoveResult == FastMoveResult.None;
-            }
-            else if (snapshot.ChartLocations.Count > 0)
+            if (snapshot.ChartLocations.Count > 0)
             {
                 location = snapshot.ChartLocations[0];
                 inputSent = await VoyagePlanningUi.CtrlClickClient(
@@ -11479,12 +10886,9 @@ namespace AllflameBot
                 "|Placement=" +
                 (_stablePlacementConfirmed + 1) + "/9" +
                 "|BeforeAvailable=" + available +
-                "|LocalId=" + localId +
                 "|Client=" + location +
                 "|InputSent=" + inputSent +
-                "|Detection=" + (dpbInventoryAvailable
-                    ? "DpbDeepwaterInventory"
-                    : "VisualFallback") +
+                "|Detection=VisualFallback" +
                 "|Action=ReturnToTaskManager");
             if (!inputSent)
             {
@@ -11781,25 +11185,6 @@ namespace AllflameBot
                 RegexOptions.IgnoreCase |
                 RegexOptions.CultureInvariant);
 
-        internal sealed class DpbVoyageSnapshot
-        {
-            public bool BeginEnabled;
-            public int BoardOccupied;
-            public string BoardState = "Unknown";
-            public string BoardCountSource = "Unknown";
-            public readonly List<DpbChartEntry> AvailableCharts =
-                new List<DpbChartEntry>();
-        }
-
-        internal sealed class DpbChartEntry
-        {
-            public DeepwaterVoyageUi.VoyageInventoryControlWrapper
-                Wrapper;
-            public Item Item;
-            public int LocalId;
-            public string Name;
-        }
-
         internal sealed class VoyageVisualSnapshot
         {
             public double ButtonCorrelation;
@@ -11861,288 +11246,8 @@ namespace AllflameBot
                 new List<StableChartBatchEntry>();
         }
 
-        public static bool IsDpbOpen()
-        {
-            try
-            {
-                return DeepwaterVoyageUi.IsOpened;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        public static bool TryResolveDpb(
-            out DpbVoyageSnapshot snapshot,
-            out string reason)
-        {
-            snapshot = null;
-            reason = "Unknown";
-            try
-            {
-                if (!DeepwaterVoyageUi.IsOpened)
-                {
-                    reason = "PanelClosed";
-                    return false;
-                }
-
-                var current = new DpbVoyageSnapshot();
-                List<DeepwaterVoyageUi.VoyageInventoryControlWrapper>
-                    wrappers = DeepwaterVoyageUi.ChartsInventory;
-                if (wrappers != null)
-                {
-                    foreach (
-                        DeepwaterVoyageUi.VoyageInventoryControlWrapper
-                            wrapper in wrappers)
-                    {
-                        if (wrapper == null)
-                        {
-                            continue;
-                        }
-                        try
-                        {
-                            Item item = wrapper.Item;
-                            if (item == null ||
-                                !item.IsValid ||
-                                !AllflameContext.IsChartItem(item))
-                            {
-                                continue;
-                            }
-                            current.AvailableCharts.Add(
-                                new DpbChartEntry
-                                {
-                                    Wrapper = wrapper,
-                                    Item = item,
-                                    LocalId = item.LocalId,
-                                    Name = SanitizeDpbValue(
-                                        !String.IsNullOrWhiteSpace(
-                                            item.FullName)
-                                            ? item.FullName
-                                            : item.Name)
-                                });
-                        }
-                        catch
-                        {
-                        }
-                    }
-                }
-
-                DeepwaterVoyageUi.VoyageMapSquare[,] map =
-                    DeepwaterVoyageUi.VoyageMap;
-                if (map != null &&
-                    map.Rank == 2 &&
-                    map.GetLength(0) == 3 &&
-                    map.GetLength(1) == 3)
-                {
-                    var state = new StringBuilder(9);
-                    for (int y = 0; y < 3; y++)
-                    {
-                        for (int x = 0; x < 3; x++)
-                        {
-                            DeepwaterVoyageUi.VoyageMapSquare square =
-                                map[x, y];
-                            state.Append(
-                                square != null
-                                    ? GetDpbDirectionToken(square)
-                                    : '.');
-                        }
-                    }
-                    current.BoardState = state.ToString();
-                }
-
-                // Directions and disconnections describe a chart's shape,
-                // not whether a board square contains a chart. Resolve the
-                // stable UI once and use its actual child count for board
-                // occupancy and Begin state.
-                StableVoyageSnapshot stableSnapshot;
-                if (!TryResolveStable(out stableSnapshot))
-                {
-                    reason = "StableBoardUnavailable";
-                    return false;
-                }
-                current.BoardOccupied = stableSnapshot.BoardChartCount;
-                current.BeginEnabled = stableSnapshot.BeginVoyageEnabled;
-                current.BoardCountSource = "StableElement";
-                snapshot = current;
-                reason = "Available";
-                return true;
-            }
-            catch (Exception exception)
-            {
-                reason = SanitizeDpbValue(
-                    exception.GetType().Name + ":" +
-                    exception.Message);
-                AllflameLog.Throttled(
-                    "voyage_dpb_api_error",
-                    TimeSpan.FromSeconds(3),
-                    "VOYAGE_DPB_API_STATE" +
-                    "|Opened=Unknown" +
-                    "|Result=Exception" +
-                    "|Reason=" + reason);
-                return false;
-            }
-        }
-
-        public static bool TryDpbFastMove(
-            DpbChartEntry entry,
-            out FastMoveResult result,
-            out string reason)
-        {
-            result = FastMoveResult.Failed;
-            reason = "InvalidEntry";
-            if (entry == null || entry.Wrapper == null)
-            {
-                return false;
-            }
-            try
-            {
-                result = entry.Wrapper.FastMove();
-                reason = result.ToString();
-                return result == FastMoveResult.None;
-            }
-            catch (Exception exception)
-            {
-                reason = SanitizeDpbValue(
-                    exception.GetType().Name + ":" +
-                    exception.Message);
-                return false;
-            }
-        }
-
-        public static bool TryDpbBeginVoyage(out string reason)
-        {
-            reason = "Unavailable";
-            try
-            {
-                if (!DeepwaterVoyageUi.IsOpened)
-                {
-                    reason = "PanelClosed";
-                    return false;
-                }
-                if (!DeepwaterVoyageUi.IsBeginVoyageEnabled)
-                {
-                    reason = "ButtonDisabled";
-                    return false;
-                }
-                DeepwaterVoyageUi.BeginVoyage();
-                reason = "Invoked";
-                return true;
-            }
-            catch (Exception exception)
-            {
-                reason = SanitizeDpbValue(
-                    exception.GetType().Name + ":" +
-                    exception.Message);
-                return false;
-            }
-        }
-
-        public static bool TryDpbClearBoard(out string reason)
-        {
-            reason = "Unavailable";
-            try
-            {
-                if (!DeepwaterVoyageUi.IsOpened)
-                {
-                    reason = "PanelClosed";
-                    return false;
-                }
-                DeepwaterVoyageUi.ClearBoard();
-                reason = "Invoked";
-                return true;
-            }
-            catch (Exception exception)
-            {
-                reason = SanitizeDpbValue(
-                    exception.GetType().Name + ":" +
-                    exception.Message);
-                return false;
-            }
-        }
-
-        private static char GetDpbDirectionToken(
-            DeepwaterVoyageUi.VoyageMapSquare square)
-        {
-            try
-            {
-                int value = (int)square.Directions;
-                const string tokens = "0123456789ABCDEF";
-                return value >= 0 && value < tokens.Length
-                    ? tokens[value]
-                    : '#';
-            }
-            catch
-            {
-                return '#';
-            }
-        }
-
-        private static string SanitizeDpbValue(string value)
-        {
-            return String.IsNullOrWhiteSpace(value)
-                ? "<none>"
-                : value
-                    .Replace("|", "/")
-                    .Replace("\r", " ")
-                    .Replace("\n", " ");
-        }
-
-        public static bool TryGetDpbAvailableCharts(
-            out InventoryControlWrapper control,
-            out List<Item> charts)
-        {
-            control = null;
-            charts = new List<Item>();
-            try
-            {
-                if (!LokiPoe.InGameState.DeepwaterChartUi.IsOpened)
-                {
-                    return false;
-                }
-
-                control =
-                    LokiPoe.InGameState.DeepwaterChartUi
-                        .InventoryControl_Main;
-                if (control == null ||
-                    control.Inventory == null ||
-                    control.Inventory.Items == null)
-                {
-                    return false;
-                }
-
-                charts = control.Inventory.Items
-                    .Where(
-                        item =>
-                            item != null &&
-                            item.IsValid &&
-                            AllflameContext.IsChartItem(item))
-                    .OrderBy(item => item.LocationTopLeft.Y)
-                    .ThenBy(item => item.LocationTopLeft.X)
-                    .ToList();
-                return true;
-            }
-            catch (Exception exception)
-            {
-                control = null;
-                charts = new List<Item>();
-                AllflameLog.Throttled(
-                    "voyage_dpb_inventory_error",
-                    TimeSpan.FromSeconds(3),
-                    "VOYAGE_DPB_INVENTORY" +
-                    "|Available=False" +
-                    "|Error=" + exception.GetType().Name +
-                    "|Action=UseVisualFallback");
-                return false;
-            }
-        }
-
         public static bool IsOpen()
         {
-            if (IsDpbOpen())
-            {
-                return true;
-            }
             StableVoyageSnapshot stable;
             if (TryResolveStable(out stable))
             {
@@ -12592,22 +11697,30 @@ namespace AllflameBot
 
             try
             {
-                List<Element> inventorySlots =
-                    SafeStableChildren(snapshot.InventoryRegion);
-                if (inventoryIndex >= inventorySlots.Count)
+                var slotUi = new InventorySlotUiElement(
+                    snapshot.InventoryRegion.Address,
+                    StashType.NormalStash);
+                if (slotUi == null ||
+                    !slotUi.IsValid ||
+                    !slotUi.IsVisible)
+                {
+                    rejectionReason = "InventorySlotUiUnavailable";
+                    return false;
+                }
+
+                const int columns = 6;
+                const int rows = 10;
+                if (slotUi.Size.X != columns ||
+                    slotUi.Size.Y != rows)
                 {
                     rejectionReason =
-                        "InventorySlotMissing:" + inventorySlots.Count;
+                        "UnexpectedGridSize:" + slotUi.Size;
                     return false;
                 }
-                Element slot = inventorySlots[inventoryIndex];
-                if (!IsStableVisible(slot) ||
-                    !ContainsStableLevelLabel(slot))
-                {
-                    rejectionReason = "InventoryChartSlotUnavailable";
-                    return false;
-                }
-                location = slot.CenterClickLocation();
+                int column = inventoryIndex % columns;
+                int row = inventoryIndex / columns;
+                location = slotUi.SlotClickLocation(
+                    new Vector2i(column + 1, row + 1));
                 if (!IsClientLocationValid(location))
                 {
                     rejectionReason =
@@ -12615,18 +11728,20 @@ namespace AllflameBot
                     return false;
                 }
 
-                mode = "StableElementSlot";
+                mode = "InventorySlotUiElement";
                 AllflameLog.Throttled(
                     "voyage_chart_grid_geometry",
                     TimeSpan.FromSeconds(2),
                     "VOYAGE_CHART_GRID" +
                     "|InventoryAddress=0x" +
                     snapshot.InventoryRegion.Address.ToString("X") +
-                    "|SlotAddress=0x" + slot.Address.ToString("X") +
+                    "|GridSize=" + slotUi.Size +
+                    "|GridTopLeft=" + slotUi.LocationTopLeft +
                     "|Index=" + inventoryIndex +
+                    "|Column=" + column +
+                    "|Row=" + row +
                     "|Client=" + location +
-                    "|Mode=" + mode +
-                    "|Result=Resolved");
+                    "|Mode=" + mode);
                 return true;
             }
             catch (Exception exception)

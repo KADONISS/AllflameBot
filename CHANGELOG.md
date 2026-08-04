@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.144 - 2026-08-05
+
+- Remove the new DPB Voyage API from Plan Board clearing, Chart placement and
+  Begin Voyage flow.
+- Restore the Element UI planner with the bounded visual Chart coordinate
+  fallback used by the successful 9/9 placement path.
+- Keep placement verification based on fresh UI state so stale coordinates do
+  not repeatedly click the same Chart.
+
 ## 0.23.143 - 2026-08-05
 
 - Fix Voyage Planner board occupancy to use the stable UI's actual Chart
