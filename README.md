@@ -562,6 +562,42 @@ Useful live-test records are `COLLECT_RAW_UI`, `COLLECT_RAW_TAB`,
 
 The observer log is intentionally compact. `Deepwater Probe` remains the
 source for full UI trees and complete object snapshots.
+
+## DPB developer guidance
+
+These rules come from the DPB developer notes and apply to new AllflameBot
+logic:
+
+- `Utility.BroadcastMessage(sender, id, params dynamic[] input)` invokes
+  `Message` on Content, the current Routine, the current Mover, and enabled
+  Plugins, in that order. The call remains on DPB's `MainCoroutine` thread;
+  message handlers must be short and must never perform blocking or expensive
+  work.
+- Message ids and custom input/output types are an integration contract.
+  Keep ids documented, validate inputs with `TryGetInput<T>`, and use named
+  outputs when reading `Message` results. Shared custom types must have the
+  same data type and constructor in every communicating component.
+- Treat every bot cycle as a state-machine step: inspect the current snapshot,
+  perform at most one action, then return to the task manager. Do not use a
+  long `for`/`foreach` loop for movement, combat, looting, or interaction;
+  returning lets the bot react to newly appearing threats and changed UI state.
+- `LokiPoe.ObjectManager` exposes a nearby-object snapshot, limited to roughly
+  210 units. Movement can invalidate objects from that snapshot, so reacquire
+  objects after meaningful movement and never assume a previously captured
+  object remains valid.
+- Object ids are unique within a zone. Cache only the small set of properties
+  needed by the current task, mark processed ids, and skip them on later ticks.
+  Limit snapshot refreshes with a stopwatch or equivalent cadence limiter.
+- Avoid repeated property reads and heavy LINQ chains on live DPB objects.
+  DPB resolves object properties from game memory through the object address;
+  `Where`, `OrderBy`, and chained projections can become expensive in dense
+  areas. Prefer one bounded scan, lightweight cached records, and explicit
+  distance comparison when ordering is required.
+- Currency Exchange UI changes are asynchronous. After selecting currencies or
+  quantities, wait with `Coroutines.LatencyWait()` and verify the corresponding
+  selected value before continuing. Place, cancel, and retrieve operations
+  must also be bounded and confirmed from the resulting order state.
+
 # Native Deepwater support (0.23.20)
 
 - Requires DreamPoeBot 0.3.29.11 or newer; built and verified against 0.3.29.12.

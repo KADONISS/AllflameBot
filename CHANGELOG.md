@@ -2,6 +2,17 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.143 - 2026-08-05
+
+- Fix Voyage Planner board occupancy to use the stable UI's actual Chart
+  count instead of interpreting map directions and border data as occupied
+  squares.
+- Resolve inventory Chart click coordinates from the live stable slot
+  elements, avoiding the invalid `6x10` grid-size assumption.
+- Require a real stable board delta before confirming `FastMove()` placement,
+  log postcondition mismatches, and use a bounded stable-element Begin Voyage
+  fallback when the native button state is stale.
+
 ## 0.23.142 - 2026-08-04
 
 - Use DreamPoeBot 0.3.29.23 `DeepwaterVoyageUi` as the primary Voyage

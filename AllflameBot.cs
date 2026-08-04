@@ -23,7 +23,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.142";
+        public const string Current = "0.23.143";
     }
 
     public sealed class AllflameBot : IBot
@@ -10720,6 +10720,7 @@ namespace AllflameBot
                 "|InventoryCharts=" + available +
                 "|BoardOccupied=" + board +
                 "|BoardState=" + snapshot.BoardState +
+                "|BoardCountSource=" + snapshot.BoardCountSource +
                 "|BeginEnabled=" + snapshot.BeginEnabled +
                 "|Confirmed=" + _stablePlacementConfirmed + "/9" +
                 "|AwaitingVerification=" +
@@ -10811,13 +10812,12 @@ namespace AllflameBot
 
             if (_stablePlacementAwaitingVerification)
             {
-                int inventoryDelta = Math.Max(
-                    0,
-                    _stablePlacementBeforeAvailable - available);
                 int boardDelta = Math.Max(
                     0,
                     board - _stablePlacementBeforeBoard);
-                int movedCount = Math.Max(inventoryDelta, boardDelta);
+                // FastMove can leave the native inventory snapshot unchanged.
+                // Trust only the fresh stable board delta as placement proof.
+                int movedCount = boardDelta;
                 if (movedCount > 0)
                 {
                     _stablePlacementConfirmed = Math.Min(
@@ -10837,6 +10837,7 @@ namespace AllflameBot
                         "|BeforeCharts=" +
                         _stablePlacementBeforeAvailable +
                         "|AfterCharts=" + available +
+                        "|BoardDelta=" + boardDelta +
                         "|BeforeBoard=" +
                         _stablePlacementBeforeBoard +
                         "|AfterBoard=" + board +
@@ -10862,9 +10863,21 @@ namespace AllflameBot
                         "|BeforeCharts=" +
                         _stablePlacementBeforeAvailable +
                         "|AfterCharts=" + available +
+                        "|BoardDelta=" + boardDelta +
                         "|Verified=False" +
                         "|Failure=" +
                         _stablePlacementFailures + "/3");
+                    AllflameLog.Info(
+                        "VOYAGE_PLACEMENT_POSTCONDITION_MISMATCH" +
+                        "|Mode=DpbFastMove" +
+                        "|BeforeBoard=" +
+                        _stablePlacementBeforeBoard +
+                        "|AfterBoard=" + board +
+                        "|BoardDelta=" + boardDelta +
+                        "|BeforeCharts=" +
+                        _stablePlacementBeforeAvailable +
+                        "|AfterCharts=" + available +
+                        "|Action=UseStableElementFallback");
                     _dpbPlacementBatchIssued = 0;
                     if (_stablePlacementFailures >= 3)
                     {
@@ -10904,7 +10917,39 @@ namespace AllflameBot
                     "|InputSent=" + inputSent +
                     "|Verified=False" +
                     "|BoardState=" + snapshot.BoardState +
-                    "|Reason=" + beginReason);
+                        "|Reason=" + beginReason);
+                if (!inputSent &&
+                    String.Equals(
+                        beginReason,
+                        "ButtonDisabled",
+                        StringComparison.Ordinal))
+                {
+                    VoyagePlanningUi.StableVoyageSnapshot stableBegin;
+                    if (VoyagePlanningUi.TryResolveStable(
+                            out stableBegin) &&
+                        stableBegin.BoardChartCount >= 9 &&
+                        stableBegin.BeginVoyageEnabled)
+                    {
+                        bool stableClicked =
+                            VoyagePlanningUi.ClickStableElement(
+                                stableBegin.BeginVoyageButton,
+                                "BeginVoyage");
+                        AllflameLog.Info(
+                            "VOYAGE_BEGIN_FALLBACK" +
+                            "|Mode=StableElement" +
+                            "|BoardCharts=" +
+                            stableBegin.BoardChartCount +
+                            "|Clicked=" + stableClicked +
+                            "|Reason=NativeButtonDisabled");
+                        if (stableClicked)
+                        {
+                            AllflameRunState.MarkVoyageStarted();
+                            ResetStablePlacement();
+                            _stage = 0;
+                            _planningReadyAtOpen = false;
+                        }
+                    }
+                }
                 if (!inputSent && _dpbBeginAttempts >= 3)
                 {
                     _dpbFallbackUntilUtc =
@@ -11741,6 +11786,7 @@ namespace AllflameBot
             public bool BeginEnabled;
             public int BoardOccupied;
             public string BoardState = "Unknown";
+            public string BoardCountSource = "Unknown";
             public readonly List<DpbChartEntry> AvailableCharts =
                 new List<DpbChartEntry>();
         }
@@ -11896,14 +11942,8 @@ namespace AllflameBot
                         {
                             DeepwaterVoyageUi.VoyageMapSquare square =
                                 map[x, y];
-                            bool occupied =
-                                IsDpbVoyageSquareOccupied(square);
-                            if (occupied)
-                            {
-                                current.BoardOccupied++;
-                            }
                             state.Append(
-                                occupied
+                                square != null
                                     ? GetDpbDirectionToken(square)
                                     : '.');
                         }
@@ -11911,8 +11951,19 @@ namespace AllflameBot
                     current.BoardState = state.ToString();
                 }
 
-                current.BeginEnabled =
-                    DeepwaterVoyageUi.IsBeginVoyageEnabled;
+                // Directions and disconnections describe a chart's shape,
+                // not whether a board square contains a chart. Resolve the
+                // stable UI once and use its actual child count for board
+                // occupancy and Begin state.
+                StableVoyageSnapshot stableSnapshot;
+                if (!TryResolveStable(out stableSnapshot))
+                {
+                    reason = "StableBoardUnavailable";
+                    return false;
+                }
+                current.BoardOccupied = stableSnapshot.BoardChartCount;
+                current.BeginEnabled = stableSnapshot.BeginVoyageEnabled;
+                current.BoardCountSource = "StableElement";
                 snapshot = current;
                 reason = "Available";
                 return true;
@@ -12006,31 +12057,6 @@ namespace AllflameBot
                 reason = SanitizeDpbValue(
                     exception.GetType().Name + ":" +
                     exception.Message);
-                return false;
-            }
-        }
-
-        private static bool IsDpbVoyageSquareOccupied(
-            DeepwaterVoyageUi.VoyageMapSquare square)
-        {
-            if (square == null)
-            {
-                return false;
-            }
-            try
-            {
-                if (square.Directions !=
-                        DeepwaterVoyageUi.Direction.None ||
-                    square.Disconnections !=
-                        DeepwaterVoyageUi.Direction.None)
-                {
-                    return true;
-                }
-                return square.BorderMods != null &&
-                    square.BorderMods.Count > 0;
-            }
-            catch
-            {
                 return false;
             }
         }
@@ -12566,30 +12592,22 @@ namespace AllflameBot
 
             try
             {
-                var slotUi = new InventorySlotUiElement(
-                    snapshot.InventoryRegion.Address,
-                    StashType.NormalStash);
-                if (slotUi == null ||
-                    !slotUi.IsValid ||
-                    !slotUi.IsVisible)
-                {
-                    rejectionReason = "InventorySlotUiUnavailable";
-                    return false;
-                }
-
-                const int columns = 6;
-                const int rows = 10;
-                if (slotUi.Size.X != columns ||
-                    slotUi.Size.Y != rows)
+                List<Element> inventorySlots =
+                    SafeStableChildren(snapshot.InventoryRegion);
+                if (inventoryIndex >= inventorySlots.Count)
                 {
                     rejectionReason =
-                        "UnexpectedGridSize:" + slotUi.Size;
+                        "InventorySlotMissing:" + inventorySlots.Count;
                     return false;
                 }
-                int column = inventoryIndex % columns;
-                int row = inventoryIndex / columns;
-                location = slotUi.SlotClickLocation(
-                    new Vector2i(column + 1, row + 1));
+                Element slot = inventorySlots[inventoryIndex];
+                if (!IsStableVisible(slot) ||
+                    !ContainsStableLevelLabel(slot))
+                {
+                    rejectionReason = "InventoryChartSlotUnavailable";
+                    return false;
+                }
+                location = slot.CenterClickLocation();
                 if (!IsClientLocationValid(location))
                 {
                     rejectionReason =
@@ -12597,20 +12615,18 @@ namespace AllflameBot
                     return false;
                 }
 
-                mode = "InventorySlotUiElement";
+                mode = "StableElementSlot";
                 AllflameLog.Throttled(
                     "voyage_chart_grid_geometry",
                     TimeSpan.FromSeconds(2),
                     "VOYAGE_CHART_GRID" +
                     "|InventoryAddress=0x" +
                     snapshot.InventoryRegion.Address.ToString("X") +
-                    "|GridSize=" + slotUi.Size +
-                    "|GridTopLeft=" + slotUi.LocationTopLeft +
+                    "|SlotAddress=0x" + slot.Address.ToString("X") +
                     "|Index=" + inventoryIndex +
-                    "|Column=" + column +
-                    "|Row=" + row +
                     "|Client=" + location +
-                    "|Mode=" + mode);
+                    "|Mode=" + mode +
+                    "|Result=Resolved");
                 return true;
             }
             catch (Exception exception)
