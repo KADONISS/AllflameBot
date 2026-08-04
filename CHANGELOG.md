@@ -2,6 +2,21 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.142 - 2026-08-04
+
+- Use DreamPoeBot 0.3.29.23 `DeepwaterVoyageUi` as the primary Voyage
+  Planner interface for open-state detection, Chart inventory reads, board
+  state, Clear Board and Begin Voyage actions.
+- Transfer Charts through the dedicated `VoyageInventoryControlWrapper`
+  `FastMove()` API in bounded batches of three, then verify inventory or board
+  deltas before issuing another batch.
+- Verify Clear Board and Begin Voyage postconditions instead of assuming that
+  a void API call succeeded, with bounded retries and explicit fallback to the
+  existing stable Element path.
+- Retain the visual Voyage Planner only as the final temporary fallback, while
+  logging API state, board signatures, transfer results and every fallback
+  reason through `VOYAGE_DPB_*` and `VOYAGE_UI_FALLBACK` markers.
+
 ## 0.23.141 - 2026-08-04
 
 - Quarantine Chart-area transitions immediately after the first successful
