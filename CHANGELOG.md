@@ -2,6 +2,20 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.141 - 2026-08-04
+
+- Quarantine Chart-area transitions immediately after the first successful
+  Bathysphere portal interaction, avoiding object, inventory and GUI reads
+  until a nonzero new area hash is stable for two consecutive refreshes.
+- Suppress repeated portal interactions for eight seconds and permit only one
+  bounded retry before the 30-second `ChartAreaTransitionTimeout` recovery
+  stop.
+- Restrict automatic Capsule direct-UI inspection to Voyage areas so Hub and
+  Chart maps no longer read the extraction window on every context refresh.
+- Mark coroutine resume faults once, request a controlled stop and rebuild
+  stale or faulted coroutine/task state on the next Start instead of emitting
+  an endless resume-exception loop.
+
 ## 0.23.140 - 2026-08-04
 
 - Reset Valerie alternate-approach recovery state across task start, stop,

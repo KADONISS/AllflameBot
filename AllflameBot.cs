@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.140";
+        public const string Current = "0.23.141";
     }
 
     public sealed class AllflameBot : IBot
@@ -32,6 +32,9 @@ namespace AllflameBot
         private AllflameBotGui _control;
         private bool _initialized;
         private bool _started;
+        private bool _coroutineFaulted;
+        private bool _coroutineFaultLogged;
+        private DateTime _lastCoroutineActivityUtc = DateTime.MinValue;
 
         public string Name { get { return "Allflame Bot"; } }
         public string Description { get { return "Chart Area runner for PoE 3.29 Allflame/Deepwater content."; } }
@@ -65,6 +68,7 @@ namespace AllflameBot
                 "|Mode=Active");
 
             _taskManager.Add(new UpdateDeepwaterStateTask());
+            _taskManager.Add(new ChartAreaTransitionTask());
             _taskManager.Add(new RespawnTask());
             _taskManager.Add(new UseLifeFlaskTask());
             _taskManager.Add(new UseEnduringCryTask());
@@ -111,7 +115,16 @@ namespace AllflameBot
         {
             if (_started)
             {
-                return;
+                bool healthy = IsCoroutineHealthy();
+                if (healthy)
+                {
+                    return;
+                }
+
+                CleanupStaleRuntimeForRestart();
+                AllflameLog.Info(
+                    "BOT_COROUTINE_REBUILT" +
+                    "|Reason=StaleOrFaultedRuntime");
             }
 
             if (!_initialized)
@@ -131,6 +144,9 @@ namespace AllflameBot
             EnsurePlayerMover();
             _taskManager.Start();
             _coroutine = new LokiCoroutine(new Func<Task<object>>(MainLoop));
+            _coroutineFaulted = false;
+            _coroutineFaultLogged = false;
+            _lastCoroutineActivityUtc = DateTime.UtcNow;
             _started = true;
             AllflameNotifications.StartSessionDashboard();
             AllflameLog.Info(
@@ -217,7 +233,6 @@ namespace AllflameBot
                 if (_coroutine != null)
                 {
                     _coroutine.Dispose();
-                    _coroutine = null;
                 }
             }
             catch (Exception ex)
@@ -238,7 +253,13 @@ namespace AllflameBot
                 {
                     stopSource = "FatalStop";
                 }
+            }
+            finally
+            {
                 _coroutine = null;
+                _coroutineFaulted = false;
+                _coroutineFaultLogged = false;
+                _lastCoroutineActivityUtc = DateTime.MinValue;
             }
 
             string stopContext = AllflameProgressWatchdog.Describe();
@@ -308,6 +329,7 @@ namespace AllflameBot
                 try
                 {
                     _coroutine.Resume();
+                    _lastCoroutineActivityUtc = DateTime.UtcNow;
                 }
                 catch (Exception ex)
                 {
@@ -315,20 +337,97 @@ namespace AllflameBot
                         ex.GetType().Name,
                         "CoroutineStoppedException",
                         StringComparison.Ordinal);
-                    AllflameLog.Info(
-                        (cancelled
-                            ? "BOT_COROUTINE_RESUME_CANCELLED"
-                            : "BOT_COROUTINE_RESUME_FAILED") +
-                        "|Type=" + ex.GetType().Name +
-                        "|Source=" +
-                        (cancelled
-                            ? (AllflameStopController.StopRequested
+                    if (cancelled)
+                    {
+                        AllflameLog.Info(
+                            "BOT_COROUTINE_RESUME_CANCELLED" +
+                            "|Type=" + ex.GetType().Name +
+                            "|Source=" +
+                            (AllflameStopController.StopRequested
                                 ? "RecoveryStop"
-                                : "UserStop")
-                            : "FatalStop") +
-                        "|Context=" +
-                        AllflameProgressWatchdog.Describe());
+                                : "UserStop") +
+                            "|Context=" +
+                            AllflameProgressWatchdog.Describe());
+                        return;
+                    }
+
+                    _coroutineFaulted = true;
+                    if (!_coroutineFaultLogged)
+                    {
+                        _coroutineFaultLogged = true;
+                        AllflameLog.Info(
+                            "BOT_COROUTINE_FAULT" +
+                            "|Type=" + ex.GetType().Name +
+                            "|Message=" +
+                            (ex.Message ?? String.Empty).Replace("|", "/") +
+                            "|Context=" +
+                            AllflameProgressWatchdog.Describe());
+                    }
+                    AllflameStopController.Stop(
+                        "BotCoroutineFault",
+                        "ActiveTask=BotRuntime|Type=" +
+                        ex.GetType().Name);
                 }
+            }
+        }
+
+        private bool IsCoroutineHealthy()
+        {
+            if (_coroutine == null || _coroutineFaulted)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (_coroutine.IsFinished)
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+
+            return _lastCoroutineActivityUtc != DateTime.MinValue &&
+                   DateTime.UtcNow - _lastCoroutineActivityUtc <
+                   TimeSpan.FromSeconds(10);
+        }
+
+        private void CleanupStaleRuntimeForRestart()
+        {
+            _started = false;
+            try
+            {
+                if (_coroutine != null)
+                {
+                    _coroutine.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BOT_COROUTINE_REBUILD_DISPOSE" +
+                    "|Type=" + ex.GetType().Name);
+            }
+            finally
+            {
+                _coroutine = null;
+                _coroutineFaulted = false;
+                _coroutineFaultLogged = false;
+                _lastCoroutineActivityUtc = DateTime.MinValue;
+            }
+
+            try
+            {
+                _taskManager.Stop();
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BOT_TASK_MANAGER_REBUILD_STOP" +
+                    "|Type=" + ex.GetType().Name);
             }
         }
 
@@ -398,6 +497,187 @@ namespace AllflameBot
         ChartArea,
         Voyage,
         WaitingForBathysphere
+    }
+
+    internal static class AllflameAreaTransitionGuard
+    {
+        private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(8);
+        private static readonly TimeSpan HardTimeout = TimeSpan.FromSeconds(30);
+        private static bool _pending;
+        private static uint _sourceAreaHash;
+        private static int _portalId;
+        private static Vector2i _portalPosition;
+        private static DateTime _startedUtc = DateTime.MinValue;
+        private static DateTime _nextRetryUtc = DateTime.MinValue;
+        private static int _interactionCount;
+        private static uint _candidateAreaHash;
+        private static int _stableCandidateSamples;
+        private static bool _sourceRuntimeReady;
+
+        public static bool Pending { get { return _pending; } }
+        public static int PortalId { get { return _portalId; } }
+
+        public static void Reset()
+        {
+            _pending = false;
+            _sourceAreaHash = 0;
+            _portalId = 0;
+            _portalPosition = new Vector2i();
+            _startedUtc = DateTime.MinValue;
+            _nextRetryUtc = DateTime.MinValue;
+            _interactionCount = 0;
+            _candidateAreaHash = 0;
+            _stableCandidateSamples = 0;
+            _sourceRuntimeReady = false;
+        }
+
+        public static void Arm(NetworkObject portal)
+        {
+            if (_pending || portal == null)
+            {
+                return;
+            }
+
+            _pending = true;
+            _sourceAreaHash = AllflameContext.AreaHash;
+            _portalId = portal.Id;
+            _portalPosition = portal.Position;
+            _startedUtc = DateTime.UtcNow;
+            _nextRetryUtc = _startedUtc + RetryDelay;
+            _interactionCount = 1;
+            _candidateAreaHash = 0;
+            _stableCandidateSamples = 0;
+            _sourceRuntimeReady = true;
+            AllflameLog.Info(
+                "CHART_AREA_TRANSITION_ARMED" +
+                "|SourceAreaHash=" + _sourceAreaHash +
+                "|PortalId=" + _portalId +
+                "|PortalPosition=" + _portalPosition +
+                "|Interactions=" + _interactionCount +
+                "|TimeoutSeconds=" + (int)HardTimeout.TotalSeconds);
+        }
+
+        public static bool Observe(bool runtimeReady, uint observedAreaHash)
+        {
+            if (!_pending)
+            {
+                return false;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            TimeSpan elapsed = now - _startedUtc;
+            if (elapsed >= HardTimeout)
+            {
+                string detail =
+                    "ActiveTask=LoadChartDeviceTask" +
+                    "|SourceAreaHash=" + _sourceAreaHash +
+                    "|ObservedAreaHash=" + observedAreaHash +
+                    "|PortalId=" + _portalId +
+                    "|Interactions=" + _interactionCount +
+                    "|ElapsedMilliseconds=" +
+                    (int)elapsed.TotalMilliseconds;
+                AllflameLog.Info("CHART_AREA_TRANSITION_TIMEOUT|" + detail);
+                AllflameStopController.Stop(
+                    "ChartAreaTransitionTimeout",
+                    detail);
+                return true;
+            }
+
+            _sourceRuntimeReady =
+                runtimeReady && observedAreaHash == _sourceAreaHash;
+            if (!runtimeReady || observedAreaHash == 0)
+            {
+                _candidateAreaHash = 0;
+                _stableCandidateSamples = 0;
+                LogWait("RuntimeNotReady", observedAreaHash, elapsed);
+                return true;
+            }
+
+            if (observedAreaHash == _sourceAreaHash)
+            {
+                _candidateAreaHash = 0;
+                _stableCandidateSamples = 0;
+                LogWait("SourceAreaStillActive", observedAreaHash, elapsed);
+                return true;
+            }
+
+            if (_candidateAreaHash == observedAreaHash)
+            {
+                _stableCandidateSamples++;
+            }
+            else
+            {
+                _candidateAreaHash = observedAreaHash;
+                _stableCandidateSamples = 1;
+            }
+
+            if (_stableCandidateSamples < 2)
+            {
+                LogWait("NewAreaStabilityCheck", observedAreaHash, elapsed);
+                return true;
+            }
+
+            AllflameLog.Info(
+                "CHART_AREA_TRANSITION_READY" +
+                "|SourceAreaHash=" + _sourceAreaHash +
+                "|NewAreaHash=" + observedAreaHash +
+                "|StableSamples=" + _stableCandidateSamples +
+                "|ElapsedMilliseconds=" +
+                (int)elapsed.TotalMilliseconds +
+                "|Interactions=" + _interactionCount);
+            Reset();
+            return false;
+        }
+
+        public static bool CanRetry(uint currentAreaHash)
+        {
+            return _pending &&
+                   _sourceRuntimeReady &&
+                   currentAreaHash == _sourceAreaHash &&
+                   _interactionCount < 2 &&
+                   DateTime.UtcNow >= _nextRetryUtc;
+        }
+
+        public static int RegisterRetry()
+        {
+            _interactionCount++;
+            _nextRetryUtc = DateTime.MaxValue;
+            return _interactionCount;
+        }
+
+        public static void LogInteractionSuppressed(uint currentAreaHash)
+        {
+            TimeSpan elapsed = DateTime.UtcNow - _startedUtc;
+            AllflameLog.Throttled(
+                "chart_portal_interaction_suppressed",
+                TimeSpan.FromSeconds(1),
+                "CHART_PORTAL_INTERACTION_SUPPRESSED" +
+                "|SourceAreaHash=" + _sourceAreaHash +
+                "|CurrentAreaHash=" + currentAreaHash +
+                "|PortalId=" + _portalId +
+                "|Interactions=" + _interactionCount +
+                "|ElapsedMilliseconds=" +
+                Math.Max(0, (int)elapsed.TotalMilliseconds) +
+                "|RetryReady=" + CanRetry(currentAreaHash));
+        }
+
+        private static void LogWait(
+            string reason,
+            uint observedAreaHash,
+            TimeSpan elapsed)
+        {
+            AllflameLog.Throttled(
+                "chart_area_transition_wait",
+                TimeSpan.FromSeconds(1),
+                "CHART_AREA_TRANSITION_WAIT" +
+                "|Reason=" + reason +
+                "|SourceAreaHash=" + _sourceAreaHash +
+                "|ObservedAreaHash=" + observedAreaHash +
+                "|StableSamples=" + _stableCandidateSamples +
+                "|Interactions=" + _interactionCount +
+                "|ElapsedMilliseconds=" +
+                Math.Max(0, (int)elapsed.TotalMilliseconds));
+        }
     }
 
     internal static class AllflameContext
@@ -511,10 +791,12 @@ namespace AllflameBot
                 _lastCoverageTransitionUtc = DateTime.MinValue;
                 _coverageOscillationCount = 0;
                 _coverageOscillationWarned = false;
+                AllflameAreaTransitionGuard.Reset();
                 BathysphereCallObserved = false;
                 Phase = AllflamePhase.NotInGame;
                 AreaId = String.Empty;
                 AreaName = String.Empty;
+                AreaHash = 0;
                 PlayerPosition = String.Empty;
                 InventoryFreeSquares = -1;
                 InventoryItemCount = 0;
@@ -551,6 +833,7 @@ namespace AllflameBot
                 {
                     if (!LokiPoe.IsInGame)
                     {
+                        AllflameAreaTransitionGuard.Observe(false, 0);
                         Phase = AllflamePhase.NotInGame;
                         AreaId = String.Empty;
                         AreaName = String.Empty;
@@ -572,6 +855,23 @@ namespace AllflameBot
                     PlayerPosition = LokiPoe.Me == null
                         ? String.Empty
                         : LokiPoe.Me.Position.ToString();
+
+                    bool runtimeReady =
+                        area != null &&
+                        AreaHash != 0 &&
+                        LokiPoe.Me != null;
+                    if (AllflameAreaTransitionGuard.Observe(
+                            runtimeReady,
+                            AreaHash))
+                    {
+                        if (!runtimeReady)
+                        {
+                            Phase = AllflamePhase.NotInGame;
+                            ClearObjectState();
+                        }
+                        PublishStateIfChanged();
+                        return;
+                    }
 
                     bool objectScan =
                         force || now >= _nextObjectRefreshUtc;
@@ -641,8 +941,15 @@ namespace AllflameBot
                         capsuleTitleVisible &&
                         (CallBathysphereVisible ||
                          SendToSurfaceVisible);
+                    bool capsuleDirectScanAllowed =
+                        String.Equals(
+                            AreaId,
+                            "DeepwaterEncounterVoyage",
+                            StringComparison.OrdinalIgnoreCase) &&
+                        !AllflameAreaTransitionGuard.Pending;
                     CapsuleUiButtons stableCapsuleUi;
-                    if (CapsuleDirectUi.TryGetStableButtons(
+                    if (capsuleDirectScanAllowed &&
+                        CapsuleDirectUi.TryGetStableButtons(
                             out stableCapsuleUi))
                     {
                         CapsuleUiVisible = true;
@@ -652,6 +959,17 @@ namespace AllflameBot
                         SendToSurfaceVisible =
                             CapsuleDirectUi.IsVisible(
                                 stableCapsuleUi.SendToSurface);
+                    }
+                    else if (!capsuleDirectScanAllowed)
+                    {
+                        AllflameLog.Throttled(
+                            "capsule_ui_scan_skipped",
+                            TimeSpan.FromSeconds(5),
+                            "CAPSULE_UI_SCAN_SKIPPED" +
+                            "|AreaId=" + AreaId +
+                            "|AreaHash=" + AreaHash +
+                            "|TransitionPending=" +
+                            AllflameAreaTransitionGuard.Pending);
                     }
                     SnapshotLanternCounter(visibleUiText);
 
@@ -796,7 +1114,8 @@ namespace AllflameBot
                 Stopwatch timer = Stopwatch.StartNew();
                 try
                 {
-                    if (!LokiPoe.IsInGame)
+                    if (!LokiPoe.IsInGame ||
+                        AllflameAreaTransitionGuard.Pending)
                     {
                         InventoryFreeSquares = -1;
                         InventoryItemCount = 0;
@@ -5451,6 +5770,62 @@ namespace AllflameBot
             AllflameContext.Refresh(false);
             AllflameProgressWatchdog.Observe();
             return Task.FromResult(false);
+        }
+    }
+
+    internal sealed class ChartAreaTransitionTask : ObserverTask
+    {
+        public ChartAreaTransitionTask()
+            : base(
+                "ChartAreaTransitionTask",
+                "Quarantines DPB reads while a Chart portal changes areas.") { }
+
+        public override async Task<bool> Run()
+        {
+            if (!AllflameAreaTransitionGuard.Pending)
+            {
+                return false;
+            }
+
+            if (AllflameStopController.StopRequested)
+            {
+                return true;
+            }
+
+            if (!AllflameAreaTransitionGuard.CanRetry(
+                    AllflameContext.AreaHash))
+            {
+                AllflameAreaTransitionGuard.LogInteractionSuppressed(
+                    AllflameContext.AreaHash);
+                return true;
+            }
+
+            NetworkObject portal = AllflameContext.BathysphereObject;
+            if (portal == null ||
+                portal.Id != AllflameAreaTransitionGuard.PortalId)
+            {
+                AllflameLog.Info(
+                    "CHART_PORTAL_INTERACTION_SUPPRESSED" +
+                    "|Reason=OriginalPortalUnavailable" +
+                    "|ExpectedPortalId=" +
+                    AllflameAreaTransitionGuard.PortalId +
+                    "|CurrentAreaHash=" + AllflameContext.AreaHash);
+                return true;
+            }
+
+            int interaction = AllflameAreaTransitionGuard.RegisterRetry();
+            await FinishMovementBeforeInteraction(
+                "Chart Bathysphere Portal Retry");
+            bool entered = await Coroutines.InteractWith(portal);
+            AllflameLog.Info(
+                "BATHYSPHERE_ENTER" +
+                "|Id=" + portal.Id +
+                "|Name=" + portal.Name +
+                "|Distance=" + portal.Distance.ToString("0.0") +
+                "|Mode=BoundedTransitionRetry" +
+                "|Interaction=" + interaction +
+                "|Success=" + entered);
+            return true;
         }
     }
 
@@ -19797,6 +20172,7 @@ namespace AllflameBot
         public override void Stop()
         {
             ResetTransactionState();
+            AllflameAreaTransitionGuard.Reset();
             AllflameProgressWatchdog.Clear(Name);
         }
 
@@ -20072,6 +20448,7 @@ namespace AllflameBot
                         "|Success=" + entered);
                     if (entered)
                     {
+                        AllflameAreaTransitionGuard.Arm(portal);
                         if (!_portalInteractionProgressMarked)
                         {
                             _portalInteractionProgressMarked = true;
