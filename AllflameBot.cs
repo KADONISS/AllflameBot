@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.144";
+        public const string Current = "0.23.145";
     }
 
     public sealed class AllflameBot : IBot
@@ -137,6 +137,7 @@ namespace AllflameBot
             VoyageRunState.Reset();
             AllflameLootState.Clear();
             AllflameStopController.Reset();
+            AllflameMovementCoordinator.Reset();
             AllflameProgressWatchdog.Reset();
             AllflameVoyageDebug.Reset();
             AllflameSession.Start();
@@ -363,10 +364,18 @@ namespace AllflameBot
                             "|Context=" +
                             AllflameProgressWatchdog.Describe());
                     }
-                    AllflameStopController.Stop(
-                        "BotCoroutineFault",
-                        "ActiveTask=BotRuntime|Type=" +
-                        ex.GetType().Name);
+                    // Rebuild the runtime in place. A transient DPB/GUI fault
+                    // must not stop the bot or leave the failed coroutine hot.
+                    AllflameLog.Info(
+                        "BOT_COROUTINE_RECOVERY" +
+                        "|Action=RebuildRuntime" +
+                        "|Type=" + ex.GetType().Name);
+                    if (!_started || AllflameStopController.StopRequested)
+                    {
+                        return;
+                    }
+                    CleanupStaleRuntimeForRestart();
+                    Start();
                 }
             }
         }
@@ -479,6 +488,18 @@ namespace AllflameBot
                 catch (Exception ex)
                 {
                     AllflameLog.Error("MAIN_LOOP_FAILED", ex);
+                    try
+                    {
+                        AllflameContext.Refresh(true);
+                    }
+                    catch (Exception refreshException)
+                    {
+                        AllflameLog.Info(
+                            "CONTEXT_REFRESH_RECOVERY_FAILED" +
+                            "|Type=" + refreshException.GetType().Name);
+                    }
+                    AllflameProgressWatchdog.MarkProgress(
+                        "MainLoopExceptionRecovered");
                 }
 
                 await LokiCoroutine.Yield();
@@ -5145,7 +5166,7 @@ namespace AllflameBot
                     DateTime.UtcNow.AddMilliseconds(650);
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 _target,
                 "Message in a Bottle safety orbit");
             if (!moving)
@@ -5445,6 +5466,179 @@ namespace AllflameBot
         }
     }
 
+    internal static class AllflameMovementCoordinator
+    {
+        private static readonly object Sync = new object();
+        private static string _owner = String.Empty;
+        private static int _priority = -1;
+        private static Vector2i _target;
+        private static DateTime _leaseUntilUtc = DateTime.MinValue;
+        private static int _navigationRevision;
+
+        public static int NavigationRevision
+        {
+            get
+            {
+                lock (Sync)
+                {
+                    return _navigationRevision;
+                }
+            }
+        }
+
+        public static void Reset()
+        {
+            lock (Sync)
+            {
+                _owner = String.Empty;
+                _priority = -1;
+                _target = new Vector2i();
+                _leaseUntilUtc = DateTime.MinValue;
+                _navigationRevision = 0;
+            }
+        }
+
+        public static int AdvanceNavigation(string reason)
+        {
+            lock (Sync)
+            {
+                _navigationRevision++;
+                _owner = String.Empty;
+                _priority = -1;
+                _leaseUntilUtc = DateTime.MinValue;
+                AllflameLog.Info(
+                    "NAVIGATION_REVISION" +
+                    "|Revision=" + _navigationRevision +
+                    "|Reason=" + (reason ?? String.Empty));
+                return _navigationRevision;
+            }
+        }
+
+        public static bool MoveTowards(Vector2i target, string requester)
+        {
+            string owner = ClassifyOwner(requester);
+            int priority = PriorityOf(owner);
+            DateTime now = DateTime.UtcNow;
+            lock (Sync)
+            {
+                if (Math.Abs(target.X) > 1500 ||
+                    Math.Abs(target.Y) > 1500)
+                {
+                    AllflameLog.Info(
+                        "MOVEMENT_TARGET_REJECTED" +
+                        "|Reason=OutOfBounds" +
+                        "|Owner=" + owner +
+                        "|Target=" + target);
+                    return false;
+                }
+
+                bool leaseActive = now < _leaseUntilUtc;
+                if (leaseActive &&
+                    !String.Equals(_owner, owner, StringComparison.Ordinal) &&
+                    priority < _priority)
+                {
+                    AllflameLog.Throttled(
+                        "movement_owner_rejected_" + owner,
+                        TimeSpan.FromSeconds(1),
+                        "MOVEMENT_INTENT_REJECTED" +
+                        "|Owner=" + owner +
+                        "|CurrentOwner=" + _owner +
+                        "|Target=" + target +
+                        "|Reason=HigherPriorityOwner");
+                    return false;
+                }
+
+                if (leaseActive &&
+                    !String.Equals(_owner, owner, StringComparison.Ordinal))
+                {
+                    AllflameLog.Info(
+                        "MOVEMENT_INTENT_PREEMPTED" +
+                        "|From=" + _owner +
+                        "|To=" + owner +
+                        "|Target=" + target);
+                }
+
+                _owner = owner;
+                _priority = priority;
+                _target = target;
+                _leaseUntilUtc = now.AddMilliseconds(1400);
+            }
+
+            try
+            {
+                bool moving = PlayerMoverManager.MoveTowards(
+                    target,
+                    requester);
+                if (!moving)
+                {
+                    AllflameLog.Throttled(
+                        "movement_rejected_" + owner,
+                        TimeSpan.FromSeconds(1),
+                        "MOVEMENT_INTENT_RESULT" +
+                        "|Owner=" + owner +
+                        "|Target=" + target +
+                        "|Moving=False");
+                }
+                return moving;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "MOVEMENT_INTENT_EXCEPTION" +
+                    "|Owner=" + owner +
+                    "|Target=" + target +
+                    "|Type=" + ex.GetType().Name +
+                    "|Action=RefreshAndTryAnotherTarget");
+                return false;
+            }
+        }
+
+        private static string ClassifyOwner(string requester)
+        {
+            string value = requester ?? String.Empty;
+            if (value.IndexOf("lantern", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("safety", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "LanternSafety";
+            }
+            if (value.IndexOf("capsule", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("bathysphere", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("extraction", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "CapsuleExtraction";
+            }
+            if (VoyageRunState.LanternsExhausted ||
+                VoyageRunState.SurfaceTransferPending)
+            {
+                return "CapsuleExtraction";
+            }
+            if (value.IndexOf("chest", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("loot", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "ChestLoot";
+            }
+            if (value.IndexOf("voyage", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("frontier", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                value.IndexOf("detour", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "VoyageFrontier";
+            }
+            return "FallbackPatrol";
+        }
+
+        private static int PriorityOf(string owner)
+        {
+            switch (owner)
+            {
+                case "LanternSafety": return 5;
+                case "CapsuleExtraction": return 4;
+                case "ChestLoot": return 3;
+                case "VoyageFrontier": return 2;
+                default: return 1;
+            }
+        }
+    }
+
     internal static class AllflameStopController
     {
         private static bool _stopRequested;
@@ -5508,6 +5702,54 @@ namespace AllflameBot
         private bool _valerieRecoveryActive;
         private Vector2i _valerieRecoveryTarget;
         private Vector2i _valerieRecoveryNpcPosition;
+
+        protected async Task<bool> InteractWithRecovery(
+            NetworkObject target,
+            string context = "Unknown")
+        {
+            if (target == null)
+            {
+                AllflameLog.Info(
+                    "INTERACTION_RECOVERY" +
+                    "|Context=" + (context ?? String.Empty) +
+                    "|Result=Skipped|Reason=TargetMissing");
+                return false;
+            }
+
+            try
+            {
+                if (LokiPoe.ClientWindowHandle == IntPtr.Zero)
+                {
+                    AllflameLog.Info(
+                        "INTERACTION_RECOVERY" +
+                        "|Context=" + (context ?? String.Empty) +
+                        "|Result=Skipped|Reason=ClientUnavailable");
+                    return false;
+                }
+
+                return await Coroutines.InteractWith(target);
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "INTERACTION_RECOVERY" +
+                    "|Context=" + (context ?? String.Empty) +
+                    "|Result=Retry" +
+                    "|Type=" + ex.GetType().Name +
+                    "|Action=RefreshSnapshot");
+                try
+                {
+                    AllflameContext.Refresh(true);
+                }
+                catch (Exception refreshException)
+                {
+                    AllflameLog.Info(
+                        "INTERACTION_RECOVERY_REFRESH_FAILED" +
+                        "|Type=" + refreshException.GetType().Name);
+                }
+                return false;
+            }
+        }
         private uint _valerieRecoveryAreaHash;
         private DateTime _valerieRecoveryStartedUtc = DateTime.MinValue;
         private DateTime _valerieRecoveryLastProgressUtc = DateTime.MinValue;
@@ -5674,7 +5916,7 @@ namespace AllflameBot
                     _valerieBestDistance = Single.MaxValue;
                     _valerieProgressUtc = DateTime.MinValue;
                 }
-                bool interacted = await Coroutines.InteractWith(obj);
+                bool interacted = await InteractWithRecovery(obj);
                 _moveFailureCount = 0;
                 _moveFailureSinceUtc = DateTime.MinValue;
                 AllflameLog.Info(
@@ -5697,7 +5939,7 @@ namespace AllflameBot
                 PlayerMoverManager.Current as AllflameMover;
             return mover != null
                 ? mover.MoveTowardsInteraction(position, context)
-                : PlayerMoverManager.MoveTowards(position, context);
+                : AllflameMovementCoordinator.MoveTowards(position, context);
         }
 
         protected async Task FinishMovementBeforeInteraction(
@@ -5816,7 +6058,7 @@ namespace AllflameBot
             int interaction = AllflameAreaTransitionGuard.RegisterRetry();
             await FinishMovementBeforeInteraction(
                 "Chart Bathysphere Portal Retry");
-            bool entered = await Coroutines.InteractWith(portal);
+            bool entered = await InteractWithRecovery(portal);
             AllflameLog.Info(
                 "BATHYSPHERE_ENTER" +
                 "|Id=" + portal.Id +
@@ -7265,7 +7507,7 @@ namespace AllflameBot
             if (sulphur.Distance >
                 sulphurDirectPickupRange)
             {
-                bool moving = PlayerMoverManager.MoveTowards(
+                bool moving = AllflameMovementCoordinator.MoveTowards(
                     sulphur.Position,
                     Name);
                 AllflameLog.Throttled(
@@ -7292,7 +7534,7 @@ namespace AllflameBot
             int inventoryBefore =
                 AllflameContext.GetInventoryQuantity(itemName);
             float pickupDistance = sulphur.Distance;
-            bool picked = await Coroutines.InteractWith(sulphur);
+            bool picked = await InteractWithRecovery(sulphur);
             AllflameLog.Info(
                 "SULPHUR_REWARD|Action=PickupIssued" +
                 "|WorldId=" + worldId +
@@ -7533,7 +7775,7 @@ namespace AllflameBot
                 return true;
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 _valerieRecoveryTarget,
                 Name + " Valerie approach recovery");
             if (!moving)
@@ -7751,7 +7993,7 @@ namespace AllflameBot
                 selected.ToString());
             AllflameProgressWatchdog.SetRetry(
                 _valerieRecoveryCandidateFailures);
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 selected,
                 Name + " Valerie alternate approach");
             if (!moving)
@@ -8137,7 +8379,7 @@ namespace AllflameBot
             if (now < _recoveryCooldownUntilUtc)
                 return Task.FromResult(true);
 
-            bool moving = PlayerMoverManager.MoveTowards(target, Name);
+            bool moving = AllflameMovementCoordinator.MoveTowards(target, Name);
             if (!moving && _pathFailureSinceUtc == DateTime.MinValue)
                 _pathFailureSinceUtc = now;
             if (moving)
@@ -8671,7 +8913,7 @@ namespace AllflameBot
                 bool opened = false;
                 try
                 {
-                    opened = await Coroutines.InteractWith(stash);
+                    opened = await InteractWithRecovery(stash);
                 }
                 catch (Exception ex)
                 {
@@ -9217,7 +9459,7 @@ namespace AllflameBot
             bool interacted = false;
             try
             {
-                interacted = await Coroutines.InteractWith(storage);
+                interacted = await InteractWithRecovery(storage);
             }
             catch (Exception exception)
             {
@@ -9655,7 +9897,7 @@ namespace AllflameBot
             if (bathysphere.Distance >
                 voyageBathysphereInteractRange)
             {
-                bool moving = PlayerMoverManager.MoveTowards(
+                bool moving = AllflameMovementCoordinator.MoveTowards(
                     bathysphere.Position,
                     Name);
                 AllflameLog.Throttled(
@@ -9679,7 +9921,7 @@ namespace AllflameBot
             _attempts++;
             await FinishMovementBeforeInteraction(
                 "Voyage Bathysphere");
-            bool entered = await Coroutines.InteractWith(bathysphere);
+            bool entered = await InteractWithRecovery(bathysphere);
             AllflameLog.Info(
                 "VOYAGE_STAGE|Stage=1|State=Interact" +
                 "|Attempt=" + _attempts +
@@ -9690,7 +9932,7 @@ namespace AllflameBot
                 "|Runner=Voyage");
             if (!entered)
             {
-                PlayerMoverManager.MoveTowards(
+                AllflameMovementCoordinator.MoveTowards(
                     bathysphere.Position,
                     Name + " interaction recovery");
             }
@@ -10037,7 +10279,7 @@ namespace AllflameBot
                 await FinishMovementBeforeInteraction(
                     "Valerie Voyage");
                 bool interacted =
-                    await Coroutines.InteractWith(valerie);
+                    await InteractWithRecovery(valerie);
                 _valerieEffectDeadlineUtc =
                     interacted
                         ? DateTime.UtcNow.AddMilliseconds(900)
@@ -13463,7 +13705,7 @@ namespace AllflameBot
                 await FinishMovementBeforeInteraction(
                     "Chart Storage Debug");
                 bool interacted =
-                    await Coroutines.InteractWith(storage);
+                    await InteractWithRecovery(storage);
                 _stage = interacted ? 1 : 0;
                 _waitUntilUtc =
                     DateTime.UtcNow.AddMilliseconds(
@@ -13937,7 +14179,7 @@ namespace AllflameBot
                 bool opened = false;
                 try
                 {
-                    opened = await Coroutines.InteractWith(stash);
+                    opened = await InteractWithRecovery(stash);
                 }
                 catch (Exception ex)
                 {
@@ -14674,7 +14916,7 @@ namespace AllflameBot
         {
             try
             {
-                return PlayerMoverManager.MoveTowards(target, context);
+                return AllflameMovementCoordinator.MoveTowards(target, context);
             }
             catch (Exception ex)
             {
@@ -15097,7 +15339,7 @@ namespace AllflameBot
                     return true;
                 }
 
-                bool interacted = await Coroutines.InteractWith(storage);
+                bool interacted = await InteractWithRecovery(storage);
                 _openAttempts++;
                 AllflameLog.Info(
                     "CHART_STORAGE_OPEN|Success=" + interacted +
@@ -19637,7 +19879,7 @@ namespace AllflameBot
 
             await FinishMovementBeforeInteraction(
                 "Valerie Identify");
-            bool interacted = await Coroutines.InteractWith(valerie);
+            bool interacted = await InteractWithRecovery(valerie);
             _nextActionUtc = DateTime.UtcNow.AddMilliseconds(800);
             AllflameLog.Info(
                 "CHART_IDENTIFY|Action=Interact" +
@@ -19857,7 +20099,7 @@ namespace AllflameBot
                         await FinishMovementBeforeInteraction(
                             "Bathysphere Chart Device");
                         bool interacted =
-                            await Coroutines.InteractWith(bathysphere);
+                            await InteractWithRecovery(bathysphere);
                         _bathysphereAttempts++;
                         _nextBathysphereAttemptUtc =
                             DateTime.UtcNow.AddSeconds(2);
@@ -19989,7 +20231,7 @@ namespace AllflameBot
                 await FinishMovementBeforeInteraction(
                     "Valerie Chart Device");
                 bool interacted =
-                    await Coroutines.InteractWith(valerie);
+                    await InteractWithRecovery(valerie);
                 _bestValerieDistance = Single.MaxValue;
                 _lastValerieProgressUtc = DateTime.MinValue;
                 _valerieInteractionFailures =
@@ -20351,7 +20593,7 @@ namespace AllflameBot
                     await FinishMovementBeforeInteraction(
                         "Chart Bathysphere Portal");
                     bool entered =
-                        await Coroutines.InteractWith(portal);
+                        await InteractWithRecovery(portal);
                     AllflameLog.Info(
                         "BATHYSPHERE_ENTER|Id=" +
                         portal.Id +
@@ -20376,7 +20618,7 @@ namespace AllflameBot
                 }
 
                 bool moving =
-                    PlayerMoverManager.MoveTowards(
+                    AllflameMovementCoordinator.MoveTowards(
                         portal.Position,
                         Name);
                 AllflameLog.Throttled(
@@ -22031,6 +22273,8 @@ namespace AllflameBot
         private int _shortEscapeRadiusIndex;
         private int _shortEscapeCycle;
         private int _shortEscapeRecoveries;
+        private string _lastTargetFingerprint = String.Empty;
+        private int _repeatedTargetFingerprintCount;
 
         public ExploreVoyageTask()
             : base(
@@ -22042,6 +22286,8 @@ namespace AllflameBot
             _topologyPlanner.Reset(0);
             ResetSpatialLoopTracking();
             ResetShortTargetRecovery();
+            _lastTargetFingerprint = String.Empty;
+            _repeatedTargetFingerprintCount = 0;
         }
 
         public override void Stop()
@@ -22050,6 +22296,8 @@ namespace AllflameBot
             _activeTopologyRoomIndex = -1;
             ResetSpatialLoopTracking();
             ResetShortTargetRecovery();
+            _lastTargetFingerprint = String.Empty;
+            _repeatedTargetFingerprintCount = 0;
         }
 
         public override Task<bool> Run()
@@ -22087,6 +22335,8 @@ namespace AllflameBot
                 _topologyPlanner.Reset(_areaHash);
                 ResetShortTargetRecovery();
                 ResetPlanner();
+                AllflameMovementCoordinator.AdvanceNavigation(
+                    "VoyageAreaChanged");
                 try { ExilePather.Reload(true); }
                 catch { }
             }
@@ -22127,6 +22377,8 @@ namespace AllflameBot
                 ResetShortTargetRecovery();
                 ResetPlanner();
                 ResetActiveNavigation();
+                AllflameMovementCoordinator.AdvanceNavigation(
+                    "LargePositionDiscontinuity");
                 AllflameLog.Info(
                     "VOYAGE_NAVIGATION_REBASED" +
                     "|Reason=LargePositionDiscontinuity" +
@@ -22236,6 +22488,8 @@ namespace AllflameBot
                                 settings.VoyageFrontierSpacing * 0.65f));
                     }
                     _nodeIndex = -1;
+                    AllflameMovementCoordinator.AdvanceNavigation(
+                        timedOut ? "FrontierTimeout" : "FrontierNoProgress");
                     _preferredDirection =
                         (_preferredDirection + 1) % 8;
                     AllflameLog.Info(
@@ -22251,7 +22505,44 @@ namespace AllflameBot
                 }
                 else
                 {
-                    bool moving = PlayerMoverManager.MoveTowards(
+                    string targetFingerprint =
+                        AllflameContext.AreaHash + "|" +
+                        AllflameMovementCoordinator.NavigationRevision +
+                        "|" + _target;
+                    if (String.Equals(
+                            targetFingerprint,
+                            _lastTargetFingerprint,
+                            StringComparison.Ordinal))
+                    {
+                        _repeatedTargetFingerprintCount++;
+                    }
+                    else
+                    {
+                        _lastTargetFingerprint = targetFingerprint;
+                        _repeatedTargetFingerprintCount = 1;
+                    }
+                    if (_repeatedTargetFingerprintCount >= 4 &&
+                        DateTime.UtcNow - _meaningfulProgressUtc >=
+                            TimeSpan.FromSeconds(2))
+                    {
+                        AllflameLog.Info(
+                            "NAVIGATION_FINGERPRINT_REPEAT" +
+                            "|Target=" + _target +
+                            "|Count=" + _repeatedTargetFingerprintCount +
+                            "|Action=DiscardTargetAndRebuild");
+                        _planner.MarkBlockedRegion(_target, 120f);
+                        _nodeIndex = -1;
+                        _activeTopologyRoomIndex = -1;
+                        _activeTopologyRoomName = String.Empty;
+                        _preferredDirection =
+                            (_preferredDirection + 1) % 8;
+                        AllflameMovementCoordinator.AdvanceNavigation(
+                            "TargetFingerprintRepeat");
+                        ResetPlanner();
+                        _repeatedTargetFingerprintCount = 0;
+                        return Task.FromResult(true);
+                    }
+                    bool moving = AllflameMovementCoordinator.MoveTowards(
                         _target,
                         Name);
                     AllflameLog.Throttled(
@@ -22414,6 +22705,11 @@ namespace AllflameBot
                 "|Direction=" + direction +
                 "|Center=" + _sectorCenter +
                 "|Target=" + target);
+            _lastTargetFingerprint =
+                AllflameContext.AreaHash + "|" +
+                AllflameMovementCoordinator.NavigationRevision + "|" +
+                target;
+            _repeatedTargetFingerprintCount = 0;
             return Task.FromResult(true);
         }
 
@@ -22464,7 +22760,7 @@ namespace AllflameBot
                 if (now - _shortEscapeStartedUtc <
                     TimeSpan.FromSeconds(3))
                 {
-                    bool moving = PlayerMoverManager.MoveTowards(
+                    bool moving = AllflameMovementCoordinator.MoveTowards(
                         _shortEscapeTarget,
                         Name + " short frontier escape");
                     AllflameLog.Throttled(
@@ -22600,7 +22896,7 @@ namespace AllflameBot
                 bool moving = false;
                 if (pathOk)
                 {
-                    moving = PlayerMoverManager.MoveTowards(
+                    moving = AllflameMovementCoordinator.MoveTowards(
                         resolved,
                         Name + " short frontier escape");
                     if (!moving)
@@ -22688,20 +22984,25 @@ namespace AllflameBot
                     : (DateTime.UtcNow - _shortEscapeTotalStartedUtc)
                         .TotalSeconds;
             AllflameLog.Info(
-                "VOYAGE_SHORT_ESCAPE_STOP" +
+                "VOYAGE_SHORT_ESCAPE_ROTATE" +
                 "|Reason=" + (reason ?? String.Empty) +
                 "|Cycle=" + _shortEscapeCycle +
                 "|Recoveries=" + _shortEscapeRecoveries +
                 "|ElapsedSeconds=" + elapsed.ToString("0.0") +
                 "|Player=" + player +
-                "|Action=RecoveryStop");
-            AllflameStopController.Stop(
-                "VoyageShortEscapeFailed",
-                "Reason=" + (reason ?? String.Empty) +
-                "|ActiveTask=ExploreVoyageTask" +
-                "|Cycle=" + _shortEscapeCycle +
-                "|Recoveries=" + _shortEscapeRecoveries +
-                "|ElapsedSeconds=" + elapsed.ToString("0.0"));
+                "|Action=ResetPlannerAndContinue");
+            _sectorCenter = player;
+            _preferredDirection =
+                (_preferredDirection + 1) % 8;
+            _nodeIndex = -1;
+            _activeTopologyRoomIndex = -1;
+            _activeTopologyRoomName = String.Empty;
+            AllflameMovementCoordinator.AdvanceNavigation(
+                "ShortEscapeStrategyRotated");
+            ResetShortTargetRecovery();
+            ResetPlanner();
+            _shortEscapeWaitUntilUtc =
+                DateTime.UtcNow.AddSeconds(1);
             return true;
         }
 
@@ -22875,7 +23176,7 @@ namespace AllflameBot
                 "|EscapeToward=" + recoveryAnchor +
                 "|EscapeTarget=" + escapeTarget);
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 escapeTarget,
                 Name + " spatial loop escape");
             AllflameLog.Info(
@@ -22945,7 +23246,7 @@ namespace AllflameBot
                     return true;
                 }
                 candidate = resolvedCandidate;
-                bool moving = PlayerMoverManager.MoveTowards(
+                bool moving = AllflameMovementCoordinator.MoveTowards(
                     candidate,
                     Name + " obstacle detour");
                 if (!moving)
@@ -23015,6 +23316,8 @@ namespace AllflameBot
                     Single.MaxValue;
                 _obstacleRecoveryStartedUtc =
                     DateTime.MinValue;
+                AllflameMovementCoordinator.AdvanceNavigation(
+                    "ObstacleFiveSecondFailsafe");
                 AllflameLog.Info(
                     "VOYAGE_OBSTACLE_FIVE_SECOND_FAILSAFE" +
                     "|ElapsedSeconds=" +
@@ -23052,7 +23355,7 @@ namespace AllflameBot
                 return true;
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 _detourTarget,
                 Name + " obstacle detour");
             if (timedOut || !moving)
@@ -23066,6 +23369,8 @@ namespace AllflameBot
                     "|Moving=" + moving);
                 if (!TryStartDetour(player))
                 {
+                    AllflameMovementCoordinator.AdvanceNavigation(
+                        "DetourCandidatesExhausted");
                     _meaningfulProgressUtc =
                         DateTime.UtcNow.AddSeconds(-4);
                 }
@@ -23257,7 +23562,7 @@ namespace AllflameBot
                 }
                 else
                 {
-                bool continuing = PlayerMoverManager.MoveTowards(
+                bool continuing = AllflameMovementCoordinator.MoveTowards(
                     _fallbackDestination,
                     Name + " fallback");
                 if (continuing)
@@ -23320,7 +23625,7 @@ namespace AllflameBot
                     continue;
                 }
 
-                bool moving = PlayerMoverManager.MoveTowards(
+                bool moving = AllflameMovementCoordinator.MoveTowards(
                     candidate,
                     Name + " cardinal patrol");
                 if (!moving)
@@ -23674,7 +23979,7 @@ namespace AllflameBot
                 return true;
             }
 
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 _patrolCenter,
                 Name + " return to Chart spawn");
             if (!moving)
@@ -24364,7 +24669,7 @@ namespace AllflameBot
                 }
 
                 bool moving =
-                    PlayerMoverManager.MoveTowards(
+                    AllflameMovementCoordinator.MoveTowards(
                         lantern.Position,
                         Name + " Golden Lantern");
                 if (!moving &&
@@ -24422,7 +24727,7 @@ namespace AllflameBot
             else
             {
                 interacted =
-                    await Coroutines.InteractWith(lantern);
+                    await InteractWithRecovery(lantern);
             }
             if (interacted)
             {
@@ -24911,7 +25216,7 @@ namespace AllflameBot
             Vector2i chestPosition = chest.Position;
             bool messageBottleChest =
                 AllflameLootState.IsMessageBottleChest(chest);
-            bool interacted = await Coroutines.InteractWith(chest);
+            bool interacted = await InteractWithRecovery(chest);
             bool confirmedOpen =
                 interacted &&
                 await WaitForChestOpenConfirmation(
@@ -25464,7 +25769,7 @@ namespace AllflameBot
                                 30,
                                 settings.LootActionDelayMilliseconds));
 
-                    bool moving = PlayerMoverManager.MoveTowards(
+                    bool moving = AllflameMovementCoordinator.MoveTowards(
                         target.Position,
                         Name + " walk over gold");
                     AllflameLog.Throttled(
@@ -25552,7 +25857,7 @@ namespace AllflameBot
                     ? target.Id.ToString()
                     : item.FullName));
             bool interactionAccepted =
-                await Coroutines.InteractWith(target);
+                await InteractWithRecovery(target);
             _pendingPickupActive = true;
             _pendingWorldId = target.Id;
             _pendingAreaHash = interactionAreaHash;
@@ -26919,7 +27224,7 @@ namespace AllflameBot
                     }
                 }
                 bool inputAccepted =
-                    await Coroutines.InteractWith(capsule);
+                    await InteractWithRecovery(capsule);
                 _openAttempts++;
                 await LokiCoroutine.Sleep(250);
                 VisualCallProbe openProbe =
@@ -28456,7 +28761,7 @@ namespace AllflameBot
                 return true;
             }
             _rescueCooldownUntilUtc = DateTime.UtcNow.AddMilliseconds(325);
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 waypoint,
                 Name + " zero-lantern rescue");
             _rescueRoutePreviousWaypoint = waypoint;
@@ -28642,7 +28947,7 @@ namespace AllflameBot
                 return true;
             }
             _rescueStageAttempt++;
-            bool accepted = await Coroutines.InteractWith(live);
+            bool accepted = await InteractWithRecovery(live);
             _openAttempts++;
             AllflameLog.Info(
                 "CAPSULE_RESCUE_INTERACT" +
@@ -30037,7 +30342,7 @@ namespace AllflameBot
                 ? " lantern route"
                 : " remembered capsule");
             bool moving = usingLanternRoute
-                ? PlayerMoverManager.MoveTowards(
+                ? AllflameMovementCoordinator.MoveTowards(
                     movementTarget,
                     movementContext)
                 : MoveTowardsInteraction(
@@ -30678,7 +30983,7 @@ namespace AllflameBot
                     stepReason);
                 return false;
             }
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 movementTarget,
                 Name + " coverage re-entry");
             AllflameLog.Throttled(
@@ -31000,7 +31305,7 @@ namespace AllflameBot
                 ? MoveTowardsInteraction(
                     waypoint,
                     Name + " " + mode)
-                : PlayerMoverManager.MoveTowards(
+                : AllflameMovementCoordinator.MoveTowards(
                     waypoint,
                     Name + " " + mode);
             if (moving)
@@ -31702,7 +32007,7 @@ namespace AllflameBot
             _capsuleReturnInteracted.Add(targetKey);
             _capsuleReturnInteractionIssued = true;
             _capsuleReturnInteractedUtc = DateTime.UtcNow;
-            bool accepted = await Coroutines.InteractWith(live);
+            bool accepted = await InteractWithRecovery(live);
             AllflameLog.Info(
                 "CAPSULE_RETURN_INTERACT" +
                 "|Index=" + (_capsuleReturnIndex + 1) +
@@ -32091,7 +32396,7 @@ namespace AllflameBot
             Vector2i target = new Vector2i(
                 center.X + (int)Math.Round(Math.Cos(angle) * radius),
                 center.Y + (int)Math.Round(Math.Sin(angle) * radius));
-            bool moving = PlayerMoverManager.MoveTowards(
+            bool moving = AllflameMovementCoordinator.MoveTowards(
                 target,
                 Name);
             AllflameLog.Throttled(
@@ -32229,7 +32534,7 @@ namespace AllflameBot
                         "ReacquireBathysphere");
                     return true;
                 }
-                bool moving = PlayerMoverManager.MoveTowards(
+                bool moving = AllflameMovementCoordinator.MoveTowards(
                     extraction.Position,
                     Name);
                 AllflameLog.Throttled(
@@ -32305,7 +32610,7 @@ namespace AllflameBot
             bool used = false;
             try
             {
-                used = await Coroutines.InteractWith(extraction);
+                used = await InteractWithRecovery(extraction);
             }
             catch (Exception ex)
             {
@@ -32944,13 +33249,13 @@ namespace AllflameBot
                         25,
                         AllflameSettings.Instance.InteractDistance + 6))
                 {
-                    PlayerMoverManager.MoveTowards(
+                    AllflameMovementCoordinator.MoveTowards(
                         chest.Position,
                         Name);
                     return true;
                 }
 
-                bool opened = await Coroutines.InteractWith(chest);
+                bool opened = await InteractWithRecovery(chest);
                 AllflameLog.Info(
                     "VOYAGE_STAGE|Stage=10|Action=OpenCollectLoot" +
                     "|Success=" + opened +
@@ -37597,7 +37902,7 @@ namespace AllflameBot
                     return true;
                 }
 
-                bool opened = await Coroutines.InteractWith(stash);
+                bool opened = await InteractWithRecovery(stash);
                 _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(
                     opened ? 300 : 350);
                 AllflameLog.Info(
@@ -38237,7 +38542,7 @@ namespace AllflameBot
                     AllflameSettings.Instance.InteractDistance)
                 {
                     bool moving =
-                        PlayerMoverManager.MoveTowards(
+                        AllflameMovementCoordinator.MoveTowards(
                             extraction.Position,
                             Name);
                     AllflameLog.Throttled(
@@ -38275,7 +38580,7 @@ namespace AllflameBot
                 }
 
                 bool interacted =
-                    await Coroutines.InteractWith(extraction);
+                    await InteractWithRecovery(extraction);
                 if (interacted)
                 {
                     _extractionInteractFailures = 0;
@@ -38296,7 +38601,7 @@ namespace AllflameBot
                     _nextExtractionInteractUtc =
                         DateTime.UtcNow.AddMilliseconds(
                             retryDelayMs);
-                    PlayerMoverManager.MoveTowards(
+                    AllflameMovementCoordinator.MoveTowards(
                         extraction.Position,
                         Name + " highlight recovery");
                     AllflameLog.Info(
@@ -38330,7 +38635,7 @@ namespace AllflameBot
                     out lanternOrder))
                 {
                     bool emergencyMoving =
-                        PlayerMoverManager.MoveTowards(
+                        AllflameMovementCoordinator.MoveTowards(
                             lanternWaypoint,
                             Name + " emergency lantern return");
                     AllflameLog.Throttled(
@@ -38355,7 +38660,7 @@ namespace AllflameBot
                     out emergencyStep))
                 {
                     bool emergencyMoving =
-                        PlayerMoverManager.MoveTowards(
+                        AllflameMovementCoordinator.MoveTowards(
                             emergencyWaypoint,
                             Name + " emergency breadcrumb return");
                     AllflameLog.Throttled(
@@ -38376,7 +38681,7 @@ namespace AllflameBot
             if (AllflameRunState.HasExtractionPosition)
             {
                 bool moving =
-                    PlayerMoverManager.MoveTowards(
+                    AllflameMovementCoordinator.MoveTowards(
                         AllflameRunState.LastExtractionPosition,
                         Name);
                 if (moving)
@@ -38420,7 +38725,7 @@ namespace AllflameBot
                     out outwardStep))
                 {
                     bool routeMoving =
-                        PlayerMoverManager.MoveTowards(
+                        AllflameMovementCoordinator.MoveTowards(
                             outwardWaypoint,
                             Name);
                     AllflameLog.Throttled(
@@ -38583,7 +38888,7 @@ namespace AllflameBot
             bool moving;
             try
             {
-                moving = PlayerMoverManager.MoveTowards(resolved, Name);
+                moving = AllflameMovementCoordinator.MoveTowards(resolved, Name);
             }
             catch (Exception ex)
             {

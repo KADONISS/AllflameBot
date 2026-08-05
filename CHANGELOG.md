@@ -2,6 +2,16 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.145 - 2026-08-05
+
+- Arbitrate movement ownership so safety, extraction and loot actions cannot
+  be overridden by lower-priority Voyage exploration movement.
+- Recover from stale navigation targets with revision invalidation, frontier
+  no-progress detection and repeated-target fingerprint handling.
+- Rebuild recoverable task and coroutine runtime faults in place, including
+  interaction and DPB/UI exceptions, so Voyage can continue without adding
+  automatic stop behavior.
+
 ## 0.23.144 - 2026-08-05
 
 - Remove the new DPB Voyage API from Plan Board clearing, Chart placement and
