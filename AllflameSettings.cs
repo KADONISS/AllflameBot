@@ -63,6 +63,7 @@ namespace AllflameBot
         public int ChartsRequiredForVoyage { get; set; }
         public bool StartVoyageWhenReady { get; set; }
         public bool EnableVoyageRunner { get; set; }
+        public bool EnableVoyageTerrainPlanner { get; set; }
         public int VoyageFrontierSpacing { get; set; }
         public int VoyageFrontierTimeoutSeconds { get; set; }
         public bool EnableVoyageTimeLimit { get; set; }
@@ -218,7 +219,7 @@ namespace AllflameBot
             {
                 ApplyRecommendedDefaults();
             }
-            else if (SettingsSchemaVersion < 41)
+            else if (SettingsSchemaVersion < 42)
             {
                 int oldSchema = SettingsSchemaVersion;
                 if (oldSchema < 3)
@@ -407,7 +408,11 @@ namespace AllflameBot
                     ItemTransferDelayMinMilliseconds = 80;
                     ItemTransferDelayMaxMilliseconds = 140;
                 }
-                SettingsSchemaVersion = 41;
+                if (oldSchema < 42)
+                {
+                    EnableVoyageTerrainPlanner = true;
+                }
+                SettingsSchemaVersion = 42;
                 Save();
             }
         }
@@ -757,6 +762,7 @@ namespace AllflameBot
         private void ApplyVoyageRunnerDefaults()
         {
             EnableVoyageRunner = true;
+            EnableVoyageTerrainPlanner = true;
             VoyageFrontierSpacing = 95;
             VoyageFrontierTimeoutSeconds = 12;
             EnableVoyageTimeLimit = true;

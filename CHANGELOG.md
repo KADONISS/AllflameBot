@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.148 - 2026-08-05
+
+- Add a Voyage terrain snapshot service backed by DPB terrain metadata and
+  walkability data, stabilized per AreaHash before use.
+- Validate geometric Voyage frontier targets against the live DPB pathfinder
+  when terrain data is ready, while retaining the existing planner fallback.
+- Add terrain readiness, dimensions, walkable-cell and no-path diagnostics;
+  terrain failures retry softly without stopping the bot.
+
 ## 0.23.147 - 2026-08-05
 
 - Make emergency Allflame Capsule routing select the Capsule itself instead

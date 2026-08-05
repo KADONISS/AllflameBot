@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.147";
+        public const string Current = "0.23.148";
     }
 
     public sealed class AllflameBot : IBot
@@ -22194,6 +22194,286 @@ namespace AllflameBot
         }
     }
 
+    internal sealed class VoyageTerrainSnapshot
+    {
+        public uint AreaHash { get; private set; }
+        public string AreaId { get; private set; }
+        public int Rows { get; private set; }
+        public int Cols { get; private set; }
+        public Vector2i SizeInNavCells { get; private set; }
+        public int DataLength { get; private set; }
+        public int WalkableCells { get; private set; }
+        public int TerrainCells { get; private set; }
+        public DateTime CreatedUtc { get; private set; }
+
+        private VoyageTerrainSnapshot(
+            uint areaHash,
+            string areaId,
+            int rows,
+            int cols,
+            Vector2i sizeInNavCells,
+            int dataLength,
+            int walkableCells,
+            int terrainCells)
+        {
+            AreaHash = areaHash;
+            AreaId = areaId ?? String.Empty;
+            Rows = rows;
+            Cols = cols;
+            SizeInNavCells = sizeInNavCells;
+            DataLength = dataLength;
+            WalkableCells = walkableCells;
+            TerrainCells = terrainCells;
+            CreatedUtc = DateTime.UtcNow;
+        }
+
+        public static VoyageTerrainSnapshot Create(
+            uint areaHash,
+            string areaId,
+            DreamPoeBot.Loki.Game.CachedTerrainData cache,
+            Vector2i sizeInNavCells,
+            int walkableCells,
+            int terrainCells)
+        {
+            return new VoyageTerrainSnapshot(
+                areaHash,
+                areaId,
+                cache.Rows,
+                cache.Cols,
+                sizeInNavCells,
+                cache.Data == null ? 0 : cache.Data.Length,
+                walkableCells,
+                terrainCells);
+        }
+    }
+
+    internal static class VoyageTerrainSnapshotService
+    {
+        private static readonly object Sync = new object();
+        private static VoyageTerrainSnapshot _current;
+        private static string _candidateSignature = String.Empty;
+        private static int _candidateSamples;
+        private static uint _candidateAreaHash;
+
+        public static VoyageTerrainSnapshot Current
+        {
+            get
+            {
+                lock (Sync)
+                {
+                    return _current;
+                }
+            }
+        }
+
+        public static bool IsReady(uint areaHash)
+        {
+            VoyageTerrainSnapshot snapshot = Current;
+            return snapshot != null && snapshot.AreaHash == areaHash;
+        }
+
+        public static void Reset(uint areaHash, string reason)
+        {
+            lock (Sync)
+            {
+                _current = null;
+                _candidateSignature = String.Empty;
+                _candidateSamples = 0;
+                _candidateAreaHash = areaHash;
+                AllflameLog.Info(
+                    "VOYAGE_TERRAIN_REBUILT" +
+                    "|AreaHash=" + areaHash +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|State=Loading");
+            }
+        }
+
+        public static void Observe(
+            uint areaHash,
+            string areaId,
+            Vector2i player,
+            int navigationRevision)
+        {
+            if (!AllflameSettings.Instance.EnableVoyageTerrainPlanner ||
+                areaHash == 0 ||
+                LokiPoe.Me == null)
+            {
+                return;
+            }
+
+            try
+            {
+                DreamPoeBot.Loki.Game.CachedTerrainData cache =
+                    LokiPoe.TerrainData.Cache;
+                Vector2i size = LokiPoe.TerrainData.SizeInNavCells;
+                if (cache == null ||
+                    cache.Rows <= 0 ||
+                    cache.Cols <= 0 ||
+                    cache.Data == null ||
+                    cache.Data.Length == 0 ||
+                    size.X <= 0 ||
+                    size.Y <= 0)
+                {
+                    AllflameLog.Throttled(
+                        "voyage_terrain_wait",
+                        TimeSpan.FromSeconds(3),
+                        "VOYAGE_TERRAIN_WAIT" +
+                        "|AreaHash=" + areaHash +
+                        "|Player=" + player +
+                        "|NavigationRevision=" + navigationRevision +
+                        "|Reason=CacheNotReady");
+                    return;
+                }
+
+                string signature =
+                    areaHash + "|" + cache.Rows + "|" + cache.Cols +
+                    "|" + cache.Data.Length + "|" + size;
+                System.Collections.BitArray walkable =
+                    WalkabilityGrid.GetWalkableBitArray(cache, 0);
+                int walkableCells = 0;
+                int terrainCells = walkable == null ? 0 : walkable.Length;
+                if (walkable != null)
+                {
+                    for (int i = 0; i < walkable.Length; i++)
+                    {
+                        if (walkable[i])
+                        {
+                            walkableCells++;
+                        }
+                    }
+                }
+                lock (Sync)
+                {
+                    if (_candidateAreaHash != areaHash)
+                    {
+                        _current = null;
+                        _candidateSignature = String.Empty;
+                        _candidateSamples = 0;
+                        _candidateAreaHash = areaHash;
+                    }
+                    if (String.Equals(
+                            _candidateSignature,
+                            signature,
+                            StringComparison.Ordinal))
+                    {
+                        _candidateSamples++;
+                    }
+                    else
+                    {
+                        _candidateSignature = signature;
+                        _candidateSamples = 1;
+                    }
+
+                    if (_candidateSamples < 2)
+                    {
+                        AllflameLog.Throttled(
+                            "voyage_terrain_stabilizing",
+                            TimeSpan.FromSeconds(2),
+                            "VOYAGE_TERRAIN_WAIT" +
+                            "|AreaHash=" + areaHash +
+                            "|Player=" + player +
+                            "|Rows=" + cache.Rows +
+                            "|Cols=" + cache.Cols +
+                            "|DataLength=" + cache.Data.Length +
+                            "|Samples=" + _candidateSamples +
+                            "|Reason=MetadataStabilizing");
+                        return;
+                    }
+
+                    if (_current == null ||
+                        _current.AreaHash != areaHash ||
+                        _current.Rows != cache.Rows ||
+                        _current.Cols != cache.Cols ||
+                        _current.DataLength != cache.Data.Length)
+                    {
+                        _current = VoyageTerrainSnapshot.Create(
+                            areaHash,
+                            areaId,
+                            cache,
+                            size,
+                            walkableCells,
+                            terrainCells);
+                        AllflameLog.Info(
+                            "VOYAGE_TERRAIN_READY" +
+                            "|AreaHash=" + areaHash +
+                            "|AreaId=" + (areaId ?? String.Empty) +
+                            "|Rows=" + cache.Rows +
+                            "|Cols=" + cache.Cols +
+                            "|DataLength=" + cache.Data.Length +
+                            "|WalkableCells=" + walkableCells +
+                            "|TerrainCells=" + terrainCells +
+                            "|SizeInNavCells=" + size +
+                            "|Player=" + player +
+                            "|NavigationRevision=" +
+                            navigationRevision);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Throttled(
+                    "voyage_terrain_invalid",
+                    TimeSpan.FromSeconds(5),
+                    "VOYAGE_TERRAIN_INVALID" +
+                    "|AreaHash=" + areaHash +
+                    "|Player=" + player +
+                    "|NavigationRevision=" + navigationRevision +
+                    "|Error=" + ex.GetType().Name +
+                    "|Action=UseExistingPlannerAndRetry");
+            }
+        }
+
+        public static bool ValidatePath(
+            uint areaHash,
+            Vector2i player,
+            Vector2i target,
+            string source,
+            int navigationRevision)
+        {
+            if (!IsReady(areaHash))
+            {
+                return true;
+            }
+
+            bool pathExists;
+            try
+            {
+                pathExists = ExilePather.PathExistsBetween(
+                    player,
+                    target,
+                    false);
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Throttled(
+                    "voyage_terrain_path_validation_failed",
+                    TimeSpan.FromSeconds(3),
+                    "VOYAGE_TERRAIN_INVALID" +
+                    "|AreaHash=" + areaHash +
+                    "|Player=" + player +
+                    "|Target=" + target +
+                    "|Source=" + (source ?? String.Empty) +
+                    "|NavigationRevision=" + navigationRevision +
+                    "|Error=" + ex.GetType().Name +
+                    "|Action=UsePathfinderFallback");
+                return true;
+            }
+
+            if (!pathExists)
+            {
+                AllflameLog.Info(
+                    "VOYAGE_TARGET_NO_PATH" +
+                    "|AreaHash=" + areaHash +
+                    "|Player=" + player +
+                    "|Target=" + target +
+                    "|Source=" + (source ?? String.Empty) +
+                    "|NavigationRevision=" + navigationRevision +
+                    "|Action=DiscardTargetAndSelectAnother");
+            }
+            return pathExists;
+        }
+    }
+
     internal sealed class ExploreVoyageTask : ObserverTask
     {
         private const int ShortTargetRejectsBeforeEscape = 4;
@@ -22332,6 +22612,9 @@ namespace AllflameBot
                 _topologyPlanner.Reset(_areaHash);
                 ResetShortTargetRecovery();
                 ResetPlanner();
+                VoyageTerrainSnapshotService.Reset(
+                    _areaHash,
+                    "VoyageAreaChanged");
                 AllflameMovementCoordinator.AdvanceNavigation(
                     "VoyageAreaChanged");
                 try { ExilePather.Reload(true); }
@@ -22339,6 +22622,11 @@ namespace AllflameBot
             }
 
             Vector2i player = LokiPoe.Me.Position;
+            VoyageTerrainSnapshotService.Observe(
+                AllflameContext.AreaHash,
+                AllflameContext.AreaId,
+                player,
+                AllflameMovementCoordinator.NavigationRevision);
             if (capsuleSearchRequired != _capsuleSecuringMode)
             {
                 _capsuleSecuringMode = capsuleSearchRequired;
@@ -22677,6 +22965,26 @@ namespace AllflameBot
                 _preferredDirection =
                     (_preferredDirection + 1) % 8;
                 ResetPlanner();
+                return Task.FromResult(true);
+            }
+
+            if (!VoyageTerrainSnapshotService.ValidatePath(
+                    AllflameContext.AreaHash,
+                    player,
+                    target,
+                    capsuleSearchRequired
+                        ? "CapsuleSearchFallback"
+                        : "TerrainFrontier",
+                    AllflameMovementCoordinator.NavigationRevision))
+            {
+                _planner.MarkBlockedRegion(
+                    target,
+                    Math.Max(
+                        45f,
+                        settings.VoyageFrontierSpacing * 0.65f));
+                _nodeIndex = -1;
+                AllflameMovementCoordinator.AdvanceNavigation(
+                    "TerrainTargetNoPath");
                 return Task.FromResult(true);
             }
 
