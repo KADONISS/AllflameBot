@@ -2,6 +2,14 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.147 - 2026-08-05
+
+- Make emergency Allflame Capsule routing select the Capsule itself instead
+  of only steering the geometric frontier toward it.
+- Preserve `CapsuleExtraction` movement priority through approach, reach and
+  soft-defer recovery so topology/frontier movement cannot take ownership.
+- Keep Capsule failures recoverable without adding automatic stop behavior.
+
 ## 0.23.146 - 2026-08-05
 
 - Remove the incorrect absolute `+/-1500` world-coordinate limit that rejected

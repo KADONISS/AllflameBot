@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.146";
+        public const string Current = "0.23.147";
     }
 
     public sealed class AllflameBot : IBot
@@ -22254,6 +22254,7 @@ namespace AllflameBot
         private DateTime _lastLanternProgressUtc =
             DateTime.MinValue;
         private bool _capsuleSecuringMode;
+        private bool _capsuleTargetActive;
         private int _consecutiveShortTargetRejects;
         private Vector2i _shortTargetRejectAnchor;
         private bool _shortEscapeActive;
@@ -22280,6 +22281,7 @@ namespace AllflameBot
             _topologyPlanner.Reset(0);
             ResetSpatialLoopTracking();
             ResetShortTargetRecovery();
+            _capsuleTargetActive = false;
             _lastTargetFingerprint = String.Empty;
             _repeatedTargetFingerprintCount = 0;
         }
@@ -22290,6 +22292,7 @@ namespace AllflameBot
             _activeTopologyRoomIndex = -1;
             ResetSpatialLoopTracking();
             ResetShortTargetRecovery();
+            _capsuleTargetActive = false;
             _lastTargetFingerprint = String.Empty;
             _repeatedTargetFingerprintCount = 0;
         }
@@ -22385,16 +22388,18 @@ namespace AllflameBot
             _planner.Observe(player);
             ObserveSpatialLoopState(player);
 
-            if (_shortEscapeActive ||
+            if (!_capsuleTargetActive &&
+                (_shortEscapeActive ||
                 _consecutiveShortTargetRejects >=
                     ShortTargetRejectsBeforeEscape ||
-                DateTime.UtcNow < _shortEscapeWaitUntilUtc)
+                DateTime.UtcNow < _shortEscapeWaitUntilUtc))
             {
                 return Task.FromResult(
                     RunShortTargetEscape(player));
             }
 
-            if (TryRecoverSpatialLoop(player))
+            if (!_capsuleTargetActive &&
+                TryRecoverSpatialLoop(player))
             {
                 return Task.FromResult(true);
             }
@@ -22405,7 +22410,8 @@ namespace AllflameBot
             }
 
             if (_nodeIndex >= 0 ||
-                _activeTopologyRoomIndex >= 0)
+                _activeTopologyRoomIndex >= 0 ||
+                _capsuleTargetActive)
             {
                 float distance = player.DistanceF(_target);
                 // Frontier points can lie just inside large terrain objects.
@@ -22432,7 +22438,19 @@ namespace AllflameBot
                     TimeSpan.FromSeconds(1);
                 if (reached)
                 {
-                    if (_activeTopologyRoomIndex >= 0)
+                    if (_capsuleTargetActive)
+                    {
+                        VoyageRunState.MarkCapsuleTraversed(
+                            _target,
+                            "ExploreVoyageCapsulePriority");
+                        AllflameLog.Info(
+                            "CAPSULE_PRIORITY_TARGET_REACHED" +
+                            "|Target=" + _target +
+                            "|Distance=" + distance.ToString("0.0") +
+                            "|Action=ResumeVoyage");
+                        _capsuleTargetActive = false;
+                    }
+                    else if (_activeTopologyRoomIndex >= 0)
                     {
                         AllflameLog.Info(
                             "TOPOLOGY_ROOM_REACHED" +
@@ -22465,7 +22483,22 @@ namespace AllflameBot
                         return Task.FromResult(true);
                     }
 
-                    if (_activeTopologyRoomIndex >= 0)
+                    if (_capsuleTargetActive)
+                    {
+                        VoyageRunState.DeferCapsuleVisit(
+                            _target,
+                            timedOut
+                                ? "PriorityTargetTimeout"
+                                : "PriorityTargetNoProgress");
+                        _capsuleTargetActive = false;
+                        AllflameLog.Info(
+                            "CAPSULE_PRIORITY_TARGET_DEFERRED" +
+                            "|Target=" + _target +
+                            "|Timeout=" + timedOut +
+                            "|NoProgress=" + noProgress +
+                            "|Action=ResumeVoyageThenRetry");
+                    }
+                    else if (_activeTopologyRoomIndex >= 0)
                     {
                         _topologyPlanner.MarkBlocked(
                             _activeTopologyRoomIndex,
@@ -22536,9 +22569,13 @@ namespace AllflameBot
                         _repeatedTargetFingerprintCount = 0;
                         return Task.FromResult(true);
                     }
+                    string movementContext =
+                        _capsuleTargetActive || capsuleSearchRequired
+                            ? Name + " Capsule extraction priority"
+                            : Name;
                     bool moving = AllflameMovementCoordinator.MoveTowards(
                         _target,
-                        Name);
+                        movementContext);
                     AllflameLog.Throttled(
                         "voyage_frontier_move",
                         TimeSpan.FromSeconds(2),
@@ -22559,23 +22596,26 @@ namespace AllflameBot
                     player,
                     out knownCapsule))
             {
-                _preferredDirection =
-                    _planner.SteerToward(
-                        player,
-                        knownCapsule);
-                AllflameLog.Throttled(
-                    "capsule_frontier_steering",
-                    TimeSpan.FromSeconds(2),
-                    "CAPSULE_FRONTIER_STEERING" +
-                    "|Capsule=" + knownCapsule +
+                _capsuleTargetActive = true;
+                _nodeIndex = -1;
+                _activeTopologyRoomIndex = -1;
+                _activeTopologyRoomName = String.Empty;
+                _target = knownCapsule;
+                _targetStartedUtc = DateTime.UtcNow;
+                _meaningfulProgressUtc = DateTime.UtcNow;
+                _lastProgressPosition = player;
+                _bestTargetDistance = player.DistanceF(knownCapsule);
+                _detourAttempt = 0;
+                AllflameLog.Info(
+                    "CAPSULE_PRIORITY_TARGET_SELECTED" +
+                    "|Target=" + knownCapsule +
                     "|Distance=" +
-                    player.DistanceF(knownCapsule)
-                        .ToString("0.0") +
-                    "|Direction=" + _preferredDirection +
-                    "|NearestLanternDistance=" +
-                    VoyageRunState.GetNearestLanternDistance(
-                        knownCapsule).ToString("0.0") +
-                    "|Action=ExtendLanternCoverageTowardCapsule");
+                    _bestTargetDistance.ToString("0.0") +
+                    "|LanternCounter=" +
+                    AllflameContext.LanternCounterCurrent + "/" +
+                    AllflameContext.LanternCounterMaximum +
+                    "|Action=PreemptTopologyAndFrontier");
+                return Task.FromResult(true);
             }
             if (!capsuleSearchRequired &&
                 _topologyPlanner.TrySelect(
@@ -23281,7 +23321,19 @@ namespace AllflameBot
             if (totalRecoverySeconds >= 5.0)
             {
                 Vector2i abandonedTarget = _target;
-                if (_activeTopologyRoomIndex >= 0)
+                if (_capsuleTargetActive)
+                {
+                    VoyageRunState.DeferCapsuleVisit(
+                        abandonedTarget,
+                        "PriorityDetourFailsafe");
+                    _capsuleTargetActive = false;
+                    AllflameLog.Info(
+                        "CAPSULE_PRIORITY_TARGET_DEFERRED" +
+                        "|Target=" + abandonedTarget +
+                        "|Reason=DetourFailsafe" +
+                        "|Action=ResumeVoyageThenRetry");
+                }
+                else if (_activeTopologyRoomIndex >= 0)
                 {
                     _topologyPlanner.MarkBlocked(
                         _activeTopologyRoomIndex,
@@ -23349,9 +23401,13 @@ namespace AllflameBot
                 return true;
             }
 
+            string movementContext =
+                _capsuleTargetActive
+                    ? Name + " Capsule extraction priority obstacle detour"
+                    : Name + " obstacle detour";
             bool moving = AllflameMovementCoordinator.MoveTowards(
                 _detourTarget,
-                Name + " obstacle detour");
+                movementContext);
             if (timedOut || !moving)
             {
                 _detouring = false;
@@ -23388,6 +23444,7 @@ namespace AllflameBot
             _activeTopologyRoomIndex = -1;
             _activeTopologyRoomName = String.Empty;
             _nodeIndex = -1;
+            _capsuleTargetActive = false;
             _detouring = false;
             _detourAttempt = 0;
             _targetStartedUtc = DateTime.MinValue;
