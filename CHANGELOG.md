@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## Unreleased
+
+- Add an AI-native repository operating system with root and module context,
+  architecture boundaries, business knowledge, rules, workflows, prompts,
+  ADRs and release/test checklists.
+- Document current DPB compatibility assumptions, map-coordinate uncertainty,
+  task ownership and the distinction between recoverable faults and terminal
+  stop paths.
+
 ## 0.23.151 - 2026-08-05
 
 - Confirm the Call Bathysphere unused-Capsule warning through DPB Element

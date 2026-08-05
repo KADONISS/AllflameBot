@@ -2,6 +2,36 @@
 
 DPB 3.29 bot for the Allflame/Deepwater league mechanic.
 
+## Repository guide
+
+This repository contains a single DreamPoeBot plugin assembly targeting .NET
+Framework 4.8, x64 and C# 7.3. The runtime is an ordered `ObserverTask`
+pipeline that reads DPB state, performs one bounded action, and verifies the
+result on a later cycle.
+
+Start with these documents when changing the repository:
+
+- [`AGENTS.md`](AGENTS.md) - repository rules and required reading for coding agents.
+- [`.agents/index.md`](.agents/index.md) - context routing by task type.
+- [`architecture/overview.md`](architecture/overview.md) - current system boundaries.
+- [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md) - lifecycle and task-cycle behavior.
+- [`docs/dpb-compatibility.md`](docs/dpb-compatibility.md) - external DPB assumptions.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) - evidence-first diagnosis workflow.
+- [`workflows/release.md`](workflows/release.md) - build and release checklist.
+
+The existing release notes below remain the historical feature record. The
+new architecture and AI-context documents describe the current codebase and
+must be updated when responsibilities or runtime contracts change.
+
+## Quick start
+
+1. Build `AllflameBot.csproj` with the matching DreamPoeBot and Newtonsoft.Json
+   assemblies available at the paths declared by the project file.
+2. Keep `3rdparty.json` and the `Data` content beside the plugin project.
+3. Copy the resulting `AllflameBot.dll` into the DPB `3rdParty` deployment
+   location and verify the plugin loads before enabling automation.
+4. Keep runtime settings, logs, screenshots and compiled output outside Git.
+
 ## Release 0.23.93
 
 Version 0.23.93 distinguishes a real reward held on the cursor from the
