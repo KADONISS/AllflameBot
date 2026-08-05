@@ -2,6 +2,14 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.151 - 2026-08-05
+
+- Confirm the Call Bathysphere unused-Capsule warning through DPB Element
+  nodes, with dialog-relative coordinates and scoped `OK` text fallbacks.
+- Retain the existing screenshot matcher as the final warning confirmation
+  fallback for clients whose warning modal is not exposed by the Element tree.
+- Log the confirmation mode in both direct and visual Call Bathysphere paths.
+
 ## 0.23.150 - 2026-08-05
 
 - Add an immutable `AreaMapSnapshot` backed by DPB terrain, walkability,

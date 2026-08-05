@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.150";
+        public const string Current = "0.23.151";
     }
 
     public sealed class AllflameBot : IBot
@@ -17093,6 +17093,508 @@ namespace AllflameBot
         }
     }
 
+    internal sealed class CapsuleWarningMatch
+    {
+        public Element Dialog;
+        public Element OkElement;
+        public Element ActionButton;
+        public Vector2i Coordinate;
+        public int RootIndex;
+    }
+
+    /// <summary>
+    /// Resolves the modal warning shown after Call Bathysphere. The Element
+    /// path is primary; dialog-relative coordinates and scoped OK text are
+    /// fallbacks before the existing screenshot matcher is used.
+    /// </summary>
+    internal static class CapsuleWarningUi
+    {
+        private const string ConfirmationWindowId =
+            "confirmation_window";
+        private const string ActionButtonId = "action_button";
+        private const string WarningTitle = "Warning";
+        private const string UnusedCapsuleText = "unused Capsules";
+        private const string ReturnSovereignText =
+            "return to the Sovereign";
+        private const int MaximumVisited = 1200;
+
+        public static bool TryClick(
+            out string mode,
+            out Vector2i location)
+        {
+            mode = "None";
+            location = new Vector2i();
+            CapsuleWarningMatch match;
+            if (!TryFindWarning(out match))
+            {
+                return false;
+            }
+
+            if (IsUsable(match.OkElement) &&
+                SafeEnabled(match.OkElement))
+            {
+                if (TryGetCenter(match.OkElement, out location) &&
+                    VoyagePlanningUi.Click(match.OkElement))
+                {
+                    mode = "Element";
+                    LogClick(mode, match, location);
+                    return true;
+                }
+            }
+
+            if (TryGetCoordinate(match, out location) &&
+                VoyagePlanningUi.ClickClient(location))
+            {
+                mode = "Coordinate";
+                LogClick(mode, match, location);
+                return true;
+            }
+
+            Element textOk = FindTextOk(match.Dialog);
+            if (IsUsable(textOk) &&
+                SafeEnabled(textOk) &&
+                TryGetCenter(textOk, out location) &&
+                VoyagePlanningUi.Click(textOk))
+            {
+                mode = "Text";
+                LogClick(mode, match, location);
+                return true;
+            }
+
+            AllflameLog.Throttled(
+                "capsule_warning_element_click_failed",
+                TimeSpan.FromSeconds(2),
+                "CAPSULE_WARNING_CONFIRM" +
+                "|Mode=None" +
+                "|Reason=NoUsableElementCoordinateOrText" +
+                "|RootIndex=" + match.RootIndex);
+            return false;
+        }
+
+        public static bool IsVisible()
+        {
+            CapsuleWarningMatch match;
+            return TryFindWarning(out match);
+        }
+
+        private static bool TryFindWarning(
+            out CapsuleWarningMatch match)
+        {
+            match = null;
+            List<Element> roots;
+            try
+            {
+                roots = LokiPoe.GetGuiElements();
+            }
+            catch
+            {
+                return false;
+            }
+            if (roots == null)
+            {
+                return false;
+            }
+
+            int visited = 0;
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(350);
+            var seen = new HashSet<long>();
+            for (int rootIndex = roots.Count - 1;
+                 rootIndex >= 0 &&
+                 visited < MaximumVisited &&
+                 DateTime.UtcNow < deadline;
+                 rootIndex--)
+            {
+                Element dialog = FindById(
+                    roots[rootIndex],
+                    ConfirmationWindowId,
+                    0,
+                    seen,
+                    deadline,
+                    ref visited);
+                if (!IsUsable(dialog) ||
+                    !IsWarningDialog(dialog))
+                {
+                    continue;
+                }
+
+                Element action = FindById(
+                    dialog,
+                    ActionButtonId,
+                    0,
+                    new HashSet<long>(),
+                    deadline,
+                    ref visited);
+                Element ok = FindText(
+                    action ?? dialog,
+                    "ok",
+                    0,
+                    new HashSet<long>(),
+                    deadline,
+                    ref visited);
+                match = new CapsuleWarningMatch
+                {
+                    Dialog = dialog,
+                    ActionButton = action,
+                    OkElement = ok,
+                    RootIndex = rootIndex
+                };
+                Vector2i coordinate;
+                if (TryGetCoordinate(match, out coordinate))
+                {
+                    match.Coordinate = coordinate;
+                }
+                AllflameLog.Throttled(
+                    "capsule_warning_element_found",
+                    TimeSpan.FromSeconds(2),
+                    "CAPSULE_WARNING_ELEMENT" +
+                    "|Found=True" +
+                    "|RootIndex=" + rootIndex +
+                    "|Dialog=" + FormatAddress(dialog) +
+                    "|ActionButton=" + FormatAddress(action) +
+                    "|Ok=" + FormatAddress(ok) +
+                    "|Coordinate=" + match.Coordinate +
+                    "|OkEnabled=" + SafeEnabled(ok));
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsWarningDialog(Element dialog)
+        {
+            string allText = String.Join(
+                " ",
+                EnumerateText(dialog)
+                    .Where(text => !String.IsNullOrWhiteSpace(text)));
+            bool titleMatches = EnumerateText(dialog).Any(text =>
+                String.Equals(
+                    text.Trim(),
+                    WarningTitle,
+                    StringComparison.OrdinalIgnoreCase));
+            bool messageMatches =
+                allText.IndexOf(
+                    UnusedCapsuleText,
+                    StringComparison.OrdinalIgnoreCase) >= 0 ||
+                allText.IndexOf(
+                    ReturnSovereignText,
+                    StringComparison.OrdinalIgnoreCase) >= 0;
+            return IsUsable(dialog) && titleMatches && messageMatches;
+        }
+
+        private static bool TryGetCoordinate(
+            CapsuleWarningMatch match,
+            out Vector2i location)
+        {
+            location = new Vector2i();
+            if (match == null || !IsUsable(match.Dialog))
+            {
+                return false;
+            }
+
+            if (TryGetCenter(match.OkElement, out location) ||
+                TryGetCenter(match.ActionButton, out location))
+            {
+                return IsClientLocation(location);
+            }
+
+            Vector2i dialogCenter;
+            if (!TryGetCenter(match.Dialog, out dialogCenter))
+            {
+                return false;
+            }
+
+            // Reference snapshot: dialog center {1025,513}, OK center
+            // {1088,541}. Keep the offset proportional to the dialog so
+            // this remains valid across UI scales and resolutions.
+            location = new Vector2i(
+                dialogCenter.X +
+                    (int)Math.Round(match.Dialog.Width * 0.0956),
+                dialogCenter.Y +
+                    (int)Math.Round(match.Dialog.Height * 0.1302));
+            return IsClientLocation(location);
+        }
+
+        private static Element FindTextOk(Element dialog)
+        {
+            int visited = 0;
+            return FindText(
+                dialog,
+                "ok",
+                0,
+                new HashSet<long>(),
+                DateTime.UtcNow.AddMilliseconds(250),
+                ref visited);
+        }
+
+        private static IEnumerable<string> EnumerateText(Element root)
+        {
+            if (root == null)
+            {
+                yield break;
+            }
+            string text = SafeText(root).Trim();
+            if (!String.IsNullOrWhiteSpace(text))
+            {
+                yield return text;
+            }
+            List<Element> children;
+            try
+            {
+                children = root.Children;
+            }
+            catch
+            {
+                yield break;
+            }
+            if (children == null)
+            {
+                yield break;
+            }
+            foreach (Element child in children)
+            {
+                foreach (string childText in EnumerateText(child))
+                {
+                    yield return childText;
+                }
+            }
+        }
+
+        private static Element FindById(
+            Element element,
+            string id,
+            int depth,
+            ISet<long> seen,
+            DateTime deadline,
+            ref int visited)
+        {
+            if (element == null ||
+                depth > 14 ||
+                visited >= MaximumVisited ||
+                DateTime.UtcNow >= deadline)
+            {
+                return null;
+            }
+            if (!MarkVisited(element, seen, ref visited))
+            {
+                return null;
+            }
+            if (String.Equals(
+                    SafeId(element),
+                    id,
+                    StringComparison.OrdinalIgnoreCase) &&
+                IsUsable(element))
+            {
+                return element;
+            }
+            foreach (Element child in SafeChildren(element))
+            {
+                Element found = FindById(
+                    child,
+                    id,
+                    depth + 1,
+                    seen,
+                    deadline,
+                    ref visited);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        private static Element FindText(
+            Element element,
+            string expected,
+            int depth,
+            ISet<long> seen,
+            DateTime deadline,
+            ref int visited)
+        {
+            if (element == null ||
+                depth > 14 ||
+                visited >= MaximumVisited ||
+                DateTime.UtcNow >= deadline)
+            {
+                return null;
+            }
+            if (!MarkVisited(element, seen, ref visited))
+            {
+                return null;
+            }
+            if (String.Equals(
+                    SafeText(element).Trim(),
+                    expected,
+                    StringComparison.OrdinalIgnoreCase) &&
+                IsUsable(element))
+            {
+                return element;
+            }
+            foreach (Element child in SafeChildren(element))
+            {
+                Element found = FindText(
+                    child,
+                    expected,
+                    depth + 1,
+                    seen,
+                    deadline,
+                    ref visited);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+            return null;
+        }
+
+        private static bool MarkVisited(
+            Element element,
+            ISet<long> seen,
+            ref int visited)
+        {
+            visited++;
+            try
+            {
+                long address = element.Address;
+                return address == 0 || seen.Add(address);
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        private static List<Element> SafeChildren(Element element)
+        {
+            try
+            {
+                return element == null || element.Children == null
+                    ? new List<Element>()
+                    : element.Children;
+            }
+            catch
+            {
+                return new List<Element>();
+            }
+        }
+
+        private static bool IsUsable(Element element)
+        {
+            try
+            {
+                return element != null &&
+                    element.IsValid &&
+                    element.IsVisible;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool SafeEnabled(Element element)
+        {
+            try
+            {
+                return IsUsable(element) && element.IsEnable;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string SafeId(Element element)
+        {
+            try
+            {
+                return element == null ? String.Empty : element.IdLabel ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static string SafeText(Element element)
+        {
+            try
+            {
+                return element == null ? String.Empty : element.Text ?? String.Empty;
+            }
+            catch
+            {
+                return String.Empty;
+            }
+        }
+
+        private static bool TryGetCenter(
+            Element element,
+            out Vector2i center)
+        {
+            center = new Vector2i();
+            if (!IsUsable(element))
+            {
+                return false;
+            }
+            try
+            {
+                center = element.CenterClickLocation();
+                return IsClientLocation(center);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsClientLocation(Vector2i location)
+        {
+            try
+            {
+                var client = LokiPoe.ClientWindowInfo.Client;
+                int width = client.Right - client.Left;
+                int height = client.Bottom - client.Top;
+                return width > 0 && height > 0 &&
+                    location.X >= 0 && location.X < width &&
+                    location.Y >= 0 && location.Y < height;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string FormatAddress(Element element)
+        {
+            try
+            {
+                return element == null
+                    ? "0x0"
+                    : "0x" + element.Address.ToString("X");
+            }
+            catch
+            {
+                return "0x0";
+            }
+        }
+
+        private static void LogClick(
+            string mode,
+            CapsuleWarningMatch match,
+            Vector2i location)
+        {
+            AllflameLog.Info(
+                "CAPSULE_WARNING_CONFIRM" +
+                "|Mode=" + mode +
+                "|InputSent=True" +
+                "|RootIndex=" + match.RootIndex +
+                "|Dialog=" + FormatAddress(match.Dialog) +
+                "|Ok=" + FormatAddress(match.OkElement) +
+                "|ActionButton=" + FormatAddress(match.ActionButton) +
+                "|Client=" + location);
+        }
+    }
+
     /// <summary>
     /// Bounded visual fallback for the enabled CALL BATHYSPHERE button.
     /// DPB 0.3.29.14 exposes the Capsule world object but the opened Capsule
@@ -28599,37 +29101,20 @@ namespace AllflameBot
                                 _callAttempts;
                             bool acknowledged = false;
                             bool warningOkClicked = false;
+                            string warningMode = "None";
                             double warningCorrelation = -1.0;
                             if (inputSent)
                             {
                                 await LokiCoroutine.Sleep(350);
                                 Vector2i warningOkLocation;
-                                if (CapsuleVisualUi
-                                    .TryFindWarningOk(
+                                warningOkClicked =
+                                    TryConfirmCapsuleWarning(
+                                        out warningMode,
                                         out warningOkLocation,
-                                        out warningCorrelation) &&
-                                    CanUseLockedCapsuleUi(
-                                        "WarningConfirm"))
+                                        out warningCorrelation);
+                                if (warningOkClicked)
                                 {
-                                    warningOkClicked =
-                                        CapsuleVisualUi.ClickCall(
-                                            warningOkLocation,
-                                            1);
-                                    AllflameLog.Info(
-                                        "CAPSULE_WARNING_CONFIRM" +
-                                        "|Action=ClickOk" +
-                                        "|InputSent=" +
-                                        warningOkClicked +
-                                        "|Correlation=" +
-                                        warningCorrelation
-                                            .ToString("0.000") +
-                                        "|Client=" +
-                                        warningOkLocation);
-                                    if (warningOkClicked)
-                                    {
-                                        await LokiCoroutine
-                                            .Sleep(500);
-                                    }
+                                    await LokiCoroutine.Sleep(500);
                                 }
 
                                 AllflameContext.Refresh(true);
@@ -28663,7 +29148,8 @@ namespace AllflameBot
                                 "|InputSent=" + inputSent +
                                 "|Acknowledged=" + acknowledged +
                                 "|WarningOkClicked=" +
-                                warningOkClicked);
+                                warningOkClicked +
+                                "|WarningMode=" + warningMode);
                             AllflameLog.Info(
                                 "VOYAGE_STAGE" +
                                 "|Stage=8" +
@@ -28677,6 +29163,7 @@ namespace AllflameBot
                                 secondDirectLocation +
                                 "|WarningOkClicked=" +
                                 warningOkClicked +
+                                "|WarningMode=" + warningMode +
                                 "|WarningCorrelation=" +
                                 (warningCorrelation >= 0
                                     ? warningCorrelation
@@ -28754,32 +29241,20 @@ namespace AllflameBot
                     int callAttemptForLog = _callAttempts;
                     bool acknowledged = false;
                     bool warningOkClicked = false;
+                    string warningMode = "None";
                     double warningCorrelation = -1.0;
                     if (inputSent)
                     {
                         await LokiCoroutine.Sleep(350);
                         Vector2i warningOkLocation;
-                        if (CapsuleVisualUi.TryFindWarningOk(
-                            out warningOkLocation,
-                            out warningCorrelation) &&
-                            CanUseLockedCapsuleUi(
-                                "WarningConfirm"))
+                        warningOkClicked =
+                            TryConfirmCapsuleWarning(
+                                out warningMode,
+                                out warningOkLocation,
+                                out warningCorrelation);
+                        if (warningOkClicked)
                         {
-                            warningOkClicked =
-                                CapsuleVisualUi.ClickCall(
-                                    warningOkLocation,
-                                    1);
-                            AllflameLog.Info(
-                                "CAPSULE_WARNING_CONFIRM" +
-                                "|Action=ClickOk" +
-                                "|InputSent=" + warningOkClicked +
-                                "|Correlation=" +
-                                warningCorrelation.ToString("0.000") +
-                                "|Client=" + warningOkLocation);
-                            if (warningOkClicked)
-                            {
-                                await LokiCoroutine.Sleep(500);
-                            }
+                            await LokiCoroutine.Sleep(500);
                         }
                         Vector2i afterFirstLocation;
                         double afterFirstCorrelation;
@@ -28847,6 +29322,7 @@ namespace AllflameBot
                             .ToString("0.000") +
                         "|WarningOkClicked=" +
                         warningOkClicked +
+                        "|WarningMode=" + warningMode +
                         "|WarningCorrelation=" +
                         (warningCorrelation >= 0
                             ? warningCorrelation.ToString("0.000")
@@ -31228,6 +31704,59 @@ namespace AllflameBot
             }
             position = capsule.Position;
             return true;
+        }
+
+        private bool TryConfirmCapsuleWarning(
+            out string warningMode,
+            out Vector2i warningLocation,
+            out double visualCorrelation)
+        {
+            warningMode = "None";
+            warningLocation = new Vector2i();
+            visualCorrelation = -1.0;
+
+            // Keep the coverage/anchor guard ahead of every confirmation
+            // input, including the new Element-based warning resolver.
+            if (!CanUseLockedCapsuleUi("WarningConfirm"))
+            {
+                warningMode = "Blocked";
+                return false;
+            }
+
+            if (CapsuleWarningUi.TryClick(
+                    out warningMode,
+                    out warningLocation))
+            {
+                return true;
+            }
+
+            if (!CapsuleVisualUi.TryFindWarningOk(
+                    out warningLocation,
+                    out visualCorrelation))
+            {
+                warningMode = "None";
+                return false;
+            }
+
+            if (!CanUseLockedCapsuleUi("WarningConfirmVisual"))
+            {
+                warningMode = "Blocked";
+                return false;
+            }
+
+            warningMode = "Visual";
+            bool inputSent = CapsuleVisualUi.ClickCall(
+                warningLocation,
+                1);
+            AllflameLog.Info(
+                "CAPSULE_WARNING_CONFIRM" +
+                "|Mode=Visual" +
+                "|Action=ClickOk" +
+                "|InputSent=" + inputSent +
+                "|Correlation=" +
+                visualCorrelation.ToString("0.000") +
+                "|Client=" + warningLocation);
+            return inputSent;
         }
 
         private bool CanUseLockedCapsuleUi(string action)
