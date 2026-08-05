@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.145";
+        public const string Current = "0.23.146";
     }
 
     public sealed class AllflameBot : IBot
@@ -5521,17 +5521,6 @@ namespace AllflameBot
             DateTime now = DateTime.UtcNow;
             lock (Sync)
             {
-                if (Math.Abs(target.X) > 1500 ||
-                    Math.Abs(target.Y) > 1500)
-                {
-                    AllflameLog.Info(
-                        "MOVEMENT_TARGET_REJECTED" +
-                        "|Reason=OutOfBounds" +
-                        "|Owner=" + owner +
-                        "|Target=" + target);
-                    return false;
-                }
-
                 bool leaseActive = now < _leaseUntilUtc;
                 if (leaseActive &&
                     !String.Equals(_owner, owner, StringComparison.Ordinal) &&
@@ -5564,21 +5553,26 @@ namespace AllflameBot
                 _leaseUntilUtc = now.AddMilliseconds(1400);
             }
 
+            AllflameLog.Throttled(
+                "movement_submitted_" + owner,
+                TimeSpan.FromMilliseconds(500),
+                "MOVEMENT_INTENT_SUBMITTED" +
+                "|Owner=" + owner +
+                "|Target=" + target +
+                "|Revision=" + NavigationRevision);
+
             try
             {
                 bool moving = PlayerMoverManager.MoveTowards(
                     target,
                     requester);
-                if (!moving)
-                {
-                    AllflameLog.Throttled(
-                        "movement_rejected_" + owner,
-                        TimeSpan.FromSeconds(1),
-                        "MOVEMENT_INTENT_RESULT" +
-                        "|Owner=" + owner +
-                        "|Target=" + target +
-                        "|Moving=False");
-                }
+                AllflameLog.Throttled(
+                    "movement_result_" + owner,
+                    TimeSpan.FromSeconds(1),
+                    "MOVEMENT_INTENT_RESULT" +
+                    "|Owner=" + owner +
+                    "|Target=" + target +
+                    "|Moving=" + moving);
                 return moving;
             }
             catch (Exception ex)

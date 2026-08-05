@@ -2,6 +2,13 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.146 - 2026-08-05
+
+- Remove the incorrect absolute `+/-1500` world-coordinate limit that rejected
+  valid Voyage positions and caused movement recovery loops.
+- Record submitted movement intents and throttled mover results for diagnosing
+  real pathfinder failures without adding automatic stop behavior.
+
 ## 0.23.145 - 2026-08-05
 
 - Arbitrate movement ownership so safety, extraction and loot actions cannot
