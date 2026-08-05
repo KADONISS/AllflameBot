@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.150 - 2026-08-05
+
+- Add an immutable `AreaMapSnapshot` backed by DPB terrain, walkability,
+  fly-data and jump-mask buffers, stabilized per AreaHash.
+- Add Chart terrain-guided frontier targets while retaining topology, Capsule,
+  Lantern, chest and hybrid geometric planner ownership priorities.
+- Add Chart terrain readiness, heartbeat, no-path and fallback diagnostics;
+  terrain/API failures continue through the existing planner without stopping.
+
 ## 0.23.149 - 2026-08-05
 
 - Recover Chart Device and Bathysphere transition failures by refreshing UI
