@@ -19,6 +19,7 @@ Update when a new operational guide or module boundary is added.
 - [`runtime-lifecycle.md`](runtime-lifecycle.md)
 - [`troubleshooting.md`](troubleshooting.md)
 - [`dpb-compatibility.md`](dpb-compatibility.md)
+- [`dpb-developer-guidance.md`](dpb-developer-guidance.md)
 - [`release.md`](release.md)
 - [`maintenance.md`](maintenance.md)
 

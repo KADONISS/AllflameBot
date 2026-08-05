@@ -10,6 +10,8 @@ All notable changes to AllflameBot are documented in this file.
 - Document current DPB compatibility assumptions, map-coordinate uncertainty,
   task ownership and the distinction between recoverable faults and terminal
   stop paths.
+- Remove obsolete release-history sections from `README.md`; release history now
+  remains centralized in this changelog.
 
 ## 0.23.151 - 2026-08-05
 
