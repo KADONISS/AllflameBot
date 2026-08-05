@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.149 - 2026-08-05
+
+- Recover Chart Device and Bathysphere transition failures by refreshing UI
+  state and reacquiring the chart instead of stopping the bot.
+- Add transition heartbeats with area, UI, chart and recovery state diagnostics
+  to expose stalled Descend transactions.
+- Keep coroutine disposal and progress watchdog failures recoverable so Voyage
+  can continue without automatic stop behavior.
+
 ## 0.23.148 - 2026-08-05
 
 - Add a Voyage terrain snapshot service backed by DPB terrain metadata and

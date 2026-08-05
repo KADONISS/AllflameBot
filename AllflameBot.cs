@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.148";
+        public const string Current = "0.23.149";
     }
 
     public sealed class AllflameBot : IBot
@@ -248,12 +248,9 @@ namespace AllflameBot
                         : "BOT_COROUTINE_DISPOSE_FAILED") +
                     "|Type=" + ex.GetType().Name +
                     "|Source=" +
-                    (cancelled ? stopSource : "FatalStop") +
+                    stopSource +
+                    "|RecoveryAction=ContinueCleanup" +
                     "|Context=" + AllflameProgressWatchdog.Describe());
-                if (!cancelled)
-                {
-                    stopSource = "FatalStop";
-                }
             }
             finally
             {
@@ -5376,15 +5373,24 @@ namespace AllflameBot
                     "|TargetId=" + _targetId +
                     "|Retry=" + _retry +
                     "|ElapsedSeconds=" + ElapsedSecondsUnsafe() +
-                    "|NextAction=ControlledStop";
+                    "|NextAction=RuntimeRecovery";
             }
             if (!String.IsNullOrEmpty(timeoutDetail))
             {
                 AllflameLog.Info(
-                    "PROGRESS_WATCHDOG_TIMEOUT|" + timeoutDetail);
-                AllflameStopController.Stop(
-                    "ProgressWatchdogTimeout",
-                    timeoutDetail);
+                    "PROGRESS_WATCHDOG_RECOVERY|" + timeoutDetail +
+                    "|Action=ContinueAndRefresh");
+                try
+                {
+                    AllflameContext.Refresh(true);
+                }
+                catch (Exception ex)
+                {
+                    AllflameLog.Info(
+                        "PROGRESS_WATCHDOG_REFRESH_FAILED" +
+                        "|Type=" + ex.GetType().Name);
+                }
+                MarkProgress("WatchdogRecovery");
             }
         }
 
@@ -20303,7 +20309,9 @@ namespace AllflameBot
         private DateTime _portalConfirmedUtc = DateTime.MinValue;
         private DateTime _portalWaitUntilUtc = DateTime.MinValue;
         private DateTime _nextPortalInteractUtc = DateTime.MinValue;
+        private DateTime _lastTransitionHeartbeatUtc = DateTime.MinValue;
         private int _portalUiRecoveries;
+        private int _transactionRecoveries;
         private bool _capacityRecoveryClosePending;
         private uint _transactionAreaHash;
         private DateTime _transactionStartedUtc = DateTime.MinValue;
@@ -20340,7 +20348,9 @@ namespace AllflameBot
             _portalConfirmedUtc = DateTime.MinValue;
             _portalWaitUntilUtc = DateTime.MinValue;
             _nextPortalInteractUtc = DateTime.MinValue;
+            _lastTransitionHeartbeatUtc = DateTime.MinValue;
             _portalUiRecoveries = 0;
+            _transactionRecoveries = 0;
             _descendDisabledSinceUtc = DateTime.MinValue;
             _transactionAreaHash = 0;
             _transactionStartedUtc = DateTime.MinValue;
@@ -20435,6 +20445,7 @@ namespace AllflameBot
 
             TimeSpan transactionElapsed =
                 DateTime.UtcNow - _transactionStartedUtc;
+            LogTransitionHeartbeat(transactionElapsed);
             if (transactionElapsed >= TransactionTimeout)
             {
                 string detail =
@@ -20449,10 +20460,11 @@ namespace AllflameBot
                     "|PortalUiRecoveries=" + _portalUiRecoveries +
                     "|LoadedChartId=" + _customChartLocalId;
                 AllflameLog.Info(
-                    "CHART_DEVICE_TRANSACTION_TIMEOUT|" + detail);
-                AllflameStopController.Stop(
-                    "ChartDeviceStateTimeout",
-                    detail);
+                    "CHART_DEVICE_TRANSACTION_RECOVERY|" + detail +
+                    "|Action=RefreshUiAndRetry");
+                await RecoverChartDeviceTransaction(
+                    "TransactionTimeout",
+                    true);
                 return true;
             }
 
@@ -20519,18 +20531,15 @@ namespace AllflameBot
                 if (portalEntryElapsed >= PortalEntryTimeout)
                 {
                     AllflameLog.Info(
-                        "BATHYSPHERE_PORTAL_ENTRY_TIMEOUT" +
+                        "BATHYSPHERE_PORTAL_ENTRY_RECOVERY" +
                         "|Attempts=" + _descendAttempts +
                         "|UiRecoveries=" + _portalUiRecoveries +
                         "|ElapsedMs=" +
                         (int)portalEntryElapsed.TotalMilliseconds +
-                        "|Action=StopBot");
-                    AllflameStopController.Stop(
-                        "ChartPortalEntryTimeout",
-                        "DescendConfirmed=True|Attempts=" +
-                        _descendAttempts +
-                        "|UiRecoveries=" + _portalUiRecoveries +
-                        "|ActiveTask=" + Name);
+                        "|Action=RefreshContextAndRetry");
+                    await RecoverChartDeviceTransaction(
+                        "PortalEntryTimeout",
+                        true);
                     return true;
                 }
 
@@ -20647,17 +20656,15 @@ namespace AllflameBot
             if (_descendConfirmed)
             {
                 AllflameLog.Info(
-                    "BATHYSPHERE_PORTAL_APPEARANCE_TIMEOUT" +
+                    "BATHYSPHERE_PORTAL_APPEARANCE_RECOVERY" +
                     "|Attempts=" + _descendAttempts +
                     "|ElapsedMs=" +
                     (int)(DateTime.UtcNow -
                           _portalConfirmedUtc).TotalMilliseconds +
-                    "|Action=StopBot");
-                AllflameStopController.Stop(
-                    "ChartPortalMissing",
-                    "DescendConfirmed=True|Attempts=" +
-                    _descendAttempts +
-                    "|ActiveTask=" + Name);
+                    "|Action=RefreshContextAndRetry");
+                await RecoverChartDeviceTransaction(
+                    "PortalAppearanceTimeout",
+                    true);
                 return true;
             }
 
@@ -20860,16 +20867,13 @@ namespace AllflameBot
             if (_descendAttempts >= MaximumDescendAttempts)
             {
                 AllflameLog.Info(
-                    "CHART_DEVICE_DESCEND_FAILSAFE|Attempts=" +
+                    "CHART_DEVICE_DESCEND_RECOVERY|Attempts=" +
                     _descendAttempts +
                     "|LoadedChartId=" + _customChartLocalId +
-                    "|Action=StopBot");
-                AllflameStopController.Stop(
-                    "DescendFailed",
-                    "CustomUiExpected=True|Attempts=" +
-                    _descendAttempts +
-                    "|LoadedChartId=" +
-                    _customChartLocalId);
+                    "|Action=CloseUiAndRetry");
+                await RecoverChartDeviceTransaction(
+                    "DescendAttemptsExhausted",
+                    true);
                 return true;
             }
 
@@ -20968,10 +20972,10 @@ namespace AllflameBot
                         "|LoadedChartId=" + _customChartLocalId;
                     AllflameLog.Info(
                         "CHART_DEVICE_EMPTY_RECOVERY_EXHAUSTED|" +
-                        detail);
-                    AllflameStopController.Stop(
-                        "ChartDeviceStateTimeout",
-                        detail);
+                        detail + "|Action=RefreshUiAndRetry");
+                    await RecoverChartDeviceTransaction(
+                        "EmptyDeviceRecoveryExhausted",
+                        true);
                     return true;
                 }
                 _nextActivateUtc =
@@ -21014,6 +21018,127 @@ namespace AllflameBot
                 "|DeviceItems=" + nativeDeviceItems.Count +
                 "|Attempt=" + _descendAttempts);
             return true;
+        }
+
+        private async Task RecoverChartDeviceTransaction(
+            string reason,
+            bool closeBlockingUi)
+        {
+            _transactionRecoveries++;
+            _descendAttempts = 0;
+            _descendIssued = false;
+            _descendConfirmed = false;
+            _descendIssuedUtc = DateTime.MinValue;
+            _portalConfirmedUtc = DateTime.MinValue;
+            _portalWaitUntilUtc = DateTime.MinValue;
+            _nextPortalInteractUtc = DateTime.MinValue;
+            _portalUiRecoveries = 0;
+            _descendDisabledSinceUtc = DateTime.MinValue;
+            _transactionStartedUtc = DateTime.UtcNow;
+            _lastTransitionHeartbeatUtc = DateTime.MinValue;
+            _nextActivateUtc = DateTime.UtcNow.AddSeconds(1);
+            AllflameProgressWatchdog.SetRetry(_transactionRecoveries);
+            AllflameProgressWatchdog.MarkProgress(
+                "ChartDeviceRecovery:" + reason);
+
+            AllflameLog.Info(
+                "CHART_DEVICE_RECOVERY_BEGIN" +
+                "|Reason=" + reason +
+                "|Recovery=" + _transactionRecoveries +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|LoadedChartId=" + _customChartLocalId +
+                "|InventoryCharts=" +
+                AllflameContext.InventoryChartCount +
+                "|Action=RefreshContext" +
+                (closeBlockingUi ? "+CloseUi" : String.Empty));
+
+            try
+            {
+                AllflameContext.Refresh(true);
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_DEVICE_RECOVERY_REFRESH_FAILED" +
+                    "|Reason=" + reason +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            if (closeBlockingUi)
+            {
+                try
+                {
+                    await Coroutines.CloseBlockingWindows();
+                }
+                catch (Exception ex)
+                {
+                    AllflameLog.Info(
+                        "CHART_DEVICE_RECOVERY_CLOSE_UI_FAILED" +
+                        "|Reason=" + reason +
+                        "|Type=" + ex.GetType().Name);
+                }
+            }
+
+            AllflameLog.Info(
+                "CHART_DEVICE_RECOVERY_READY" +
+                "|Reason=" + reason +
+                "|Recovery=" + _transactionRecoveries +
+                "|NextAction=ReacquireChartDevice");
+        }
+
+        private void LogTransitionHeartbeat(TimeSpan transactionElapsed)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now - _lastTransitionHeartbeatUtc <
+                TimeSpan.FromSeconds(2))
+            {
+                return;
+            }
+
+            _lastTransitionHeartbeatUtc = now;
+            AllflameProgressWatchdog.MarkProgress(
+                "ChartDeviceHeartbeat");
+            bool nativeUiOpen = false;
+            bool stableUiOpen = false;
+            int deviceItems = 0;
+            try
+            {
+                nativeUiOpen = NativeDeepwaterChartDeviceUi.IsOpened;
+                stableUiOpen = DeepwaterChartDeviceUi.IsStableWindowOpen;
+                if (nativeUiOpen)
+                {
+                    deviceItems = NativeDeepwaterChartDeviceUi.DeviceItems.Count;
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_DEVICE_HEARTBEAT_READ_FAILED" +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            AllflameLog.Info(
+                "CHART_DEVICE_TRANSITION_HEARTBEAT" +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|Phase=" + AllflameContext.Phase +
+                "|UiOpen=" + (nativeUiOpen || stableUiOpen) +
+                "|NativeUiOpen=" + nativeUiOpen +
+                "|StableUiOpen=" + stableUiOpen +
+                "|DeviceItems=" + deviceItems +
+                "|InventoryCharts=" +
+                AllflameContext.InventoryChartCount +
+                "|DescendIssued=" + _descendIssued +
+                "|DescendConfirmed=" + _descendConfirmed +
+                "|DescendAttempts=" + _descendAttempts +
+                "|Recoveries=" + _transactionRecoveries +
+                "|ElapsedMs=" +
+                (int)transactionElapsed.TotalMilliseconds +
+                "|NextAction=" +
+                (_descendIssued
+                    ? "AwaitDescendConfirmation"
+                    : (_descendConfirmed
+                        ? "AcquireBathysphere"
+                        : "ResolveChartDevice")));
         }
 
         private void LogChartDeviceLoadConfirmed(
