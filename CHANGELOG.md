@@ -4,6 +4,14 @@ All notable changes to AllflameBot are documented in this file.
 
 ## Unreleased
 
+## 0.23.155 - 2026-08-06
+
+- Close an already-open Voyage Planner with a foreground Escape action and
+  verify the planner is hidden before returning control to Chart runner.
+- Allow an already-open Voyage Planner to place the required nine Charts
+  from a fresh board snapshot even when the configured stock threshold is
+  higher, and verify bounded planner-close recovery before resuming Chart
+  Areas.
 - Add an AI-native repository operating system with root and module context,
   architecture boundaries, business knowledge, rules, workflows, prompts,
   ADRs and release/test checklists.

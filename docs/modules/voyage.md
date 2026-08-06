@@ -18,6 +18,7 @@ Voyage tasks, `VoyagePlanningUi`, `VoyageRunState` and voyage planners are in
 
 - Voyage planning UI and chart placement verification.
 - Native Voyage Planner shadow reads and opt-in action canary.
+- Planner-open target override and bounded Escape close verification.
 - Voyage spawn, capsule anchors, lantern coverage and sector progress.
 - Bathysphere call/wait/extraction handoff.
 - Surface transfer and return-to-hub state.

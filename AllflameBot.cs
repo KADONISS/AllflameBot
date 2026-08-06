@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.154";
+        public const string Current = "0.23.155";
     }
 
     public sealed class AllflameBot : IBot
@@ -10141,9 +10141,13 @@ namespace AllflameBot
         private bool _nativeBeginPending;
         private bool _nativeBeginFallbackUsed;
         private DateTime _nativeBeginIssuedUtc = DateTime.MinValue;
+        private bool _plannerOpenTargetOverrideActive;
 
         private static readonly TimeSpan NativePlannerConfirmationTimeout =
             TimeSpan.FromSeconds(4);
+        private const int MaximumVoyagePlannerCloseAttempts = 3;
+        private static readonly TimeSpan VoyagePlannerCloseVerificationDelay =
+            TimeSpan.FromMilliseconds(180);
 
         public PrepareVoyageTask()
             : base(
@@ -10165,6 +10169,7 @@ namespace AllflameBot
             _lastInsufficientChartCount = -1;
             _stableInsufficientChartSnapshots = 0;
             _nativePlannerShadowMatches = 0;
+            _plannerOpenTargetOverrideActive = false;
             ResetNativePlannerActionState();
         }
 
@@ -10183,6 +10188,7 @@ namespace AllflameBot
             _lastInsufficientChartCount = -1;
             _stableInsufficientChartSnapshots = 0;
             _nativePlannerShadowMatches = 0;
+            _plannerOpenTargetOverrideActive = false;
             ResetNativePlannerActionState();
         }
 
@@ -10197,6 +10203,7 @@ namespace AllflameBot
                     ResetStablePlacement();
                     _stage = 0;
                     _planningReadyAtOpen = false;
+                    _plannerOpenTargetOverrideActive = false;
                     _retryAfterUtc =
                         DateTime.UtcNow.AddMilliseconds(500);
                     AllflameProgressWatchdog.MarkProgress(
@@ -10257,6 +10264,7 @@ namespace AllflameBot
                 _chartDetectionAttempts = 0;
                 _lastInsufficientChartCount = -1;
                 _stableInsufficientChartSnapshots = 0;
+                _plannerOpenTargetOverrideActive = false;
                 ResetNativePlannerActionState();
                 return false;
             }
@@ -10333,35 +10341,6 @@ namespace AllflameBot
                 return true;
             }
 
-            // After the first visual snapshot, do not reopen Valerie on every
-            // Chart return. The session estimate is incremented when a Chart
-            // Area completes. Reopen only when that estimate reaches the
-            // configured requirement so the real UI can be reconciled.
-            if (AllflameRunState.VoyagePlanChecked &&
-                !AllflameRunState.VoyageReadyForPlanning &&
-                !AllflameRunState.VoyageReconcileRequired)
-            {
-                _planningReadyAtOpen = false;
-                _chartDetectionAttempts = 0;
-                _lastInsufficientChartCount = -1;
-                _stableInsufficientChartSnapshots = 0;
-                AllflameLog.Throttled(
-                    "voyage_progress_wait",
-                    TimeSpan.FromSeconds(5),
-                    "VOYAGE_PROGRESS_WAIT" +
-                    "|AvailableEstimate=" +
-                    AllflameRunState.VoyageAvailableCharts +
-                    "|Required=" +
-                    AllflameRunState.VoyageRequiredCharts +
-                    "|Remaining=" +
-                    Math.Max(
-                        0,
-                        AllflameRunState.VoyageRequiredCharts -
-                        AllflameRunState.VoyageAvailableCharts) +
-                    "|Action=RunChartAreas");
-                return false;
-            }
-
             if (DateTime.UtcNow < _retryAfterUtc)
             {
                 return true;
@@ -10386,6 +10365,53 @@ namespace AllflameBot
                 nativeVoyageOpen ||
                 (visualScanArmed &&
                  VoyagePlanningUi.IsOpen());
+
+            AllflameLog.Throttled(
+                "voyage_config",
+                TimeSpan.FromSeconds(5),
+                "VOYAGE_CONFIG" +
+                "|ChartsRequired=" + settings.ChartsRequiredForVoyage +
+                "|EffectiveStockRequired=" +
+                AllflameRunState.VoyageRequiredCharts +
+                "|AutoPlan=" + settings.AutoPlanVoyage +
+                "|StartWhenReady=" + settings.StartVoyageWhenReady +
+                "|PlannerOpen=" + voyageOpen +
+                "|NativeRead=" + settings.UseNativeVoyagePlannerRead +
+                "|NativeActions=" +
+                settings.UseNativeVoyagePlannerActions +
+                "|ChainActive=" + AllflameRunState.VoyageChainActive +
+                "|AvailableEstimate=" +
+                AllflameRunState.VoyageAvailableCharts);
+
+            // The session estimate is only a gate for opening the planner. If
+            // the planner is already open, let its fresh inventory snapshot
+            // decide whether a legal nine-Chart board can be built.
+            if (!voyageOpen &&
+                AllflameRunState.VoyagePlanChecked &&
+                !AllflameRunState.VoyageReadyForPlanning &&
+                !AllflameRunState.VoyageReconcileRequired)
+            {
+                _planningReadyAtOpen = false;
+                _plannerOpenTargetOverrideActive = false;
+                _chartDetectionAttempts = 0;
+                _lastInsufficientChartCount = -1;
+                _stableInsufficientChartSnapshots = 0;
+                AllflameLog.Throttled(
+                    "voyage_progress_wait",
+                    TimeSpan.FromSeconds(5),
+                    "VOYAGE_PROGRESS_WAIT" +
+                    "|AvailableEstimate=" +
+                    AllflameRunState.VoyageAvailableCharts +
+                    "|Required=" +
+                    AllflameRunState.VoyageRequiredCharts +
+                    "|Remaining=" +
+                    Math.Max(
+                        0,
+                        AllflameRunState.VoyageRequiredCharts -
+                        AllflameRunState.VoyageAvailableCharts) +
+                    "|Action=RunChartAreas");
+                return false;
+            }
 
             if (voyageOpen)
             {
@@ -10872,6 +10898,23 @@ namespace AllflameBot
             bool reconciliation =
                 AllflameRunState.VoyageReconcileRequired;
 
+            if (!_plannerOpenTargetOverrideActive &&
+                availableCount >= 9)
+            {
+                _plannerOpenTargetOverrideActive = true;
+                AllflameLog.Info(
+                    "VOYAGE_PLANNER_TARGET_OVERRIDE" +
+                    "|PlannerOpen=True" +
+                    "|Available=" + availableCount +
+                    "|Board=Unknown" +
+                    "|Total=" + availableCount +
+                    "|ConfiguredRequired=" + configuredTarget +
+                    "|EffectiveTarget=9" +
+                    "|Reason=PlannerAlreadyOpen" +
+                    "|Action=PlaceNineCharts" +
+                    "|Detection=VisualFallback");
+            }
+
             AllflameLog.Info(
                 "VOYAGE_CHART_COUNT|Available=" + availableCount +
                 "|ConfiguredRequired=" + configuredTarget +
@@ -10917,22 +10960,37 @@ namespace AllflameBot
                 AllflameRunState.MarkVoyagePlanChecked(0);
                 _stage = 0;
                 _planningReadyAtOpen = false;
+                _plannerOpenTargetOverrideActive = false;
                 _chartDetectionAttempts = 0;
-                await Coroutines.CloseBlockingWindows();
+                bool plannerClosed =
+                    await CloseVoyagePlannerBounded(
+                        "EmptyVisualSnapshot");
                 AllflameLog.Info(
                     "VOYAGE_PLAN_EMPTY" +
                     "|Available=0" +
                     "|ConfirmedSnapshots=2" +
                     "|PreviousEstimate=" + previousEstimate +
-                    "|Action=ClosePlanAndContinueChartAreas");
-                return false;
+                    "|Closed=" + plannerClosed +
+                    "|Action=" +
+                    (plannerClosed
+                        ? "ContinueChartAreas"
+                        : "RetryPlannerClose"));
+                if (!plannerClosed)
+                {
+                    _stage = 1;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(500);
+                }
+                return !plannerClosed;
             }
 
             bool progressAllowsPlanning =
-                reconciliation
+                (_plannerOpenTargetOverrideActive &&
+                 availableCount >= 9) ||
+                (reconciliation
                     ? availableCount >= effectiveTarget
                     : (_planningReadyAtOpen ||
-                       availableCount >= effectiveTarget);
+                       availableCount >= effectiveTarget));
             if (!progressAllowsPlanning)
             {
                 if (reconciliation &&
@@ -10955,15 +11013,28 @@ namespace AllflameBot
                     availableCount);
                 _stage = 0;
                 _planningReadyAtOpen = false;
-                await Coroutines.CloseBlockingWindows();
+                _plannerOpenTargetOverrideActive = false;
+                bool plannerClosed =
+                    await CloseVoyagePlannerBounded(
+                        "InsufficientVisualCharts");
                 AllflameLog.Info(
                     "VOYAGE_NOT_READY|Available=" +
                     availableCount +
                     "|Required=" + effectiveTarget +
                     "|DetectedChartLocations=" +
                     chartLocations.Count +
-                    "|Action=ContinueChartAreas");
-                return false;
+                    "|Closed=" + plannerClosed +
+                    "|Action=" +
+                    (plannerClosed
+                        ? "ContinueChartAreas"
+                        : "RetryPlannerClose"));
+                if (!plannerClosed)
+                {
+                    _stage = 1;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(500);
+                }
+                return !plannerClosed;
             }
 
             if (reconciliation)
@@ -11018,10 +11089,13 @@ namespace AllflameBot
                         confirmedShortfallCount);
                     _stage = 0;
                     _planningReadyAtOpen = false;
+                    _plannerOpenTargetOverrideActive = false;
                     _chartDetectionAttempts = 0;
                     _lastInsufficientChartCount = -1;
                     _stableInsufficientChartSnapshots = 0;
-                    await Coroutines.CloseBlockingWindows();
+                    bool plannerClosed =
+                        await CloseVoyagePlannerBounded(
+                            "VisualChartShortfall");
                     _retryAfterUtc =
                         DateTime.UtcNow.AddMilliseconds(500);
                     AllflameLog.Info(
@@ -11031,20 +11105,33 @@ namespace AllflameBot
                         "|ActualAvailable=" +
                         confirmedShortfallCount +
                         "|Required=9" +
-                        "|Action=CorrectEstimateClosePlanAndRunCharts");
-                    return false;
+                        "|Closed=" + plannerClosed +
+                        "|Action=" +
+                        (plannerClosed
+                            ? "CorrectEstimateAndRunCharts"
+                            : "RetryPlannerClose"));
+                    if (!plannerClosed)
+                    {
+                        _stage = 1;
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(500);
+                    }
+                    return !plannerClosed;
                 }
                 if (_chartDetectionAttempts >= 8)
                 {
                     _stage = 0;
                     _chartDetectionAttempts = 0;
-                    await Coroutines.CloseBlockingWindows();
+                    bool plannerClosed =
+                        await CloseVoyagePlannerBounded(
+                            "VisualChartRenderRetry");
                     _retryAfterUtc =
                         DateTime.UtcNow.AddSeconds(1);
                     AllflameLog.Info(
                         "VOYAGE_PLAN_RETRY" +
                         "|Reason=FewerThanNineClickableCharts" +
-                        "|ProgressPreserved=True");
+                        "|ProgressPreserved=True" +
+                        "|Closed=" + plannerClosed);
                 }
                 return true;
             }
@@ -11149,6 +11236,25 @@ namespace AllflameBot
                 ? 9
                 : Math.Max(9, configuredTarget);
 
+            if (!_plannerOpenTargetOverrideActive &&
+                totalCharts >= 9)
+            {
+                _plannerOpenTargetOverrideActive = true;
+                AllflameLog.Info(
+                    "VOYAGE_PLANNER_TARGET_OVERRIDE" +
+                    "|PlannerOpen=True" +
+                    "|Available=" + available +
+                    "|Board=" + board +
+                    "|Total=" + totalCharts +
+                    "|ConfiguredRequired=" + configuredTarget +
+                    "|EffectiveTarget=9" +
+                    "|Reason=PlannerAlreadyOpen" +
+                    "|Action=PlaceNineCharts");
+            }
+            bool plannerOpenOverrideReady =
+                _plannerOpenTargetOverrideActive &&
+                totalCharts >= 9;
+
             AllflameLog.Throttled(
                 "voyage_incremental_state",
                 TimeSpan.FromMilliseconds(500),
@@ -11159,6 +11265,9 @@ namespace AllflameBot
                 "|Available=" + available +
                 "|Board=" + board +
                 "|Confirmed=" + _stablePlacementConfirmed + "/9" +
+                "|ConfiguredRequired=" + configuredTarget +
+                "|TargetOverride=" +
+                _plannerOpenTargetOverrideActive +
                 "|OneActionPerCycle=True" +
                 "|Snapshot=FreshStableElements");
 
@@ -11176,22 +11285,36 @@ namespace AllflameBot
                     AllflameRunState.MarkVoyagePlanChecked(0);
                     _stage = 0;
                     _planningReadyAtOpen = false;
+                    _plannerOpenTargetOverrideActive = false;
                     _chartDetectionAttempts = 0;
-                    await Coroutines.CloseBlockingWindows();
+                    bool plannerClosed =
+                        await CloseVoyagePlannerBounded(
+                            "EmptyStableSnapshot");
                     AllflameLog.Info(
                         "VOYAGE_PLAN_EMPTY|Available=0" +
                         "|Detection=StableVoyageSlots" +
                         "|ConfirmedSnapshots=2" +
-                        "|Action=ClosePlanAndContinueChartAreas");
-                    return false;
+                        "|Closed=" + plannerClosed +
+                        "|Action=" +
+                        (plannerClosed
+                            ? "ContinueChartAreas"
+                            : "RetryPlannerClose"));
+                    if (!plannerClosed)
+                    {
+                        _stage = 1;
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(500);
+                    }
+                    return !plannerClosed;
                 }
 
                 bool reconciliation =
                     AllflameRunState.VoyageReconcileRequired;
-                bool ready = reconciliation
-                    ? totalCharts >= effectiveTarget
-                    : (_planningReadyAtOpen ||
-                       totalCharts >= effectiveTarget);
+                bool ready = plannerOpenOverrideReady ||
+                    (reconciliation
+                        ? totalCharts >= effectiveTarget
+                        : (_planningReadyAtOpen ||
+                           totalCharts >= effectiveTarget));
                 if (!ready)
                 {
                     if (_lastInsufficientChartCount == totalCharts)
@@ -11212,16 +11335,30 @@ namespace AllflameBot
                     AllflameRunState.MarkVoyagePlanChecked(totalCharts);
                     _stage = 0;
                     _planningReadyAtOpen = false;
-                    await Coroutines.CloseBlockingWindows();
+                    _plannerOpenTargetOverrideActive = false;
+                    bool plannerClosed =
+                        await CloseVoyagePlannerBounded(
+                            "InsufficientStableCharts");
                     AllflameLog.Info(
                         "VOYAGE_NOT_READY|Available=" + totalCharts +
                         "|Required=" + effectiveTarget +
                         "|Detection=StableVoyageSlots" +
-                        "|Action=ContinueChartAreas");
-                    return false;
+                        "|Closed=" + plannerClosed +
+                        "|Action=" +
+                        (plannerClosed
+                            ? "ContinueChartAreas"
+                            : "RetryPlannerClose"));
+                    if (!plannerClosed)
+                    {
+                        _stage = 1;
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(500);
+                    }
+                    return !plannerClosed;
                 }
 
-                if (reconciliation)
+                if (reconciliation ||
+                    _plannerOpenTargetOverrideActive)
                 {
                     AllflameRunState.MarkVoyagePlanChecked(totalCharts);
                 }
@@ -11238,6 +11375,9 @@ namespace AllflameBot
                     "|Available=" + available +
                     "|Board=" + board +
                     "|Target=9" +
+                    "|ConfiguredRequired=" + configuredTarget +
+                    "|TargetOverride=" +
+                    _plannerOpenTargetOverrideActive +
                     "|Mode=OneActionPerCycle");
             }
 
@@ -11348,6 +11488,7 @@ namespace AllflameBot
                     ResetStablePlacement();
                     _stage = 0;
                     _planningReadyAtOpen = false;
+                    _plannerOpenTargetOverrideActive = false;
                     _retryAfterUtc =
                         DateTime.UtcNow.AddMilliseconds(500);
                 }
@@ -11460,6 +11601,164 @@ namespace AllflameBot
             _stablePlacementIssuedUtc = DateTime.MinValue;
         }
 
+        private bool IsVoyagePlannerOpenFresh(out string source)
+        {
+            source = "None";
+            try
+            {
+                DeepwaterVoyageSnapshot nativeSnapshot;
+                if (NativeDeepwaterVoyageUi.TryCapture(
+                        out nativeSnapshot))
+                {
+                    source = "Native";
+                    if (nativeSnapshot != null &&
+                        nativeSnapshot.IsOpened)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                source = "NativeException";
+            }
+
+            try
+            {
+                VoyagePlanningUi.StableVoyageSnapshot stableSnapshot;
+                if (VoyagePlanningUi.TryResolveStable(
+                        out stableSnapshot))
+                {
+                    source = "StableElement";
+                    return true;
+                }
+            }
+            catch
+            {
+                source = "StableElementException";
+            }
+
+            // The title is a weaker fallback than a complete stable tree, but
+            // it prevents us from declaring the planner closed during a brief
+            // Element refresh gap and releasing Chart Storage too early.
+            try
+            {
+                AllflameContext.Refresh(true);
+                if (AllflameContext.PlanVoyageVisible)
+                {
+                    source = "ContextTitle";
+                    return true;
+                }
+            }
+            catch
+            {
+                source = "ContextException";
+            }
+
+            return false;
+        }
+
+        private async Task<bool> CloseVoyagePlannerBounded(
+            string reason)
+        {
+            string initialSource;
+            bool initiallyOpen =
+                IsVoyagePlannerOpenFresh(out initialSource);
+            if (!initiallyOpen)
+            {
+                AllflameLog.Info(
+                    "VOYAGE_PLANNER_CLOSE" +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Attempt=0/" + MaximumVoyagePlannerCloseAttempts +
+                    "|Mode=None" +
+                    "|InputSent=False" +
+                    "|Postcondition=True" +
+                    "|Source=" + initialSource);
+                _plannerOpenTargetOverrideActive = false;
+                return true;
+            }
+
+            for (int attempt = 1;
+                 attempt <= MaximumVoyagePlannerCloseAttempts;
+                 attempt++)
+            {
+                bool inputSent = false;
+                bool focusSent = false;
+                string inputReason = "Escape";
+                try
+                {
+                    if (LokiPoe.ClientWindowHandle != IntPtr.Zero)
+                    {
+                        DreamPoeBot.Loki.Game.Interop
+                            .SetForegroundWindow(
+                                LokiPoe.ClientWindowHandle);
+                        focusSent = true;
+                        await LokiCoroutine.Sleep(80);
+                        LokiPoe.Input.SimulateKeyEvent(
+                            System.Windows.Forms.Keys.Escape,
+                            true,
+                            false,
+                            true);
+                        inputSent = true;
+                    }
+                    else
+                    {
+                        inputReason = "EscapeClientUnavailable";
+                    }
+                }
+                catch (Exception exception)
+                {
+                    inputReason = "Escape" +
+                        exception.GetType().Name;
+                    AllflameLog.Info(
+                        "VOYAGE_PLANNER_CLOSE_INPUT_FAILED" +
+                        "|Reason=" + (reason ?? String.Empty) +
+                        "|Attempt=" + attempt + "/" +
+                        MaximumVoyagePlannerCloseAttempts +
+                        "|Exception=" + exception.GetType().Name +
+                        "|Message=" +
+                        (exception.Message ?? String.Empty)
+                            .Replace("|", "/"));
+                }
+
+                await LokiCoroutine.Sleep(
+                    (int)VoyagePlannerCloseVerificationDelay.TotalMilliseconds);
+                string verificationSource;
+                bool stillOpen =
+                    IsVoyagePlannerOpenFresh(out verificationSource);
+                bool closed = !stillOpen;
+                AllflameLog.Info(
+                    "VOYAGE_PLANNER_CLOSE" +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Attempt=" + attempt + "/" +
+                    MaximumVoyagePlannerCloseAttempts +
+                    "|Mode=" + inputReason +
+                    "|FocusSent=" + focusSent +
+                    "|InputSent=" + inputSent +
+                    "|Postcondition=" + closed +
+                    "|Source=" + verificationSource);
+                if (closed)
+                {
+                    _plannerOpenTargetOverrideActive = false;
+                    AllflameProgressWatchdog.MarkProgress(
+                        "VoyagePlannerClosed");
+                    return true;
+                }
+
+                if (attempt < MaximumVoyagePlannerCloseAttempts)
+                {
+                    await LokiCoroutine.Sleep(120);
+                }
+            }
+
+            AllflameLog.Info(
+                "VOYAGE_PLANNER_CLOSE_FAILED" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|Attempts=" + MaximumVoyagePlannerCloseAttempts +
+                "|Action=HoldVoyageTaskAndRetry");
+            return false;
+        }
+
         private void ResetNativePlannerActionState()
         {
             _nativeClearPending = false;
@@ -11568,6 +11867,7 @@ namespace AllflameBot
                     ResetStablePlacement();
                     _stage = 0;
                     _planningReadyAtOpen = false;
+                    _plannerOpenTargetOverrideActive = false;
                 }
                 else
                 {

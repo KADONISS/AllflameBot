@@ -49,7 +49,7 @@ namespace AllflameBot
         public string Name => "Allflame Mover";
         public string Description => "Pathfinding mover for Allflame Chart Areas.";
         public string Author => "Codex";
-        public string Version => "0.23.154";
+        public string Version => "0.23.155";
         public UserControl Control => null;
         public JsonSettings Settings => AllflameSettings.Instance;
         public PathfindingCommand CurrentCommand => _currentCommand;
