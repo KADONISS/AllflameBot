@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.152";
+        public const string Current = "0.23.153";
     }
 
     public sealed class AllflameBot : IBot
@@ -753,6 +753,8 @@ namespace AllflameBot
         public static int ChartStorageItemCount { get; private set; }
         public static int ChartStorageStackCount { get; private set; }
         public static string ChartStorageSummary { get; private set; }
+        public static bool VoyageSnapshotAvailable { get; private set; }
+        public static DeepwaterVoyageSnapshot VoyageSnapshot { get; private set; }
         public static NetworkObject ChartStorageObject { get; private set; }
         public static NetworkObject StashObject { get; private set; }
         public static NetworkObject ValerieObject { get; private set; }
@@ -822,6 +824,8 @@ namespace AllflameBot
                 ChartStorageItemCount = 0;
                 ChartStorageStackCount = 0;
                 ChartStorageSummary = String.Empty;
+                VoyageSnapshotAvailable = false;
+                VoyageSnapshot = null;
             }
         }
 
@@ -899,6 +903,15 @@ namespace AllflameBot
                         force || now >= _nextUiRefreshUtc;
                     bool chartStorageScan =
                         force || now >= _nextChartStorageStatsRefreshUtc;
+                    bool deepwaterHub = String.Equals(
+                        AreaId,
+                        "DeepwaterHub",
+                        StringComparison.OrdinalIgnoreCase);
+                    if (!deepwaterHub)
+                    {
+                        VoyageSnapshotAvailable = false;
+                        VoyageSnapshot = null;
+                    }
                     if (objectScan)
                     {
                         Stopwatch stageTimer = Stopwatch.StartNew();
@@ -931,6 +944,13 @@ namespace AllflameBot
                     {
                         Stopwatch stageTimer = Stopwatch.StartNew();
                         _cachedVisibleUiText = CaptureVisibleUiText();
+                        DeepwaterVoyageSnapshot voyageSnapshot = null;
+                        VoyageSnapshotAvailable = deepwaterHub &&
+                            NativeDeepwaterVoyageUi.TryCapture(
+                                out voyageSnapshot);
+                        VoyageSnapshot = VoyageSnapshotAvailable
+                            ? voyageSnapshot
+                            : null;
                         stageTimer.Stop();
                         uiScanMilliseconds = stageTimer.ElapsedMilliseconds;
                         _nextUiRefreshUtc = DateTime.UtcNow.AddMilliseconds(
@@ -942,9 +962,12 @@ namespace AllflameBot
                     // window title contains "Plan your Voyage"; using the
                     // shorter text incorrectly classified Valerie's dialogue
                     // as an already opened Voyage window.
-                    PlanVoyageVisible = ContainsUiText(
-                        visibleUiText,
-                        "Plan your Voyage");
+                    PlanVoyageVisible = VoyageSnapshotAvailable
+                        ? VoyageSnapshot != null &&
+                          VoyageSnapshot.IsOpened
+                        : ContainsUiText(
+                            visibleUiText,
+                            "Plan your Voyage");
                     ChartAreaOptionVisible = ContainsUiText(visibleUiText, "Chart Area");
                     CallBathysphereVisible = ContainsUiText(visibleUiText, "Call Bathysphere");
                     SendToSurfaceVisible = ContainsUiText(visibleUiText, "Send to Surface");
@@ -1707,6 +1730,8 @@ namespace AllflameBot
             TargetableMonsters = 0;
             IsPotentiallyStuck = false;
             ChartStorageObject = null;
+            VoyageSnapshotAvailable = false;
+            VoyageSnapshot = null;
             StashObject = null;
             ValerieObject = null;
             BathysphereObject = null;
@@ -10091,9 +10116,15 @@ namespace AllflameBot
                 _voyageUiExpectedUntilUtc != DateTime.MinValue ||
                 _valerieEffectDeadlineUtc != DateTime.MinValue ||
                 AllflameContext.PlanVoyageVisible;
+            DeepwaterVoyageSnapshot nativeVoyageSnapshot;
+            bool nativeVoyageOpen =
+                NativeDeepwaterVoyageUi.TryCapture(
+                    out nativeVoyageSnapshot) &&
+                nativeVoyageSnapshot.IsOpened;
             bool voyageOpen =
-                visualScanArmed &&
-                VoyagePlanningUi.IsOpen();
+                nativeVoyageOpen ||
+                (visualScanArmed &&
+                 VoyagePlanningUi.IsOpen());
             if (voyageOpen)
             {
                 ResetValerieApproachRecovery(0, "VoyageUiOpened");
@@ -11490,6 +11521,13 @@ namespace AllflameBot
 
         public static bool IsOpen()
         {
+            DeepwaterVoyageSnapshot nativeSnapshot;
+            if (NativeDeepwaterVoyageUi.TryCapture(
+                    out nativeSnapshot) &&
+                nativeSnapshot.IsOpened)
+            {
+                return true;
+            }
             StableVoyageSnapshot stable;
             if (TryResolveStable(out stable))
             {
@@ -15234,6 +15272,11 @@ namespace AllflameBot
                 return false;
             }
 
+            if (DeferForVoyagePlanner())
+            {
+                return true;
+            }
+
             if (settings.RunInventoryChartsOnly)
             {
                 ResetScan();
@@ -15320,10 +15363,10 @@ namespace AllflameBot
                     return await ContinueStorageOpenInteraction();
                 }
 
-                // Only resolve the UI after the cached observation proves that
-                // Chart Storage is visible. Resolving the full Element tree
-                // on the ordinary boat scene can block the task cycle.
-                if (IsChartStorageUiVisibleInSnapshot())
+                // The fresh root check is intentionally cheap; the page-layer
+                // resolver below is the first point that creates a storage
+                // control or slot.
+                if (ChartStorageUi.IsFreshlyVisible())
                 {
                     _openAttempts = Math.Max(1, _openAttempts);
                     _stage = 1;
@@ -15333,7 +15376,7 @@ namespace AllflameBot
                     AllflameLog.Info(
                         "CHART_STORAGE_STAGE" +
                         "|Stage=Resolve" +
-                        "|Reason=ExistingUiSnapshot" +
+                        "|Reason=FreshStorageRoot" +
                         "|Postcondition=PageLayerResolved");
                     return true;
                 }
@@ -15423,7 +15466,7 @@ namespace AllflameBot
                     return true;
                 }
 
-                if (!IsChartStorageUiVisibleInSnapshot())
+                if (!ChartStorageUi.IsFreshlyVisible())
                 {
                     AllflameLog.Throttled(
                         "chart_storage_confirm_wait",
@@ -15484,7 +15527,7 @@ namespace AllflameBot
 
             if (_stage == 2)
             {
-                if (!IsChartStorageUiVisibleInSnapshot())
+                if (!ChartStorageUi.IsFreshlyVisible())
                 {
                     return await RecoverStorageUi(
                         "StorageUiLostDuringScan");
@@ -15495,7 +15538,7 @@ namespace AllflameBot
 
             if (_stage == 3)
             {
-                if (!IsChartStorageUiVisibleInSnapshot())
+                if (!ChartStorageUi.IsFreshlyVisible())
                 {
                     return await RecoverStorageUi(
                         "StorageUiLostDuringWithdraw");
@@ -15505,6 +15548,51 @@ namespace AllflameBot
             }
 
             return true;
+        }
+
+        private bool DeferForVoyagePlanner()
+        {
+            DeepwaterVoyageSnapshot nativeSnapshot;
+            if (NativeDeepwaterVoyageUi.TryCapture(
+                    out nativeSnapshot))
+            {
+                if (!nativeSnapshot.IsOpened)
+                {
+                    return false;
+                }
+
+                ResetScan();
+                AllflameLog.Throttled(
+                    "chart_storage_deferred_voyage_native",
+                    TimeSpan.FromSeconds(2),
+                    "CHART_STORAGE_DEFERRED" +
+                    "|Reason=VoyagePlannerOpen" +
+                    "|Detection=DeepwaterVoyageSnapshot" +
+                    "|Available=" +
+                    nativeSnapshot.AvailableChartCount +
+                    "|Board=" + nativeSnapshot.BoardChartCount +
+                    "|BoardSlots=" + nativeSnapshot.BoardSlotCount +
+                    "|BeginEnabled=" +
+                    nativeSnapshot.BeginVoyageEnabled);
+                return true;
+            }
+
+            VoyagePlanningUi.StableVoyageSnapshot stableSnapshot;
+            if (VoyagePlanningUi.TryResolveStable(
+                    out stableSnapshot))
+            {
+                ResetScan();
+                AllflameLog.Throttled(
+                    "chart_storage_deferred_voyage_stable",
+                    TimeSpan.FromSeconds(2),
+                    "CHART_STORAGE_DEFERRED" +
+                    "|Reason=VoyagePlannerOpen" +
+                    "|Detection=StableElement" +
+                    "|RootIndex=" + stableSnapshot.RootIndex);
+                return true;
+            }
+
+            return false;
         }
 
         private async Task<bool> ContinueStorageOpenInteraction()
@@ -16286,15 +16374,6 @@ namespace AllflameBot
             }
 
             return false;
-        }
-
-        private static bool IsChartStorageUiVisibleInSnapshot()
-        {
-            string summary = AllflameContext.ChartStorageSummary ??
-                String.Empty;
-            return summary.IndexOf(
-                "Chart Storage",
-                StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private bool TryResolveStorageUi(int mainTab, int subTab)
@@ -18626,6 +18705,12 @@ namespace AllflameBot
             }
         }
 
+        public static bool IsFreshlyVisible()
+        {
+            Element storageRoot;
+            return TryFindStorageRoot(out storageRoot);
+        }
+
         public static bool TryResolve(
             InventoryControlWrapper cachedControl,
             InventorySlotUiElement cachedSlot,
@@ -18652,16 +18737,9 @@ namespace AllflameBot
             control = null;
             slot = null;
 
-            if (mainTab < 0 &&
-                subTab < 0 &&
-                cachedControl != null &&
-                IsUsable(cachedSlot))
-            {
-                control = cachedControl;
-                slot = cachedSlot;
-                return true;
-            }
-
+            // Cached controls can belong to a previous window instance. They
+            // are retained only as call-site state; every resolution must
+            // confirm the current root and active page layer first.
             Element storageRoot;
             if (!TryFindStorageRoot(out storageRoot))
             {
@@ -19046,7 +19124,15 @@ namespace AllflameBot
         private static bool TryFindStorageRoot(out Element storageRoot)
         {
             storageRoot = null;
-            List<Element> roots = LokiPoe.GetGuiElements();
+            List<Element> roots;
+            try
+            {
+                roots = LokiPoe.GetGuiElements();
+            }
+            catch
+            {
+                return false;
+            }
             if (roots == null)
             {
                 return false;
@@ -19517,6 +19603,145 @@ namespace AllflameBot
                 inventory.Columns == 60;
         }
 
+    }
+
+    internal sealed class DeepwaterVoyageSnapshot
+    {
+        public bool IsOpened { get; }
+        public int AvailableChartCount { get; }
+        public int BoardChartCount { get; }
+        public int BoardSlotCount { get; }
+        public bool BeginVoyageEnabled { get; }
+        public string BoardSignature { get; }
+
+        public DeepwaterVoyageSnapshot(
+            bool isOpened,
+            int availableChartCount,
+            int boardChartCount,
+            int boardSlotCount,
+            bool beginVoyageEnabled,
+            string boardSignature)
+        {
+            IsOpened = isOpened;
+            AvailableChartCount = availableChartCount;
+            BoardChartCount = boardChartCount;
+            BoardSlotCount = boardSlotCount;
+            BeginVoyageEnabled = beginVoyageEnabled;
+            BoardSignature = boardSignature ?? String.Empty;
+        }
+    }
+
+    internal static class NativeDeepwaterVoyageUi
+    {
+        public static bool TryCapture(
+            out DeepwaterVoyageSnapshot snapshot)
+        {
+            snapshot = null;
+            try
+            {
+                bool isOpened =
+                    LokiPoe.InGameState.DeepwaterVoyageUi.IsOpened;
+                int availableCharts = 0;
+                int boardCharts = 0;
+                int boardSlots = 0;
+                bool beginEnabled = false;
+                string boardSignature = String.Empty;
+                var signature = new StringBuilder();
+
+                if (isOpened)
+                {
+                    var inventory =
+                        LokiPoe.InGameState.DeepwaterVoyageUi.ChartsInventory;
+                    if (inventory != null)
+                    {
+                        foreach (var control in inventory)
+                        {
+                            if (control == null)
+                            {
+                                continue;
+                            }
+                            try
+                            {
+                                var item = control.Item;
+                                if (item != null && item.IsValid)
+                                {
+                                    availableCharts++;
+                                }
+                            }
+                            catch
+                            {
+                                // Ignore a slot while DPB refreshes its item.
+                            }
+                        }
+                    }
+
+                    var map =
+                        LokiPoe.InGameState.DeepwaterVoyageUi.VoyageMap;
+                    if (map != null)
+                    {
+                        int rows = map.GetLength(0);
+                        int columns = map.GetLength(1);
+                        boardSlots = rows * columns;
+                        for (int row = 0; row < rows; row++)
+                        {
+                            for (int column = 0;
+                                 column < columns;
+                                 column++)
+                            {
+                                var square = map[row, column];
+                                int directions = square == null
+                                    ? 0
+                                    : Convert.ToInt32(square.Directions);
+                                if (directions != 0)
+                                {
+                                    boardCharts++;
+                                }
+                                if (signature.Length > 0)
+                                {
+                                    signature.Append(',');
+                                }
+                                signature.Append(directions);
+                            }
+                        }
+                    }
+
+                    beginEnabled =
+                        LokiPoe.InGameState.DeepwaterVoyageUi
+                            .IsBeginVoyageEnabled;
+                    boardSignature = signature.ToString();
+                }
+
+                snapshot = new DeepwaterVoyageSnapshot(
+                    isOpened,
+                    availableCharts,
+                    boardCharts,
+                    boardSlots,
+                    beginEnabled,
+                    boardSignature);
+                AllflameLog.Throttled(
+                    "voyage_dpb_snapshot",
+                    TimeSpan.FromSeconds(2),
+                    "VOYAGE_DPB_SNAPSHOT" +
+                    "|Available=" + availableCharts +
+                    "|Board=" + boardCharts +
+                    "|BoardSlots=" + boardSlots +
+                    "|BeginEnabled=" + beginEnabled +
+                    "|Opened=" + isOpened +
+                    "|BoardSignature=" + boardSignature);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Throttled(
+                    "voyage_dpb_snapshot_failed",
+                    TimeSpan.FromSeconds(5),
+                    "VOYAGE_DPB_SNAPSHOT_FAILED" +
+                    "|Exception=" + ex.GetType().Name +
+                    "|Message=" +
+                    (ex.Message ?? String.Empty).Replace("|", "/"));
+                return false;
+            }
+        }
     }
 
     internal static class NativeDeepwaterChartDeviceUi

@@ -13,6 +13,16 @@ All notable changes to AllflameBot are documented in this file.
 - Remove obsolete release-history sections from `README.md`; release history now
   remains centralized in this changelog.
 
+## 0.23.153 - 2026-08-06
+
+- Add a native `DeepwaterVoyageSnapshot` backed by DPB's Voyage Planner API for
+  planner visibility, available Charts, board occupancy and Begin state.
+- Defer Chart Storage while the Voyage Planner is open, using the native state
+  first and the stable Element root as a fallback.
+- Stop using the visible-text Chart Storage summary as UI proof; resolve only
+  from a fresh Chart Storage root and active page layer, ignoring stale cached
+  controls.
+
 ## 0.23.152 - 2026-08-06
 
 - Keep Chart Storage Element resolution out of the ordinary boat scene until a
