@@ -2,7 +2,6 @@
   "AssemblyName": "AllflameBot",
   "FileList": [
     "AllflameBot.cs",
-    "BackgroundUiInput.cs",
     "AllflameSettings.cs",
     "AllflamePrices.cs",
     "AllflameNotifications.cs",
