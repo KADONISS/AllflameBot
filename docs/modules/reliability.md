@@ -21,6 +21,8 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
 - Movement ownership and priority leases.
 - Recoverable runtime rebuild.
 - Bounded Chart Storage UI open/resolve recovery and Voyage Stash fallback.
+- Bounded Chart Device Descend confirmation recovery with Escape, UI close,
+  deferred fresh observation and Chart Runner handoff.
 - Recording stop reasons.
 
 ## Required checks

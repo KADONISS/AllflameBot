@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.155";
+        public const string Current = "0.23.156";
     }
 
     public sealed class AllflameBot : IBot
@@ -372,8 +372,17 @@ namespace AllflameBot
                     {
                         return;
                     }
-                    CleanupStaleRuntimeForRestart();
-                    Start();
+                    try
+                    {
+                        CleanupStaleRuntimeForRestart();
+                        Start();
+                    }
+                    catch (Exception recoveryException)
+                    {
+                        AllflameLog.Error(
+                            "BOT_COROUTINE_RECOVERY_FAILED",
+                            recoveryException);
+                    }
                 }
             }
         }
@@ -416,7 +425,10 @@ namespace AllflameBot
             {
                 AllflameLog.Info(
                     "BOT_COROUTINE_REBUILD_DISPOSE" +
-                    "|Type=" + ex.GetType().Name);
+                    "|Type=" + ex.GetType().Name +
+                    "|Action=ContinueCleanup" +
+                    "|Context=" +
+                    AllflameProgressWatchdog.Describe());
             }
             finally
             {
@@ -434,6 +446,17 @@ namespace AllflameBot
             {
                 AllflameLog.Info(
                     "BOT_TASK_MANAGER_REBUILD_STOP" +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            try
+            {
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BOT_REBUILD_INPUT_CLEANUP_FAILED" +
                     "|Type=" + ex.GetType().Name);
             }
         }
@@ -467,6 +490,11 @@ namespace AllflameBot
                 try
                 {
                     Stopwatch cycleTimer = Stopwatch.StartNew();
+                    AllflameLog.Throttled(
+                        "task_manager_run_begin",
+                        TimeSpan.FromSeconds(2),
+                        "TASK_MANAGER_RUN_BEGIN|" +
+                        AllflameProgressWatchdog.Describe());
                     await _taskManager.Run(
                         TaskGroup.Enabled,
                         RunBehavior.UntilHandled);
@@ -857,6 +885,18 @@ namespace AllflameBot
                 long inventoryScanMilliseconds = 0;
                 long uiScanMilliseconds = 0;
                 long chartStorageScanMilliseconds = 0;
+                bool traceRefresh =
+                    force || AllflameRunState.ChartRequested;
+                AllflameLog.Throttled(
+                    "context_refresh_begin",
+                    TimeSpan.FromSeconds(2),
+                    "CONTEXT_REFRESH_BEGIN" +
+                    "|Force=" + force +
+                    "|ManualSnapshot=" + manualSnapshot +
+                    "|Phase=" + Phase +
+                    "|AreaHash=" + AreaHash +
+                    "|ChartRequested=" +
+                    AllflameRunState.ChartRequested);
 
                 try
                 {
@@ -921,11 +961,28 @@ namespace AllflameBot
                     }
                     if (objectScan)
                     {
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_objects_begin",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=Objects|State=Begin");
+                        }
                         Stopwatch stageTimer = Stopwatch.StartNew();
                         SnapshotObjects();
                         stageTimer.Stop();
                         objectScanMilliseconds =
                             stageTimer.ElapsedMilliseconds;
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_objects_end",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=Objects|State=End" +
+                                "|ElapsedMs=" + objectScanMilliseconds);
+                        }
                         _nextObjectRefreshUtc = DateTime.UtcNow.AddMilliseconds(
                             Phase == AllflamePhase.ChartArea ||
                             Phase == AllflamePhase.Voyage
@@ -938,17 +995,42 @@ namespace AllflameBot
                     }
                     if (inventoryScan)
                     {
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_inventory_begin",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=Inventory|State=Begin");
+                        }
                         Stopwatch stageTimer = Stopwatch.StartNew();
                         SnapshotInventory();
                         stageTimer.Stop();
                         inventoryScanMilliseconds =
                             stageTimer.ElapsedMilliseconds;
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_inventory_end",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=Inventory|State=End" +
+                                "|ElapsedMs=" + inventoryScanMilliseconds);
+                        }
                         _nextInventoryRefreshUtc =
                             DateTime.UtcNow.AddMilliseconds(250);
                     }
                     TrackPosition(now);
                     if (uiScan)
                     {
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_ui_begin",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=VisibleUi|State=Begin");
+                        }
                         Stopwatch stageTimer = Stopwatch.StartNew();
                         _cachedVisibleUiText = CaptureVisibleUiText();
                         DeepwaterVoyageSnapshot voyageSnapshot = null;
@@ -960,6 +1042,15 @@ namespace AllflameBot
                             : null;
                         stageTimer.Stop();
                         uiScanMilliseconds = stageTimer.ElapsedMilliseconds;
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_ui_end",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=VisibleUi|State=End" +
+                                "|ElapsedMs=" + uiScanMilliseconds);
+                        }
                         _nextUiRefreshUtc = DateTime.UtcNow.AddMilliseconds(
                             UiRefreshIntervalMilliseconds());
                     }
@@ -1098,11 +1189,29 @@ namespace AllflameBot
 
                     if (chartStorageScan)
                     {
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_storage_begin",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=ChartStorage|State=Begin");
+                        }
                         Stopwatch chartStorageTimer = Stopwatch.StartNew();
                         SnapshotChartStorageStats(visibleUiText);
                         chartStorageTimer.Stop();
                         chartStorageScanMilliseconds =
                             chartStorageTimer.ElapsedMilliseconds;
+                        if (traceRefresh)
+                        {
+                            AllflameLog.Throttled(
+                                "context_refresh_storage_end",
+                                TimeSpan.FromSeconds(2),
+                                "CONTEXT_REFRESH_STAGE" +
+                                "|Stage=ChartStorage|State=End" +
+                                "|ElapsedMs=" +
+                                chartStorageScanMilliseconds);
+                        }
                         _nextChartStorageStatsRefreshUtc =
                             DateTime.UtcNow.AddMilliseconds(350);
                     }
@@ -4671,6 +4780,19 @@ namespace AllflameBot
         {
             ChartRequested = true;
             CustomChartDeviceExpected = customChartDeviceExpected;
+        }
+
+        public static void ReleaseChartDeviceRequest(string reason)
+        {
+            bool wasRequested = ChartRequested ||
+                CustomChartDeviceExpected;
+            ChartRequested = false;
+            CustomChartDeviceExpected = false;
+            AllflameLog.Info(
+                "CHART_DEVICE_REQUEST_RELEASED" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|WasRequested=" + wasRequested +
+                "|Action=ResumeChartRunner");
         }
 
         public static void SetExplorationPercent(float value)
@@ -20668,7 +20790,14 @@ namespace AllflameBot
             }
             try
             {
-                return LokiPoe.InGameState.DeepwaterChartUi.Descend();
+                AllflameLog.Info(
+                    "CHART_DEVICE_NATIVE_CALL_BEGIN|Operation=Descend");
+                bool result =
+                    LokiPoe.InGameState.DeepwaterChartUi.Descend();
+                AllflameLog.Info(
+                    "CHART_DEVICE_NATIVE_CALL_END" +
+                    "|Operation=Descend|Result=" + result);
+                return result;
             }
             catch (Exception ex)
             {
@@ -22134,6 +22263,7 @@ namespace AllflameBot
     internal sealed class EnterBathysphereTask : ObserverTask
     {
         private const int MaximumDescendAttempts = 3;
+        private const int MaximumDescendConfirmationRecoveries = 2;
         private const int MaximumEmptyDeviceRecoveries = 2;
         private static readonly TimeSpan CapacityFullConfirmation =
             TimeSpan.FromSeconds(3);
@@ -22142,7 +22272,7 @@ namespace AllflameBot
         private static readonly TimeSpan TransactionTimeout =
             TimeSpan.FromSeconds(30);
         private static readonly TimeSpan DescendConfirmationTimeout =
-            TimeSpan.FromSeconds(2);
+            TimeSpan.FromSeconds(3);
         private static readonly TimeSpan PortalAppearanceTimeout =
             TimeSpan.FromSeconds(6);
         private static readonly TimeSpan PortalEntryTimeout =
@@ -22157,6 +22287,7 @@ namespace AllflameBot
         private bool _descendConfirmed;
         private bool _loadConfirmationLogged;
         private DateTime _descendIssuedUtc = DateTime.MinValue;
+        private int _descendConfirmationRecoveries;
         private DateTime _portalConfirmedUtc = DateTime.MinValue;
         private DateTime _portalWaitUntilUtc = DateTime.MinValue;
         private DateTime _nextPortalInteractUtc = DateTime.MinValue;
@@ -22196,6 +22327,7 @@ namespace AllflameBot
             _descendConfirmed = false;
             _loadConfirmationLogged = false;
             _descendIssuedUtc = DateTime.MinValue;
+            _descendConfirmationRecoveries = 0;
             _portalConfirmedUtc = DateTime.MinValue;
             _portalWaitUntilUtc = DateTime.MinValue;
             _nextPortalInteractUtc = DateTime.MinValue;
@@ -22359,16 +22491,10 @@ namespace AllflameBot
                 }
                 else
                 {
-                    _descendIssued = false;
-                    _descendIssuedUtc = DateTime.MinValue;
-                    AllflameLog.Info(
-                        "CHART_DEVICE_DESCEND_RETRY" +
-                        "|Attempt=" + _descendAttempts +
-                        "|Reason=UiStillOpen" +
-                        "|NativeUiOpen=" + nativeUiOpen +
-                        "|StableUiOpen=" + stableUiOpen +
-                        "|ElapsedMs=" +
-                        (int)issuedFor.TotalMilliseconds);
+                    return await RecoverDescendConfirmation(
+                        issuedFor,
+                        nativeUiOpen,
+                        stableUiOpen);
                 }
             }
 
@@ -22845,12 +22971,36 @@ namespace AllflameBot
 
             _descendDisabledSinceUtc = DateTime.MinValue;
             _descendAttempts++;
-            bool clicked =
-                nativeDeepwaterUiOpened
+            AllflameLog.Info(
+                "CHART_DEVICE_DESCEND_CALL_BEGIN" +
+                "|Ui=" +
+                (nativeDeepwaterUiOpened
+                    ? "DeepwaterNative"
+                    : "DeepwaterFallback") +
+                "|Attempt=" + _descendAttempts +
+                "|LoadedChartId=" + _customChartLocalId);
+            bool clicked = false;
+            try
+            {
+                clicked = nativeDeepwaterUiOpened
                     ? NativeDeepwaterChartDeviceUi.Descend()
                     : DeepwaterChartDeviceUi.ClickDescend(
                         descendButton,
                         _descendAttempts);
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_DEVICE_DESCEND_CALL_FAILED" +
+                    "|Attempt=" + _descendAttempts +
+                    "|Type=" + ex.GetType().Name +
+                    "|Message=" +
+                    (ex.Message ?? String.Empty).Replace("|", "/"));
+            }
+            AllflameLog.Info(
+                "CHART_DEVICE_DESCEND_CALL_END" +
+                "|Attempt=" + _descendAttempts +
+                "|InputSent=" + clicked);
             if (clicked)
             {
                 _descendIssued = true;
@@ -22869,6 +23019,139 @@ namespace AllflameBot
                 "|DeviceItems=" + nativeDeviceItems.Count +
                 "|Attempt=" + _descendAttempts);
             return true;
+        }
+
+        private async Task<bool> RecoverDescendConfirmation(
+            TimeSpan issuedFor,
+            bool nativeUiOpen,
+            bool stableUiOpen)
+        {
+            _descendIssued = false;
+            _descendIssuedUtc = DateTime.MinValue;
+            _descendConfirmationRecoveries++;
+            AllflameProgressWatchdog.SetRetry(
+                _descendConfirmationRecoveries);
+
+            AllflameLog.Info(
+                "CHART_DEVICE_DESCEND_CONFIRM_TIMEOUT" +
+                "|Attempt=" + _descendAttempts +
+                "|Recovery=" + _descendConfirmationRecoveries +
+                "/" + MaximumDescendConfirmationRecoveries +
+                "|NativeUiOpen=" + nativeUiOpen +
+                "|StableUiOpen=" + stableUiOpen +
+                "|ElapsedMs=" + (int)issuedFor.TotalMilliseconds +
+                "|Action=EscapeCloseAndReacquire");
+
+            bool escapeSent =
+                SendEscapeForChartDeviceRecovery(
+                    "DescendConfirmationTimeout");
+            bool closeCompleted = false;
+            AllflameLog.Info(
+                "CHART_DEVICE_RECOVERY_CLOSE_UI_BEGIN" +
+                "|Reason=DescendConfirmationTimeout");
+            try
+            {
+                await Coroutines.CloseBlockingWindows();
+                closeCompleted = true;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_DEVICE_RECOVERY_CLOSE_UI_FAILED" +
+                    "|Reason=DescendConfirmationTimeout" +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            AllflameContext.RequestManualSnapshot();
+
+            if (_descendConfirmationRecoveries >=
+                MaximumDescendConfirmationRecoveries)
+            {
+                AllflameLog.Info(
+                    "CHART_DEVICE_DESCEND_RECOVERY_EXHAUSTED" +
+                    "|Attempts=" + _descendAttempts +
+                    "|Recoveries=" + _descendConfirmationRecoveries +
+                    "|EscapeSent=" + escapeSent +
+                    "|CloseCompleted=" + closeCompleted +
+                    "|Postcondition=DeferredFreshCycle" +
+                    "|Action=ReleaseChartRequest");
+                AllflameRunState.ReleaseChartDeviceRequest(
+                    "DescendConfirmationRecoveriesExhausted");
+                ResetTransactionState();
+                AllflameProgressWatchdog.Clear(Name);
+                return true;
+            }
+
+            _descendConfirmed = false;
+            _portalConfirmedUtc = DateTime.MinValue;
+            _portalWaitUntilUtc = DateTime.MinValue;
+            _nextPortalInteractUtc = DateTime.MinValue;
+            _nextActivateUtc = DateTime.UtcNow.AddSeconds(1);
+            AllflameProgressWatchdog.MarkProgress(
+                "DescendConfirmationRecovery");
+            AllflameLog.Info(
+                "CHART_DEVICE_DESCEND_RECOVERY_READY" +
+                "|Recovery=" + _descendConfirmationRecoveries +
+                "/" + MaximumDescendConfirmationRecoveries +
+                "|EscapeSent=" + escapeSent +
+                "|CloseCompleted=" + closeCompleted +
+                "|Postcondition=DeferredFreshCycle" +
+                "|Action=ReacquireChartDevice");
+            return true;
+        }
+
+        private static bool SendEscapeForChartDeviceRecovery(
+            string reason)
+        {
+            bool inputSent = false;
+            string mode = "Escape";
+            try
+            {
+                if (LokiPoe.ClientWindowHandle == IntPtr.Zero)
+                {
+                    mode = "EscapeClientUnavailable";
+                }
+                else
+                {
+                    DreamPoeBot.Loki.Game.Interop.SetForegroundWindow(
+                        LokiPoe.ClientWindowHandle);
+                    LokiPoe.Input.SimulateKeyEvent(
+                        System.Windows.Forms.Keys.Escape,
+                        true,
+                        false,
+                        true);
+                    inputSent = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                mode = "Escape" + ex.GetType().Name;
+                AllflameLog.Info(
+                    "CHART_DEVICE_RECOVERY_ESCAPE_FAILED" +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Type=" + ex.GetType().Name);
+            }
+            finally
+            {
+                try
+                {
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                }
+                catch (Exception ex)
+                {
+                    AllflameLog.Info(
+                        "CHART_DEVICE_RECOVERY_INPUT_CLEANUP_FAILED" +
+                        "|Reason=" + (reason ?? String.Empty) +
+                        "|Type=" + ex.GetType().Name);
+                }
+            }
+
+            AllflameLog.Info(
+                "CHART_DEVICE_RECOVERY_INPUT" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|Mode=" + mode +
+                "|InputSent=" + inputSent);
+            return inputSent;
         }
 
         private async Task RecoverChartDeviceTransaction(
@@ -22900,26 +23183,28 @@ namespace AllflameBot
                 "|LoadedChartId=" + _customChartLocalId +
                 "|InventoryCharts=" +
                 AllflameContext.InventoryChartCount +
-                "|Action=RefreshContext" +
+                "|Action=RequestContextRefresh" +
                 (closeBlockingUi ? "+CloseUi" : String.Empty));
 
-            try
-            {
-                AllflameContext.Refresh(true);
-            }
-            catch (Exception ex)
-            {
-                AllflameLog.Info(
-                    "CHART_DEVICE_RECOVERY_REFRESH_FAILED" +
-                    "|Reason=" + reason +
-                    "|Type=" + ex.GetType().Name);
-            }
+            AllflameContext.RequestManualSnapshot();
+            AllflameLog.Info(
+                "CHART_DEVICE_RECOVERY_REFRESH_REQUESTED" +
+                "|Reason=" + reason +
+                "|Mode=NextTaskCycle" +
+                "|Postcondition=DeferredFreshSnapshot");
 
+            bool escapeSent = false;
+            bool closeCompleted = false;
             if (closeBlockingUi)
             {
+                escapeSent = SendEscapeForChartDeviceRecovery(reason);
+                AllflameLog.Info(
+                    "CHART_DEVICE_RECOVERY_CLOSE_UI_BEGIN" +
+                    "|Reason=" + reason);
                 try
                 {
                     await Coroutines.CloseBlockingWindows();
+                    closeCompleted = true;
                 }
                 catch (Exception ex)
                 {
@@ -22934,6 +23219,9 @@ namespace AllflameBot
                 "CHART_DEVICE_RECOVERY_READY" +
                 "|Reason=" + reason +
                 "|Recovery=" + _transactionRecoveries +
+                "|EscapeSent=" + escapeSent +
+                "|CloseCompleted=" + closeCompleted +
+                "|Postcondition=DeferredFreshCycle" +
                 "|NextAction=ReacquireChartDevice");
         }
 

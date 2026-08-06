@@ -22,3 +22,6 @@ Update when a recovery contract or terminal condition is intentionally changed.
   must be audited before modification.
 - Recovery must leave input and movement ownership in a known state.
 - Every recovery action needs a structured log with reason and next action.
+- A Chart Device action without a confirmed UI postcondition must send Escape,
+  close/reacquire the UI on a fresh cycle and remain bounded before returning
+  control to the Chart Runner.

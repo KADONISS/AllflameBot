@@ -2,7 +2,13 @@
 
 All notable changes to AllflameBot are documented in this file.
 
-## Unreleased
+## 0.23.156 - 2026-08-07
+
+- Add bounded Chart Device Descend recovery: send Escape, close the blocking
+  UI, queue a fresh context snapshot, retry twice and release the Chart request
+  back to the Chart Runner when confirmation recovery is exhausted.
+- Add task-manager, context-refresh-stage and native Descend boundary logs to
+  identify the synchronous DPB/UI operation that stalls the boat cycle.
 
 ## 0.23.155 - 2026-08-06
 

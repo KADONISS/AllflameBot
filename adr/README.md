@@ -26,3 +26,4 @@ supersedes them instead of rewriting history.
 - [`0003-layered-ui-fallbacks.md`](0003-layered-ui-fallbacks.md)
 - [`0004-hybrid-terrain-planning.md`](0004-hybrid-terrain-planning.md)
 - [`0005-bounded-chart-storage-recovery.md`](0005-bounded-chart-storage-recovery.md)
+- [`0006-bounded-chart-device-descend-recovery.md`](0006-bounded-chart-device-descend-recovery.md)
