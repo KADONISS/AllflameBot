@@ -16,7 +16,7 @@ release input or close the blocking UI before reacquisition.
 ## Decision
 
 Treat an unconfirmed Descend as a bounded cooperative recovery. After three
-seconds without confirmation, send Escape, close blocking windows, queue a
+seconds without confirmation, send Space, close blocking windows, queue a
 fresh context snapshot for the next task cycle and reacquire the Chart Device.
 Allow two confirmation recoveries per transaction. When those recoveries are
 exhausted, clear the Chart Device request and return control to the existing

@@ -2,6 +2,25 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.157 - 2026-08-07
+
+- Require Valerie's alternate approach to reach its selected waypoint before
+  resetting recovery; NPC proximity alone no longer counts as interaction
+  success.
+- Use Space for Chart Device recovery close actions and skip the close when no
+  Chart Device UI is actually open, preserving unrelated foreground UI state.
+- Use Space instead of Escape when closing the Voyage Planner after a verified
+  planner snapshot.
+- Coalesce recovery refresh requests so expensive full context scans run on
+  the next task cycle instead of blocking movement recovery synchronously.
+- Rebuild Voyage terrain walkability only after a stable metadata signature
+  changes, and cache Voyage path queries by area, navigation revision and
+  terrain snapshot.
+- Add Voyage cycle timing/path metrics, a normal Voyage progress watchdog and
+  a bounded per-target recovery budget to rotate strategy without stopping.
+- Confirm Lantern placement from counter or placed-lantern state changes and
+  release the next placement without a fixed 1.5-second cooldown.
+
 ## 0.23.156 - 2026-08-07
 
 - Add bounded Chart Device Descend recovery: send Escape, close the blocking

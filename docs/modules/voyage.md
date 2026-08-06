@@ -20,6 +20,9 @@ Voyage tasks, `VoyagePlanningUi`, `VoyageRunState` and voyage planners are in
 - Native Voyage Planner shadow reads and opt-in action canary.
 - Planner-open target override and bounded Escape close verification.
 - Voyage spawn, capsule anchors, lantern coverage and sector progress.
+- Rolling frontier and topology routing share bounded path-query and recovery
+  budgets; terrain snapshots are rebuilt only when their metadata signature
+  changes.
 - Bathysphere call/wait/extraction handoff.
 - Surface transfer and return-to-hub state.
 
@@ -29,3 +32,6 @@ Verify one input action per cycle where required, fresh UI snapshots, inventory
 delta, board slot postconditions, capsule priority and non-terminal recovery.
 Native planner actions require consecutive agreement with the stable Element
 snapshot; otherwise retain the stable Element/visual fallback.
+Normal frontier exploration owns an explicit progress watchdog and rotates its
+target/recovery strategy after a bounded budget rather than accumulating
+independent timeout chains.

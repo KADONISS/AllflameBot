@@ -27,3 +27,4 @@ supersedes them instead of rewriting history.
 - [`0004-hybrid-terrain-planning.md`](0004-hybrid-terrain-planning.md)
 - [`0005-bounded-chart-storage-recovery.md`](0005-bounded-chart-storage-recovery.md)
 - [`0006-bounded-chart-device-descend-recovery.md`](0006-bounded-chart-device-descend-recovery.md)
+- [`0007-cooperative-voyage-runtime-budget.md`](0007-cooperative-voyage-runtime-budget.md)
