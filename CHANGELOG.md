@@ -13,6 +13,24 @@ All notable changes to AllflameBot are documented in this file.
 - Remove obsolete release-history sections from `README.md`; release history now
   remains centralized in this changelog.
 
+## 0.23.152 - 2026-08-06
+
+- Add background-targeted UI input through the game window so UI actions can be
+  dispatched while another process covers the game; physical mouse input is
+  retained only as a foreground and uncovered fallback.
+- Replace direct client-coordinate use with a centralized coordinate/input
+  adapter and log input mode, client/screen coordinates and dispatch state.
+- Use visible-desktop capture only for a foreground, uncovered client; use
+  best-effort `PrintWindow` capture for covered-window screenshots instead of
+  reading pixels from another process.
+- Invalidate Voyage UI snapshots and Chart batches when the window origin, size,
+  DPI or target HWND changes; resolve Chart positions from live Element centers
+  before dynamic inventory geometry.
+- Route Capsule, Chart, Loot, stash and Secret Bottle UI actions through the
+  same background-capable adapter and preserve postcondition-based retries.
+- Route keyboard fallbacks through the game HWND when it is not foreground so
+  `/boat`, inventory toggles and Lantern hotkeys do not target the covering app.
+
 ## 0.23.151 - 2026-08-05
 
 - Confirm the Call Bathysphere unused-Capsule warning through DPB Element

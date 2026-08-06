@@ -27,6 +27,11 @@ and the actual DPB binaries used for a build.
 - Runtime integrations include `LokiPoe`, `ExilePather`, `Element`, inventory/UI
   controls, process hook and `LokiCoroutine`.
 
+## Release reference
+
+The `0.23.152` build was compiled against the local `DreamPoeBot.exe` with
+file version `0.3.29.27` and product version `0.4.5634.1760`.
+
 ## Compatibility checklist
 
 - Compile against the same DPB binary family used for deployment.

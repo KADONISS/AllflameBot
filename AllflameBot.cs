@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.151";
+        public const string Current = "0.23.152";
     }
 
     public sealed class AllflameBot : IBot
@@ -6147,25 +6147,22 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot =
-                    new System.Drawing.Bitmap(
-                        width,
-                        height,
-                        System.Drawing.Imaging.PixelFormat
-                            .Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(
-                            screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(width, height),
-                            System.Drawing.CopyPixelOperation.SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "respawn_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "RESPAWN_VISUAL|Found=False" +
+                        "|Reason=" + captureMode);
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle =
                         new System.Drawing.Rectangle(
@@ -6293,7 +6290,8 @@ namespace AllflameBot
                             requiredCorrelation.ToString("0.00") +
                             "|ClientLocation=" +
                             clientLocation +
-                            "|Client=" + width + "x" + height);
+                            "|Client=" + width + "x" + height +
+                            "|Capture=" + captureMode);
                         return found;
                     }
                     finally
@@ -6319,12 +6317,11 @@ namespace AllflameBot
         {
             try
             {
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager
-                    .SetMousePosition(location, false);
-                DreamPoeBot.BotFramework.MouseManager
-                    .ClickLMB(0, 0);
-                return true;
+                UiInputResult result =
+                    BackgroundUiInput.ClickClient(
+                        location,
+                        "RespawnCheckpoint");
+                return result.InputSent;
             }
             catch (Exception exception)
             {
@@ -6730,17 +6727,6 @@ namespace AllflameBot
                     "|ThresholdFloor=0.40" +
                     "|Action=AwaitManualRecovery");
                 return true;
-            }
-
-            try
-            {
-                DreamPoeBot.Loki.Game.Interop
-                    .SetForegroundWindow(
-                        LokiPoe.ClientWindowHandle);
-                await LokiCoroutine.Sleep(80);
-            }
-            catch
-            {
             }
 
             _visualDetectionAttempts++;
@@ -8210,18 +8196,22 @@ namespace AllflameBot
 
         private static async Task SendBoatWithKeyboard()
         {
-            LokiPoe.Input.SimulateKeyEvent(
-                System.Windows.Forms.Keys.Enter, true, false, true);
+            BackgroundUiInput.PressKey(
+                System.Windows.Forms.Keys.Enter,
+                "TravelToSovereignChatOpen");
             await LokiCoroutine.Sleep(80);
 
             foreach (char ch in "/boat")
             {
-                LokiPoe.Input.SimulateKeyEvent(ch);
+                BackgroundUiInput.TypeCharacter(
+                    ch,
+                    "TravelToSovereignChatText");
                 await LokiCoroutine.Sleep(35);
             }
 
-            LokiPoe.Input.SimulateKeyEvent(
-                System.Windows.Forms.Keys.Enter, true, false, true);
+            BackgroundUiInput.PressKey(
+                System.Windows.Forms.Keys.Enter,
+                "TravelToSovereignChatSubmit");
             AllflameLog.Info(
                 "ACTION|Task=TravelToSovereignTask|Action=KeyboardFallback|Command=/boat");
         }
@@ -9718,50 +9708,15 @@ namespace AllflameBot
                             new Vector2i(
                                 chart.LocationTopLeft.X + 1,
                                 chart.LocationTopLeft.Y + 1));
-                bool controlDown = false;
-                bool shiftDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager
-                        .ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(clickLocation, true);
-                    await LokiCoroutine.Sleep(5);
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    controlDown = true;
-                    if (useShift)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ShiftKey,
-                            short.MinValue,
-                            System.Windows.Forms.Keys.None);
-                        shiftDown = true;
-                    }
-                    await LokiCoroutine.Sleep(5);
-                    DreamPoeBot.BotFramework.MouseManager
-                        .ClickLMB(0, 0);
-                    return true;
-                }
-                finally
-                {
-                    if (shiftDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ShiftKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                }
+                UiInputResult input = useShift
+                    ? BackgroundUiInput.CtrlShiftClickScreen(
+                        clickLocation,
+                        "ChartInventoryTransfer")
+                    : BackgroundUiInput.CtrlClickScreen(
+                        clickLocation,
+                        "ChartInventoryTransfer");
+                await LokiCoroutine.Sleep(10);
+                return input.InputSent;
             }
             catch (Exception exception)
             {
@@ -11429,6 +11384,7 @@ namespace AllflameBot
 
         internal sealed class VoyageVisualSnapshot
         {
+            public UiWindowStamp WindowStamp;
             public double ButtonCorrelation;
             public double Scale;
             public Vector2i BeginVoyageLocation;
@@ -11447,6 +11403,7 @@ namespace AllflameBot
             public Element InventoryRegion;
             public Element BeginVoyageButton;
             public Element ClearBoardButton;
+            public UiWindowStamp WindowStamp;
             public int RootIndex;
             public int InventorySlotCount;
             public int BoardSlotCount;
@@ -11480,6 +11437,7 @@ namespace AllflameBot
             public int RootIndex;
             public Element Window;
             public Element InventoryRegion;
+            public UiWindowStamp WindowStamp;
             public long WindowAddress;
             public long InventoryAddress;
             public int InitialAvailable;
@@ -11582,12 +11540,27 @@ namespace AllflameBot
                     return false;
                 }
 
+                UiWindowStamp windowStamp;
+                if (!BackgroundUiInput.TryGetWindowStamp(
+                        out windowStamp))
+                {
+                    AllflameLog.Throttled(
+                        "voyage_stable_window_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "VOYAGE_UI_STABLE" +
+                        "|Resolved=False" +
+                        "|Reason=WindowStampUnavailable" +
+                        "|RootIndex=" + rootIndex);
+                    return false;
+                }
+
                 var resolved = new StableVoyageSnapshot
                 {
                     Window = window,
                     InventoryRegion = inventoryRegion,
                     BeginVoyageButton = beginButton,
                     ClearBoardButton = clearButton,
+                    WindowStamp = windowStamp,
                     RootIndex = rootIndex
                 };
                 List<Element> inventorySlots =
@@ -11630,7 +11603,12 @@ namespace AllflameBot
                     "|BoardSlots=" + resolved.BoardSlotCount +
                     "|BoardCharts=" + resolved.BoardChartCount +
                     "|BeginEnabled=" +
-                    resolved.BeginVoyageEnabled);
+                    resolved.BeginVoyageEnabled +
+                    "|Client=" + windowStamp.Width + "x" +
+                    windowStamp.Height +
+                    "|Origin={" + windowStamp.Left + "," +
+                    windowStamp.Top + "}" +
+                    "|Dpi=" + windowStamp.Dpi);
                 return true;
             }
             return false;
@@ -11653,12 +11631,15 @@ namespace AllflameBot
             {
                 return false;
             }
-            bool clicked = ClickClient(location);
+            bool clicked = BackgroundUiInput.ClickScreen(
+                    location,
+                    action ?? "VoyageStableElement")
+                .InputSent;
             AllflameLog.Info(
                 "VOYAGE_UI_ELEMENT_CLICK" +
                 "|Action=" + (action ?? String.Empty) +
                 "|Address=0x" + element.Address.ToString("X") +
-                "|Client=" + location +
+                "|Screen=" + location +
                 "|Enabled=" + SafeStableEnabled(element) +
                 "|Clicked=" + clicked);
             return clicked;
@@ -11738,6 +11719,7 @@ namespace AllflameBot
             if (snapshot == null ||
                 snapshot.Window == null ||
                 snapshot.InventoryRegion == null ||
+                snapshot.WindowStamp == null ||
                 snapshot.AvailableChartSlots.Count == 0)
             {
                 rejectionReason = "StableSnapshotUnavailable";
@@ -11752,6 +11734,7 @@ namespace AllflameBot
                 InventoryRegion = snapshot.InventoryRegion,
                 WindowAddress = snapshot.Window.Address,
                 InventoryAddress = snapshot.InventoryRegion.Address,
+                WindowStamp = snapshot.WindowStamp,
                 InitialAvailable = snapshot.AvailableChartSlots.Count,
                 InitialBoard = snapshot.BoardChartCount
             };
@@ -11799,6 +11782,11 @@ namespace AllflameBot
                 plan.WindowAddress.ToString("X") +
                 "|InventoryAddress=0x" +
                 plan.InventoryAddress.ToString("X") +
+                "|Client=" + plan.WindowStamp.Width + "x" +
+                plan.WindowStamp.Height +
+                "|Origin={" + plan.WindowStamp.Left + "," +
+                plan.WindowStamp.Top + "}" +
+                "|Dpi=" + plan.WindowStamp.Dpi +
                 "|Available=" + plan.InitialAvailable +
                 "|Board=" + plan.InitialBoard +
                 "|Clicks=" + plan.Entries.Count);
@@ -11821,16 +11809,9 @@ namespace AllflameBot
                 plan.Entries.Count,
                 startIndex + count);
             int sent = 0;
-            bool controlDown = false;
             try
             {
                 LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                LokiPoe.ProcessHookManager.SetKeyState(
-                    System.Windows.Forms.Keys.ControlKey,
-                    short.MinValue,
-                    System.Windows.Forms.Keys.None);
-                controlDown = true;
-                await LokiCoroutine.Sleep(20);
                 for (int index = startIndex;
                      index < endIndex;
                      index++)
@@ -11845,10 +11826,22 @@ namespace AllflameBot
                         break;
                     }
                     StableChartBatchEntry entry = plan.Entries[index];
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(entry.ClientLocation, false);
+                    UiInputResult input =
+                        BackgroundUiInput.CtrlClickClient(
+                            entry.ClientLocation,
+                            "VoyageChartBatch");
+                    if (!input.InputSent)
+                    {
+                        AllflameLog.Info(
+                            "VOYAGE_CHART_BATCH_FALLBACK" +
+                            "|Reason=InputUnavailable" +
+                            "|Placement=" + (index + 1) + "/" +
+                            plan.Entries.Count +
+                            "|Mode=" + input.Mode +
+                            "|Sent=" + sent);
+                        break;
+                    }
                     await LokiCoroutine.Sleep(12);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
                     sent++;
                     AllflameLog.Info(
                         "VOYAGE_CHART_BATCH_CLICK" +
@@ -11859,7 +11852,9 @@ namespace AllflameBot
                         entry.ElementAddress.ToString("X") +
                         "|Client=" + entry.ClientLocation +
                         "|CoordinateMode=" + entry.CoordinateMode +
-                        "|InputSent=True");
+                        "|InputSent=True" +
+                        "|InputMode=" + input.Mode +
+                        "|Postcondition=Pending");
                     await LokiCoroutine.Sleep(45);
                 }
             }
@@ -11874,13 +11869,6 @@ namespace AllflameBot
             }
             finally
             {
-                if (controlDown)
-                {
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        (short)0,
-                        System.Windows.Forms.Keys.None);
-                }
                 LokiPoe.ProcessHookManager.ClearAllKeyStates();
             }
             return sent;
@@ -11896,6 +11884,10 @@ namespace AllflameBot
                    snapshot.RootIndex == plan.RootIndex &&
                    snapshot.Window != null &&
                    snapshot.Window.Address == plan.WindowAddress &&
+                   snapshot.WindowStamp != null &&
+                   plan.WindowStamp != null &&
+                   snapshot.WindowStamp.MatchesCurrent() &&
+                   plan.WindowStamp.MatchesCurrent() &&
                    snapshot.InventoryRegion != null &&
                    snapshot.InventoryRegion.Address == plan.InventoryAddress;
         }
@@ -11910,6 +11902,8 @@ namespace AllflameBot
                        AllflameContext.AreaHash == plan.AreaHash &&
                        IsStableVisible(plan.Window) &&
                        plan.Window.Address == plan.WindowAddress &&
+                       plan.WindowStamp != null &&
+                       plan.WindowStamp.MatchesCurrent() &&
                        IsStableVisible(plan.InventoryRegion) &&
                        plan.InventoryRegion.Address == plan.InventoryAddress;
             }
@@ -11931,7 +11925,7 @@ namespace AllflameBot
             rejectionReason = String.Empty;
             if (snapshot.InventoryRegion == null ||
                 inventoryIndex < 0 ||
-                inventoryIndex >= 60)
+                inventoryIndex >= snapshot.InventorySlotCount)
             {
                 rejectionReason = "InvalidStableSlot";
                 return false;
@@ -11939,6 +11933,27 @@ namespace AllflameBot
 
             try
             {
+                StableChartSlot stableSlot =
+                    snapshot.AvailableChartSlots.FirstOrDefault(
+                        candidate => candidate.Index == inventoryIndex);
+                if (stableSlot != null &&
+                    IsStableVisible(stableSlot.Element) &&
+                    ContainsStableLevelLabel(stableSlot.Element))
+                {
+                    Vector2i screenLocation =
+                        stableSlot.Element.CenterClickLocation();
+                    if (!BackgroundUiInput.TryGetClientLocation(
+                            screenLocation,
+                            out location))
+                    {
+                        rejectionReason =
+                            "ElementOutsideClient:" + screenLocation;
+                        return false;
+                    }
+                    mode = "StableElementScreenToClient";
+                    return true;
+                }
+
                 var slotUi = new InventorySlotUiElement(
                     snapshot.InventoryRegion.Address,
                     StashType.NormalStash);
@@ -11950,34 +11965,51 @@ namespace AllflameBot
                     return false;
                 }
 
-                const int columns = 6;
-                const int rows = 10;
-                if (slotUi.Size.X != columns ||
-                    slotUi.Size.Y != rows)
+                InventoryControlWrapper inventoryControl =
+                    new InventoryControlWrapper(
+                        snapshot.InventoryRegion.Address);
+                Inventory inventory = inventoryControl.Inventory;
+                int columns = inventory == null
+                    ? 0
+                    : inventory.Columns;
+                int rows = inventory == null
+                    ? 0
+                    : inventory.Rows;
+                if (columns <= 0 || rows <= 0)
                 {
                     rejectionReason =
-                        "UnexpectedGridSize:" + slotUi.Size;
+                        "DynamicGridUnavailable:" + slotUi.Size;
+                    return false;
+                }
+                if (inventoryIndex >= columns * rows)
+                {
+                    rejectionReason =
+                        "InventoryIndexOutsideGrid:" +
+                        inventoryIndex + "/" + columns + "x" + rows;
                     return false;
                 }
                 int column = inventoryIndex % columns;
                 int row = inventoryIndex / columns;
-                location = slotUi.SlotClickLocation(
+                Vector2i slotScreenLocation = slotUi.SlotClickLocation(
                     new Vector2i(column + 1, row + 1));
-                if (!IsClientLocationValid(location))
+                if (!BackgroundUiInput.TryGetClientLocation(
+                        slotScreenLocation,
+                        out location))
                 {
                     rejectionReason =
-                        "OutsideClient:" + location;
+                        "OutsideClient:" + slotScreenLocation;
                     return false;
                 }
 
-                mode = "InventorySlotUiElement";
+                mode = "InventorySlotUiElementScreenToClient";
                 AllflameLog.Throttled(
                     "voyage_chart_grid_geometry",
                     TimeSpan.FromSeconds(2),
                     "VOYAGE_CHART_GRID" +
                     "|InventoryAddress=0x" +
                     snapshot.InventoryRegion.Address.ToString("X") +
-                    "|GridSize=" + slotUi.Size +
+                    "|GridSize=" + columns + "x" + rows +
+                    "|ControlSize=" + slotUi.Size +
                     "|GridTopLeft=" + slotUi.LocationTopLeft +
                     "|Index=" + inventoryIndex +
                     "|Column=" + column +
@@ -12244,7 +12276,9 @@ namespace AllflameBot
                 DateTime.UtcNow < _nextVisualScanUtc)
             {
                 snapshot = _cachedVisual;
-                return snapshot != null;
+                return snapshot != null &&
+                    snapshot.WindowStamp != null &&
+                    snapshot.WindowStamp.MatchesCurrent();
             }
 
             _nextVisualScanUtc =
@@ -12268,28 +12302,30 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot =
-                    new System.Drawing.Bitmap(
-                        width,
-                        height,
-                        System.Drawing.Imaging.PixelFormat
-                            .Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(
-                            screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(
-                                width,
-                                height),
-                            System.Drawing.CopyPixelOperation
-                                .SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "voyage_visual_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "VOYAGE_VISUAL|Open=False" +
+                        "|Reason=" + captureMode);
+                    return false;
+                }
+
+                UiWindowStamp windowStamp;
+                if (!BackgroundUiInput.TryGetWindowStamp(
+                        out windowStamp))
+                {
+                    screenshot.Dispose();
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle =
                         new System.Drawing.Rectangle(
@@ -12344,6 +12380,7 @@ namespace AllflameBot
 
                         var visual =
                             new VoyageVisualSnapshot();
+                        visual.WindowStamp = windowStamp;
                         visual.ButtonCorrelation = correlation;
                         visual.Scale = scale;
                         visual.BeginVoyageLocation =
@@ -12390,6 +12427,7 @@ namespace AllflameBot
                             visual.BeginVoyageEnabled +
                             "|Available=" +
                             visual.AvailableChartCount +
+                            "|Capture=" + captureMode +
                             "|ShapeDetection=Disabled");
                         return true;
                     }
@@ -12415,12 +12453,11 @@ namespace AllflameBot
         {
             try
             {
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager
-                    .SetMousePosition(location, false);
-                DreamPoeBot.BotFramework.MouseManager
-                    .ClickLMB(0, 0);
-                return true;
+                UiInputResult input =
+                    BackgroundUiInput.ClickClient(
+                        location,
+                        "VoyageClient");
+                return input.InputSent;
             }
             catch (Exception exception)
             {
@@ -12453,24 +12490,22 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot =
-                    new System.Drawing.Bitmap(
-                        width,
-                        height,
-                        System.Drawing.Imaging.PixelFormat
-                            .Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(width, height),
-                            System.Drawing.CopyPixelOperation.SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "voyage_begin_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "VOYAGE_BEGIN_ANCHOR|Enabled=False" +
+                        "|Reason=" + captureMode);
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle =
                         new System.Drawing.Rectangle(
@@ -12506,7 +12541,8 @@ namespace AllflameBot
                             TimeSpan.FromSeconds(2),
                             "VOYAGE_BEGIN_STATE|Enabled=" +
                             enabled +
-                            "|Client=" + location);
+                            "|Client=" + location +
+                            "|Capture=" + captureMode);
                         return enabled;
                     }
                     finally
@@ -12531,26 +12567,20 @@ namespace AllflameBot
         public static async Task<bool> CtrlClickClient(
             Vector2i location)
         {
-            bool controlDown = false;
             try
             {
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager
-                    .SetMousePosition(location, false);
-                await LokiCoroutine.Sleep(20);
-                LokiPoe.ProcessHookManager.SetKeyState(
-                    System.Windows.Forms.Keys.ControlKey,
-                    short.MinValue,
-                    System.Windows.Forms.Keys.None);
-                controlDown = true;
-                await LokiCoroutine.Sleep(25);
-                DreamPoeBot.BotFramework.MouseManager
-                    .ClickLMB(0, 0);
+                UiInputResult input =
+                    BackgroundUiInput.CtrlClickClient(
+                        location,
+                        "VoyageClientCtrl");
                 await LokiCoroutine.Sleep(80);
                 AllflameLog.Info(
-                    "VOYAGE_CHART_CTRL_CLICK|Client=" +
-                    location);
-                return true;
+                    "VOYAGE_CHART_CTRL_CLICK" +
+                    "|Client=" + location +
+                    "|InputMode=" + input.Mode +
+                    "|InputSent=" + input.InputSent +
+                    "|Postcondition=Pending");
+                return input.InputSent;
             }
             catch (Exception exception)
             {
@@ -12564,13 +12594,7 @@ namespace AllflameBot
             }
             finally
             {
-                if (controlDown)
-                {
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        (short)0,
-                        System.Windows.Forms.Keys.None);
-                }
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
             }
         }
 
@@ -13349,12 +13373,11 @@ namespace AllflameBot
 
                 Vector2i location =
                     element.CenterClickLocation();
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                    location,
-                    true);
-                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                return true;
+                UiInputResult input =
+                    BackgroundUiInput.ClickScreen(
+                        location,
+                        "VoyageElement");
+                return input.InputSent;
             }
             catch (Exception exception)
             {
@@ -13373,25 +13396,16 @@ namespace AllflameBot
                 return false;
             }
 
-            bool controlDown = false;
             try
             {
                 Vector2i location =
                     element.CenterClickLocation();
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                    location,
-                    true);
-                await LokiCoroutine.Sleep(20);
-                LokiPoe.ProcessHookManager.SetKeyState(
-                    System.Windows.Forms.Keys.ControlKey,
-                    short.MinValue,
-                    System.Windows.Forms.Keys.None);
-                controlDown = true;
-                await LokiCoroutine.Sleep(25);
-                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                UiInputResult input =
+                    BackgroundUiInput.CtrlClickScreen(
+                        location,
+                        "VoyageElementCtrl");
                 await LokiCoroutine.Sleep(80);
-                return true;
+                return input.InputSent;
             }
             catch (Exception exception)
             {
@@ -13403,13 +13417,7 @@ namespace AllflameBot
             }
             finally
             {
-                if (controlDown)
-                {
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        (short)0,
-                        System.Windows.Forms.Keys.None);
-                }
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
             }
         }
 
@@ -14990,12 +14998,9 @@ namespace AllflameBot
             bool spaceSent = false;
             if (planningOpenAfterApi)
             {
-                LokiPoe.Input.SimulateKeyEvent(
+                spaceSent = BackgroundUiInput.PressKey(
                     System.Windows.Forms.Keys.Space,
-                    true,
-                    false,
-                    true);
-                spaceSent = true;
+                    "VoyageStashUiRecovery");
                 await LokiCoroutine.Sleep(350);
                 AllflameContext.Refresh(true);
             }
@@ -15968,33 +15973,12 @@ namespace AllflameBot
                 }
 
                 Vector2i location = element.CenterClickLocation();
-                bool controlDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(location, true);
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    controlDown = true;
-                    await LokiCoroutine.Sleep(25);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    await LokiCoroutine.Sleep(90);
-                    return true;
-                }
-                finally
-                {
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                }
+                UiInputResult input =
+                    BackgroundUiInput.CtrlClickScreen(
+                        location,
+                        "ChartStorageRaw");
+                await LokiCoroutine.Sleep(90);
+                return input.InputSent;
             }
             catch (Exception ex)
             {
@@ -17730,24 +17714,22 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot = new System.Drawing.Bitmap(
-                    clientWidth,
-                    clientHeight,
-                    System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(
-                                clientWidth,
-                                clientHeight),
-                            System.Drawing.CopyPixelOperation.SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "capsule_call_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "CAPSULE_CALL_VISUAL|Found=False" +
+                        "|Reason=" + captureMode);
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle = new System.Drawing.Rectangle(
                         0,
@@ -17924,7 +17906,8 @@ namespace AllflameBot
                                 requiredCorrelation.ToString("0.000") +
                                 "|Template=" + bestTemplate +
                                 "|Window=" + clientWidth + "x" +
-                                clientHeight);
+                                clientHeight +
+                                "|Capture=" + captureMode);
                             return true;
                         }
 
@@ -17978,22 +17961,22 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot = new System.Drawing.Bitmap(
-                    clientWidth,
-                    clientHeight,
-                    System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(clientWidth, clientHeight),
-                            System.Drawing.CopyPixelOperation.SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "capsule_warning_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "CAPSULE_WARNING_OK_VISUAL|Found=False" +
+                        "|Reason=" + captureMode);
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle = new System.Drawing.Rectangle(
                         0, 0, clientWidth, clientHeight);
@@ -18103,8 +18086,9 @@ namespace AllflameBot
                                 "|Client=" + clientLocation +
                                 "|Correlation=" +
                                 bestCorrelation.ToString("0.000") +
-                                "|Window=" + clientWidth + "x" +
-                                clientHeight);
+                            "|Window=" + clientWidth + "x" +
+                            clientHeight +
+                            "|Capture=" + captureMode);
                             return true;
                         }
 
@@ -18165,31 +18149,18 @@ namespace AllflameBot
                     (client.Top + clickLocation.Y) + "}" +
                     "|WindowOrigin={" + client.Left + ", " +
                     client.Top + "}");
-                if (strategy == 0)
-                {
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(clickLocation, false);
-                    DreamPoeBot.BotFramework.MouseManager
-                        .ClickLMB(0, 0);
-                }
-                else if (strategy == 1)
-                {
-                    LokiPoe.Input.MoveMouseToScreenPos(
-                        client.Left + clickLocation.X,
-                        client.Top + clickLocation.Y,
-                        true);
-                    LokiPoe.Input.ClickLMB(
-                        client.Left + clickLocation.X,
-                        client.Top + clickLocation.Y);
-                }
-                else
-                {
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(clickLocation, false);
-                    DreamPoeBot.BotFramework.MouseManager
-                        .ClickLMB(0, 0);
-                }
-                return true;
+                UiInputResult input =
+                    BackgroundUiInput.ClickClient(
+                        clickLocation,
+                        "CapsuleVisualStrategy" + strategy);
+                AllflameLog.Info(
+                    "CAPSULE_VISUAL_INPUT" +
+                    "|Strategy=" + strategy +
+                    "|Mode=" + input.Mode +
+                    "|InputSent=" + input.InputSent +
+                    "|Postcondition=Pending" +
+                    "|Client=" + clickLocation);
+                return input.InputSent;
             }
             catch
             {
@@ -19004,11 +18975,9 @@ namespace AllflameBot
                 }
 
                 Vector2i location = element.CenterClickLocation();
-                LokiPoe.Input.MoveMouseToScreenPos(
-                    location.X,
-                    location.Y);
-                LokiPoe.Input.ClickLMB();
-                return true;
+                return BackgroundUiInput.ClickScreen(
+                    location,
+                    "ChartDeviceElement").InputSent;
             }
             catch
             {
@@ -19681,10 +19650,11 @@ namespace AllflameBot
                     string strategy =
                         DispatchDescendClick(
                             location,
-                            attempt);
+                            attempt,
+                            true);
                     AllflameLog.Info(
-                        "CHART_DEVICE_DESCEND_ELEMENT|Client=" +
-                        location.X + "," + location.Y +
+                        "CHART_DEVICE_DESCEND_ELEMENT|Screen=" +
+                            location.X + "," + location.Y +
                         "|Address=0x" +
                         descendButton.Address.ToString("X") +
                         "|Text=" +
@@ -19705,7 +19675,8 @@ namespace AllflameBot
                     string strategy =
                         DispatchDescendClick(
                             imageLocation,
-                            attempt);
+                            attempt,
+                            false);
                     AllflameLog.Info(
                         "CHART_DEVICE_DESCEND_IMAGE|Client=" +
                         imageLocation.X + "," + imageLocation.Y +
@@ -19730,104 +19701,94 @@ namespace AllflameBot
         }
 
         private static string DispatchDescendClick(
-            Vector2i clientLocation,
-            int attempt)
+            Vector2i location,
+            int attempt,
+            bool screenCoordinates)
         {
             int strategy = Math.Max(1, attempt);
             strategy = (strategy - 1) % 7 + 1;
-            var clientRectangle = LokiPoe.ClientWindowInfo.Client;
 
             LokiPoe.ProcessHookManager.ClearAllKeyStates();
             switch (strategy)
             {
                 case 1:
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                        clientLocation,
-                        false);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    return "MouseManagerClick";
+                    return (screenCoordinates
+                            ? BackgroundUiInput.ClickScreen(
+                                location,
+                                "ChartDeviceDescend")
+                            : BackgroundUiInput.ClickClient(
+                                location,
+                                "ChartDeviceDescend"))
+                        .Mode;
 
                 case 2:
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                        clientLocation,
-                        false);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    return "MouseManagerClickRetry";
+                    return (screenCoordinates
+                            ? BackgroundUiInput.ClickScreen(
+                                location,
+                                "ChartDeviceDescendRetry")
+                            : BackgroundUiInput.ClickClient(
+                                location,
+                                "ChartDeviceDescendRetry"))
+                        .Mode;
 
                 case 3:
-                    LokiPoe.Input.MoveMouseToScreenPos(
-                        clientRectangle.Left + clientLocation.X,
-                        clientRectangle.Top + clientLocation.Y,
-                        true);
-                    LokiPoe.Input.ClickLMB(
-                        clientRectangle.Left + clientLocation.X,
-                        clientRectangle.Top + clientLocation.Y);
-                    return "LokiExplicitCoordinates";
+                    return (screenCoordinates
+                            ? BackgroundUiInput.ClickScreen(
+                                location,
+                                "ChartDeviceDescendScreenFallback")
+                            : BackgroundUiInput.ClickClient(
+                                location,
+                                "ChartDeviceDescendScreenFallback"))
+                        .Mode;
 
                 case 4:
-                    int clientX = clientLocation.X;
-                    int clientY = clientLocation.Y;
-                    int packedCoordinates =
-                        (clientY << 16) |
-                        (clientX & 0xFFFF);
-                    DreamPoeBot.Loki.Game.Interop.PostMessage(
-                        LokiPoe.ClientWindowHandle,
-                        0x0200,
-                        IntPtr.Zero,
-                        new IntPtr(packedCoordinates));
-                    DreamPoeBot.Loki.Game.Interop.PostMessage(
-                        LokiPoe.ClientWindowHandle,
-                        0x0201,
-                        new IntPtr(1),
-                        new IntPtr(packedCoordinates));
-                    DreamPoeBot.Loki.Game.Interop.PostMessage(
-                        LokiPoe.ClientWindowHandle,
-                        0x0202,
-                        IntPtr.Zero,
-                        new IntPtr(packedCoordinates));
-                    return "Win32PostMessage";
+                    return (screenCoordinates
+                            ? BackgroundUiInput.ClickScreen(
+                                location,
+                                "ChartDeviceDescendPostMessage")
+                            : BackgroundUiInput.ClickClient(
+                                location,
+                                "ChartDeviceDescendPostMessage"))
+                        .Mode;
 
                 case 5:
-                    DreamPoeBot.Loki.Game.Interop.SetForegroundWindow(
-                        LokiPoe.ClientWindowHandle);
-                    DreamPoeBot.Loki.Game.Interop.SetCursorPos(
-                        clientRectangle.Left + clientLocation.X,
-                        clientRectangle.Top + clientLocation.Y);
-                    NativeMouseEvent(0x0002, 0, 0, 0, UIntPtr.Zero);
-                    NativeMouseEvent(0x0004, 0, 0, 0, UIntPtr.Zero);
-                    return "Win32ForegroundMouseEvent";
+                    return (screenCoordinates
+                            ? BackgroundUiInput.ClickScreen(
+                                location,
+                                "ChartDeviceDescendNativeFallback")
+                            : BackgroundUiInput.ClickClient(
+                                location,
+                                "ChartDeviceDescendNativeFallback"))
+                        .Mode;
 
                 case 6:
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                        clientLocation,
-                        false);
-                    DreamPoeBot.BotFramework.MouseManager.DblClickLMB(0, 0);
-                    return "MouseManagerDoubleClick";
+                    return (screenCoordinates
+                            ? BackgroundUiInput.DoubleClickScreen(
+                                location,
+                                "ChartDeviceDescendDouble")
+                            : BackgroundUiInput.DoubleClickClient(
+                                location,
+                                "ChartDeviceDescendDouble"))
+                        .Mode;
 
                 default:
-                    DreamPoeBot.Loki.Game.Interop.SetForegroundWindow(
-                        LokiPoe.ClientWindowHandle);
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                        clientLocation,
-                        false);
-                    LokiPoe.Input.SimulateKeyEvent(
-                        System.Windows.Forms.Keys.Enter,
-                        true,
-                        false,
-                        true);
-                    return "ForegroundHoverEnter";
+                    UiInputResult enterTarget = screenCoordinates
+                        ? BackgroundUiInput.ClickScreen(
+                            location,
+                            "ChartDeviceDescendEnter")
+                        : BackgroundUiInput.ClickClient(
+                            location,
+                            "ChartDeviceDescendEnter");
+                    if (!enterTarget.InputSent)
+                    {
+                        return enterTarget.Mode;
+                    }
+                    return BackgroundUiInput.PressEnter(
+                            "ChartDeviceDescendEnter")
+                        ? enterTarget.Mode + "Enter"
+                        : enterTarget.Mode + "EnterUnavailable";
             }
         }
-
-        [System.Runtime.InteropServices.DllImport(
-            "user32.dll",
-            EntryPoint = "mouse_event")]
-        private static extern void NativeMouseEvent(
-            uint flags,
-            uint dx,
-            uint dy,
-            uint data,
-            UIntPtr extraInfo);
 
         private static bool TryFindDescendByImage(
             out Vector2i clientLocation,
@@ -19846,24 +19807,23 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot = new System.Drawing.Bitmap(
-                    clientWidth,
-                    clientHeight,
-                    System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(
-                                clientWidth,
-                                clientHeight),
-                            System.Drawing.CopyPixelOperation.SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "chart_descend_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "CHART_DEVICE_DESCEND_IMAGE" +
+                        "|Element=False|Image=False" +
+                        "|Reason=" + captureMode);
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle = new System.Drawing.Rectangle(
                         0,
@@ -21753,33 +21713,11 @@ namespace AllflameBot
                                 chart.LocationTopLeft.X + 1,
                                 chart.LocationTopLeft.Y + 1));
 
-                bool controlDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
+                UiInputResult input =
+                    BackgroundUiInput.CtrlClickScreen(
                         clickLocation,
-                        true);
-                    await LokiCoroutine.Sleep(20);
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    controlDown = true;
-                    await LokiCoroutine.Sleep(30);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    await LokiCoroutine.Sleep(120);
-                }
-                finally
-                {
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                }
+                        "ChartDeviceInventory");
+                await LokiCoroutine.Sleep(120);
 
                 AllflameLog.Info(
                     "CHART_DEVICE_CTRL_CLICK|Id=" + chart.Id +
@@ -21789,8 +21727,11 @@ namespace AllflameBot
                     "|Element=" + (chartElement != null) +
                     "|ElementKey=" + elementKey +
                     "|SlotOrigin=" + slotUi.LocationTopLeft +
-                    "|SlotSize=" + slotUi.Size);
-                return true;
+                    "|SlotSize=" + slotUi.Size +
+                    "|InputMode=" + input.Mode +
+                    "|InputSent=" + input.InputSent +
+                    "|Postcondition=Pending");
+                return input.InputSent;
             }
             catch (Exception ex)
             {
@@ -25529,7 +25470,9 @@ namespace AllflameBot
                 return;
             }
 
-            LokiPoe.Input.SimulateKeyEvent('v');
+            BackgroundUiInput.PressKey(
+                System.Windows.Forms.Keys.V,
+                "LanternFallback");
             _nextLanternFallbackUtc =
                 DateTime.UtcNow.AddMilliseconds(1400);
             AllflameLog.Throttled(
@@ -26030,7 +25973,9 @@ namespace AllflameBot
                         "|Action=SkipInputAndResumeRecovery");
                     return false;
                 }
-                LokiPoe.Input.SimulateKeyEvent('v');
+                BackgroundUiInput.PressKey(
+                    System.Windows.Forms.Keys.V,
+                    "LanternPlace");
                 pressedV = true;
                 // A V attempt consumes this anchor for the outward pass even
                 // if the game rejects placement. Never route back to it until
@@ -34946,32 +34891,12 @@ namespace AllflameBot
                             new Vector2i(
                                 item.LocationTopLeft.X + 1,
                                 item.LocationTopLeft.Y + 1));
-                bool controlDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(location, true);
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    controlDown = true;
-                    await LokiCoroutine.Sleep(25);
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    await LokiCoroutine.Sleep(90);
-                    return true;
-                }
-                finally
-                {
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                }
+                UiInputResult input =
+                    BackgroundUiInput.CtrlClickScreen(
+                        location,
+                        "ChartStorageRaw");
+                await LokiCoroutine.Sleep(90);
+                return input.InputSent;
             }
             catch (Exception ex)
             {
@@ -35187,15 +35112,12 @@ namespace AllflameBot
                     (int)(center.Y -
                         grid.Slot.Height / 2f -
                         0.85f * cell);
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager
-                    .SetMousePosition(
+                UiInputResult input =
+                    BackgroundUiInput.ClickScreen(
                         new Vector2i(x, y),
-                        true);
-                DreamPoeBot.BotFramework.MouseManager
-                    .ClickLMB(0, 0);
+                        "CollectRawTab");
                 await LokiCoroutine.Sleep(120);
-                return true;
+                return input.InputSent;
             }
             catch (Exception ex)
             {
@@ -35332,35 +35254,15 @@ namespace AllflameBot
 
                 Vector2i location =
                     element.CenterClickLocation();
-                bool controlDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(location, true);
-                    if (controlClick)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            short.MinValue,
-                            System.Windows.Forms.Keys.None);
-                        controlDown = true;
-                        await LokiCoroutine.Sleep(25);
-                    }
-                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
-                    await LokiCoroutine.Sleep(controlClick ? 85 : 120);
-                    return true;
-                }
-                finally
-                {
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                }
+                UiInputResult input = controlClick
+                    ? BackgroundUiInput.CtrlClickScreen(
+                        location,
+                        "CollectRawElement")
+                    : BackgroundUiInput.ClickScreen(
+                        location,
+                        "CollectRawElement");
+                await LokiCoroutine.Sleep(controlClick ? 85 : 120);
+                return input.InputSent;
             }
             catch (Exception ex)
             {
@@ -37369,14 +37271,21 @@ namespace AllflameBot
                 {
                     _nextBottleAcceptClickUtc =
                         DateTime.UtcNow.AddMilliseconds(600);
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager
-                        .SetMousePosition(
+                    UiInputResult input = foundByElement
+                        ? BackgroundUiInput.ClickScreen(
                             acceptLocation,
-                            foundByElement);
+                            "SecretBottleAccept")
+                        : BackgroundUiInput.ClickClient(
+                            acceptLocation,
+                            "SecretBottleAccept");
                     await LokiCoroutine.Sleep(25);
-                    DreamPoeBot.BotFramework.MouseManager
-                        .ClickLMB(0, 0);
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_ACCEPT_CLICK" +
+                        "|Client=" + acceptLocation +
+                        "|Source=" + source +
+                        "|InputMode=" + input.Mode +
+                        "|InputSent=" + input.InputSent +
+                        "|Postcondition=Pending");
                 }
                 return;
             }
@@ -37431,11 +37340,22 @@ namespace AllflameBot
                 _bottlePlacementAttempts++;
                 _activePlacement.Column = column;
                 _activePlacement.Row = row;
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager
-                    .SetMousePosition(slotLocation, true);
+                UiInputResult input =
+                    BackgroundUiInput.ClickScreen(
+                        slotLocation,
+                        "SecretBottlePlace");
                 await LokiCoroutine.Sleep(25);
-                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                if (!input.InputSent)
+                {
+                    AllflameLog.Info(
+                        "SECRET_BOTTLE_CURSOR_PLACE" +
+                        "|Attempt=" + _bottlePlacementAttempts +
+                        "|Slot=" + column + "," + row +
+                        "|InputSent=False" +
+                        "|InputMode=" + input.Mode +
+                        "|Postcondition=Pending");
+                    return;
+                }
                 _bottleStageDeadlineUtc =
                     DateTime.UtcNow.AddSeconds(1);
                 _bottleOpenStage =
@@ -37446,6 +37366,8 @@ namespace AllflameBot
                     "|Maximum=" + maximumAttempts +
                     "|Slot=" + column + "," + row +
                     "|Confirmed=False" +
+                    "|InputMode=" + input.Mode +
+                    "|InputSent=True" +
                     "|Action=ConfirmOnNextCycle" +
                     "|OneActionPerCycle=True");
                 return;
@@ -37970,22 +37892,22 @@ namespace AllflameBot
                     return false;
                 }
 
-                using (var screenshot = new System.Drawing.Bitmap(
-                    width,
-                    height,
-                    System.Drawing.Imaging.PixelFormat.Format24bppRgb))
+                System.Drawing.Bitmap screenshot;
+                string captureMode;
+                if (!BackgroundUiInput.TryCaptureClient(
+                        out screenshot,
+                        out captureMode))
                 {
-                    using (System.Drawing.Graphics graphics =
-                        System.Drawing.Graphics.FromImage(screenshot))
-                    {
-                        graphics.CopyFromScreen(
-                            client.Left,
-                            client.Top,
-                            0,
-                            0,
-                            new System.Drawing.Size(width, height),
-                            System.Drawing.CopyPixelOperation.SourceCopy);
-                    }
+                    AllflameLog.Throttled(
+                        "secret_bottle_capture_unavailable",
+                        TimeSpan.FromSeconds(2),
+                        "SECRET_BOTTLE_ACCEPT" +
+                        "|Found=False|Reason=" + captureMode);
+                    return false;
+                }
+
+                using (screenshot)
+                {
 
                     var rectangle = new System.Drawing.Rectangle(
                         0,
@@ -38184,7 +38106,9 @@ namespace AllflameBot
                     !itemElement.IsValid ||
                     !itemElement.IsVisible)
                 {
-                    LokiPoe.Input.SimulateKeyEvent('i');
+                    BackgroundUiInput.PressKey(
+                        System.Windows.Forms.Keys.I,
+                        "SecretBottleInventoryToggle");
                     await LokiCoroutine.Sleep(250);
                     inventoryControl = MainInventory();
                     slotUi = inventoryControl == null
@@ -38227,14 +38151,16 @@ namespace AllflameBot
                                 bottle.LocationTopLeft.X + 1,
                                 bottle.LocationTopLeft.Y + 1));
 
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
-                    clickLocation,
-                    true);
+                UiInputResult input =
+                    BackgroundUiInput.RightClickScreen(
+                        clickLocation,
+                        "SecretBottleRightClick",
+                        false);
                 await LokiCoroutine.Sleep(25);
-                DreamPoeBot.BotFramework.MouseManager.ClickRMB(0, 0);
                 await LokiCoroutine.Sleep(100);
-                return "MouseRightClick:Sent";
+                return input.InputSent
+                    ? "RightClick:" + input.Mode
+                    : "RightClickFailed:" + input.Mode;
             }
             catch (Exception ex)
             {
@@ -39712,35 +39638,13 @@ namespace AllflameBot
                             new Vector2i(
                                 item.LocationTopLeft.X + 1,
                                 item.LocationTopLeft.Y + 1));
-                bool controlDown = false;
-                try
-                {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                    DreamPoeBot.BotFramework.MouseManager.SetMousePosition(
+                UiInputResult input =
+                    BackgroundUiInput.RightClickScreen(
                         clickLocation,
+                        "StashCtrlRightClick",
                         true);
-                    await LokiCoroutine.Sleep(10);
-                    LokiPoe.ProcessHookManager.SetKeyState(
-                        System.Windows.Forms.Keys.ControlKey,
-                        short.MinValue,
-                        System.Windows.Forms.Keys.None);
-                    controlDown = true;
-                    await LokiCoroutine.Sleep(15);
-                    DreamPoeBot.BotFramework.MouseManager.ClickRMB(0, 0);
-                    await LokiCoroutine.Sleep(45);
-                }
-                finally
-                {
-                    if (controlDown)
-                    {
-                        LokiPoe.ProcessHookManager.SetKeyState(
-                            System.Windows.Forms.Keys.ControlKey,
-                            (short)0,
-                            System.Windows.Forms.Keys.None);
-                    }
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                }
-                return true;
+                await LokiCoroutine.Sleep(45);
+                return input.InputSent;
             }
             catch (Exception ex)
             {
