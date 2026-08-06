@@ -25,6 +25,7 @@ introduced.
 | --- | --- | --- |
 | DPB bot contracts | `IBot`, `IPlayerMover`, task manager and lifecycle | Host and mover classes |
 | `LokiPoe` | Game state, objects, inventory, UI, input and process hook | Context, tasks and adapters |
+| Native DPB feature APIs | Semantic travel, Capsule, Loot, Bottle, Chart Device, Voyage and Deepwater state | `DpbNativeApi.cs` and native feature adapters |
 | `ExilePather` / `AreaGraphs` | Path and topology queries | Mover and planners |
 | `Element` tree | Stable DPB UI discovery and interaction | UI adapter region |
 | GDI screenshot APIs | Visual fallback matching | UI fallback region |

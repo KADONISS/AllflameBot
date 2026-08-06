@@ -73,6 +73,14 @@ namespace AllflameBot
         public bool TransferAtVoyageSectorBoundaries { get; set; }
         public bool AlwaysSendBeforeVoyageExtraction { get; set; }
         public bool CallBathysphereWhenLanternsEmpty { get; set; }
+        public bool UseNativeSovereignTravel { get; set; }
+        public bool UseNativeCapsuleActions { get; set; }
+        public bool UseNativeLootUi { get; set; }
+        public bool UseNativeBottleReveal { get; set; }
+        public bool UseNativeChartDevice { get; set; }
+        public bool UseNativeDeepwaterCounters { get; set; }
+        public bool UseNativeVoyagePlannerRead { get; set; }
+        public bool UseNativeVoyagePlannerActions { get; set; }
 
         public bool OpenSunkenLoot { get; set; }
         public bool OpenSunkenOpulence { get; set; }
@@ -219,7 +227,7 @@ namespace AllflameBot
             {
                 ApplyRecommendedDefaults();
             }
-            else if (SettingsSchemaVersion < 42)
+            else if (SettingsSchemaVersion < 43)
             {
                 int oldSchema = SettingsSchemaVersion;
                 if (oldSchema < 3)
@@ -412,7 +420,20 @@ namespace AllflameBot
                 {
                     EnableVoyageTerrainPlanner = true;
                 }
-                SettingsSchemaVersion = 42;
+                if (oldSchema < 43)
+                {
+                    UseNativeSovereignTravel = true;
+                    UseNativeCapsuleActions = true;
+                    UseNativeLootUi = true;
+                    UseNativeBottleReveal = true;
+                    UseNativeChartDevice = true;
+                    UseNativeDeepwaterCounters = true;
+                    UseNativeVoyagePlannerRead = true;
+                    // Planner actions remain opt-in until runtime shadow
+                    // evidence proves the board semantics for this DPB build.
+                    UseNativeVoyagePlannerActions = false;
+                }
+                SettingsSchemaVersion = 43;
                 Save();
             }
         }
@@ -657,6 +678,14 @@ namespace AllflameBot
             ChartsRequiredForVoyage = 9;
             StartVoyageWhenReady = false;
             ApplyVoyageRunnerDefaults();
+            UseNativeSovereignTravel = true;
+            UseNativeCapsuleActions = true;
+            UseNativeLootUi = true;
+            UseNativeBottleReveal = true;
+            UseNativeChartDevice = true;
+            UseNativeDeepwaterCounters = true;
+            UseNativeVoyagePlannerRead = true;
+            UseNativeVoyagePlannerActions = false;
 
             OpenSunkenLoot = true;
             OpenSunkenOpulence = true;

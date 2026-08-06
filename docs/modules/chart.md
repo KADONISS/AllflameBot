@@ -20,6 +20,7 @@ Chart settings are in [`AllflameSettings.cs`](../../AllflameSettings.cs).
 - Immutable spawn and exploration progress.
 - Terrain/topology/hybrid target selection.
 - Lantern and chest handoff priorities.
+- Native Chart Device state reads with stable UI fallback.
 
 ## Required checks
 

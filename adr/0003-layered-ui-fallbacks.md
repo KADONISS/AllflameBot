@@ -6,13 +6,16 @@
 
 ## Context
 
-DPB UI exposure can vary by client state. The plugin uses Element/native paths
-and visual or coordinate fallbacks for several interactions.
+DPB UI exposure can vary by client state. The plugin uses native semantic APIs,
+Element paths and visual or coordinate fallbacks for several interactions.
 
 ## Decision
 
-Use validated Element/native controls first, scoped coordinate input second and
-visual matching last. Confirm the resulting state on a fresh observation cycle.
+Use a validated native semantic action first when it is available and its
+postcondition is known. Otherwise use validated Element controls, scoped
+coordinate input and visual matching in that order. Confirm the resulting state
+on a fresh observation cycle. Voyage Planner native actions remain opt-in until
+shadow snapshots agree across consecutive cycles.
 
 ## Consequences
 

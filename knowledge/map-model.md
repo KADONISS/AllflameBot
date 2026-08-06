@@ -23,6 +23,8 @@ Update when DPB terrain APIs, coordinate transforms or planner ownership change.
 - `DeepwaterVoyageUi.VoyageMap` is the Voyage Planner board, not world terrain.
 - Voyage terrain uses the same DPB terrain/pathfinding family as Chart terrain,
   but its planner currently remains a rolling frontier implementation.
+- Native Voyage Planner board fields are shadow diagnostics; stable Element slot
+  occupancy remains authoritative until consecutive snapshots agree.
 
 ## Coordinate warning
 

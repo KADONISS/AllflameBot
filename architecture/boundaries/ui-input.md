@@ -20,10 +20,16 @@ Update when a UI adapter, fallback order or input method changes.
 
 ## Adapter order
 
-1. Stable DPB `Element` nodes when exposed and validated.
-2. Native DPB control or inventory APIs when available.
+1. Validated native DPB control/action APIs for semantic state changes that
+   must work while the client process is covered.
+2. Stable DPB `Element` nodes when a native action is unavailable or its
+   postcondition is not yet trusted.
 3. Scoped coordinate input derived from the current window/control.
 4. Screenshot or text fallback with a fresh visual confirmation.
+
+Native Voyage Planner reads may run in shadow mode while Element remains the
+authoritative planner snapshot. Native board actions stay opt-in until the
+native and stable snapshots agree across fresh consecutive observations.
 
 Every action must release held input and identify its verification mode in the
 log. A visual match is evidence of a visible control, not proof that the game

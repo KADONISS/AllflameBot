@@ -17,6 +17,7 @@ Voyage tasks, `VoyagePlanningUi`, `VoyageRunState` and voyage planners are in
 ## Owns
 
 - Voyage planning UI and chart placement verification.
+- Native Voyage Planner shadow reads and opt-in action canary.
 - Voyage spawn, capsule anchors, lantern coverage and sector progress.
 - Bathysphere call/wait/extraction handoff.
 - Surface transfer and return-to-hub state.
@@ -25,3 +26,5 @@ Voyage tasks, `VoyagePlanningUi`, `VoyageRunState` and voyage planners are in
 
 Verify one input action per cycle where required, fresh UI snapshots, inventory
 delta, board slot postconditions, capsule priority and non-terminal recovery.
+Native planner actions require consecutive agreement with the stable Element
+snapshot; otherwise retain the stable Element/visual fallback.

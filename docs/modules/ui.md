@@ -17,10 +17,12 @@ UI adapters are in [`AllflameBot.cs`](../../AllflameBot.cs); WPF settings UI is 
 ## Owns
 
 - UI discovery and stable element resolution.
+- Native DPB semantic controls for process-covered actions.
 - Input dispatch and held-input cleanup.
 - Postcondition snapshot and fallback mode logging.
 
 ## Required checks
 
-Use the narrowest valid control scope, avoid global text clicks when an element
-exists, verify the next state, and retain visual fallback only as a final path.
+Use a validated native semantic action when available, then the narrowest valid
+Element control; avoid global text clicks, verify the next state, and retain
+visual fallback only as a final path.

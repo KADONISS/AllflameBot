@@ -20,9 +20,11 @@ Price/filter support is in [`AllflamePrices.cs`](../../AllflamePrices.cs) and
 - Chest priority and open-session debt.
 - Ground-item acceptance/rejection and pickup verification.
 - Inventory capacity, surface loot and stash handoff.
+- Native Allflame Loot UI state with filtered reward transfer.
 
 ## Required checks
 
 Preserve safety/capsule/extraction priority, verify inventory deltas, account for
 Message in a Bottle cursor behavior and avoid declaring completion from a stale
-inventory snapshot.
+inventory snapshot. Do not replace filtered `FastMoveReward()` with native
+`TakeAll()`.

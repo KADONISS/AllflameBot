@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.153";
+        public const string Current = "0.23.154";
     }
 
     public sealed class AllflameBot : IBot
@@ -63,6 +63,7 @@ namespace AllflameBot
             AllflameLog.Initialize();
             AllflameSettings.LogStorageStatus();
             AllflamePrices.Initialize();
+            DpbNativeApi.LogCapabilities();
             AllflameLog.Info(
                 "BOT_INITIALIZE|Version=" + Version +
                 "|Mode=Active");
@@ -744,6 +745,8 @@ namespace AllflameBot
         public static float NearestPlacedLanternDistance { get; private set; }
         public static int LanternCounterCurrent { get; private set; }
         public static int LanternCounterMaximum { get; private set; }
+        public static int CollectedSulphur { get; private set; }
+        public static bool DeepwaterCountersNativeAvailable { get; private set; }
         public static int TargetableDeepwaterChests { get; private set; }
         public static int SelectedTargetableChests { get; private set; }
         public static int TargetableMonsters { get; private set; }
@@ -821,6 +824,10 @@ namespace AllflameBot
                 InventoryFreeSquares = -1;
                 InventoryItemCount = 0;
                 InventoryChartCount = 0;
+                LanternCounterCurrent = -1;
+                LanternCounterMaximum = -1;
+                CollectedSulphur = -1;
+                DeepwaterCountersNativeAvailable = false;
                 ChartStorageItemCount = 0;
                 ChartStorageStackCount = 0;
                 ChartStorageSummary = String.Empty;
@@ -1013,6 +1020,34 @@ namespace AllflameBot
                             AllflameAreaTransitionGuard.Pending);
                     }
                     SnapshotLanternCounter(visibleUiText);
+                    SnapshotNativeDeepwaterCounters();
+
+                    DpbCapsuleSnapshot nativeCapsule;
+                    string nativeCapsuleReason;
+                    if (AllflameSettings.Instance.UseNativeCapsuleActions &&
+                        capsuleDirectScanAllowed &&
+                        DpbNativeApi.TryCaptureCapsule(
+                            out nativeCapsule,
+                            out nativeCapsuleReason))
+                    {
+                        CapsuleUiVisible = nativeCapsule.IsOpened;
+                        CallBathysphereVisible =
+                            nativeCapsule.IsOpened &&
+                            nativeCapsule.CallBathysphereEnabled;
+                        SendToSurfaceVisible =
+                            nativeCapsule.IsOpened &&
+                            nativeCapsule.SendToSurfaceEnabled;
+                        AllflameLog.Throttled(
+                            "capsule_native_snapshot",
+                            TimeSpan.FromSeconds(2),
+                            "CAPSULE_NATIVE_SNAPSHOT" +
+                            "|Opened=" + nativeCapsule.IsOpened +
+                            "|SendEnabled=" +
+                            nativeCapsule.SendToSurfaceEnabled +
+                            "|CallEnabled=" +
+                            nativeCapsule.CallBathysphereEnabled +
+                            "|Reason=" + nativeCapsuleReason);
+                    }
 
                     bool isVoyage = String.Equals(
                         AreaId,
@@ -1225,6 +1260,8 @@ namespace AllflameBot
                 IsPotentiallyStuck) +
                 "|InventoryCharts=" + InventoryChartCount +
                 "|LanternCounter=" + LanternCounterCurrent + "/" + LanternCounterMaximum +
+                "|Sulphur=" + CollectedSulphur +
+                "|CountersNative=" + DeepwaterCountersNativeAvailable +
                 "|StorageSnapshot=" + Safe(AllflameSettings.Instance.LastChartStorageScan);
         }
 
@@ -1300,6 +1337,70 @@ namespace AllflameBot
                     return;
                 }
             }
+        }
+
+        private static void SnapshotNativeDeepwaterCounters()
+        {
+            CollectedSulphur = -1;
+            DeepwaterCountersNativeAvailable = false;
+            if (!AllflameSettings.Instance.UseNativeDeepwaterCounters ||
+                !(String.Equals(
+                    AreaId,
+                    "DeepwaterEncounter",
+                    StringComparison.OrdinalIgnoreCase) ||
+                  String.Equals(
+                    AreaId,
+                    "DeepwaterEncounterVoyage",
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+
+            int textCurrent = LanternCounterCurrent;
+            int textMaximum = LanternCounterMaximum;
+            DpbDeepwaterCounterSnapshot nativeSnapshot;
+            string reason;
+            if (!DpbNativeApi.TryCaptureDeepwaterCounters(
+                    out nativeSnapshot,
+                    out reason))
+            {
+                AllflameLog.Throttled(
+                    "deepwater_counter_native_unavailable",
+                    TimeSpan.FromSeconds(5),
+                    "DEEPWATER_COUNTER_SOURCE" +
+                    "|Source=TextFallback" +
+                    "|Native=False" +
+                    "|Reason=" + reason);
+                return;
+            }
+
+            LanternCounterCurrent = nativeSnapshot.RemainingLanterns;
+            LanternCounterMaximum = nativeSnapshot.MaxLanterns;
+            CollectedSulphur = nativeSnapshot.CollectedSulphur;
+            DeepwaterCountersNativeAvailable =
+                nativeSnapshot.MaxLanterns >= 0 &&
+                nativeSnapshot.RemainingLanterns >= 0;
+            if (textCurrent >= 0 &&
+                textMaximum > 0 &&
+                (textCurrent != LanternCounterCurrent ||
+                 textMaximum != LanternCounterMaximum))
+            {
+                AllflameLog.Info(
+                    "DEEPWATER_COUNTER_MISMATCH" +
+                    "|Text=" + textCurrent + "/" + textMaximum +
+                    "|Native=" + LanternCounterCurrent + "/" +
+                    LanternCounterMaximum +
+                    "|Action=UseNativeSource");
+            }
+            AllflameLog.Throttled(
+                "deepwater_counter_native",
+                TimeSpan.FromSeconds(2),
+                "DEEPWATER_COUNTER_SOURCE" +
+                "|Source=Native" +
+                "|Native=True" +
+                "|Current=" + LanternCounterCurrent +
+                "|Maximum=" + LanternCounterMaximum +
+                "|Sulphur=" + CollectedSulphur);
         }
 
         private static void SnapshotChartStorageStats(IEnumerable<string> visibleUiText)
@@ -1725,6 +1826,8 @@ namespace AllflameBot
             NearestPlacedLanternDistance = -1f;
             LanternCounterCurrent = -1;
             LanternCounterMaximum = -1;
+            CollectedSulphur = -1;
+            DeepwaterCountersNativeAvailable = false;
             TargetableDeepwaterChests = 0;
             SelectedTargetableChests = 0;
             TargetableMonsters = 0;
@@ -8194,6 +8297,7 @@ namespace AllflameBot
     internal sealed class TravelToSovereignTask : ObserverTask
     {
         private DateTime _nextBoatUtc = DateTime.MinValue;
+        private bool _nativeTravelPending;
 
         public TravelToSovereignTask()
             : base("TravelToSovereignTask", "Uses /boat to travel to The Sovereign.") { }
@@ -8202,6 +8306,7 @@ namespace AllflameBot
         {
             if (AllflameContext.Phase != AllflamePhase.OutsideContent)
             {
+                _nativeTravelPending = false;
                 return false;
             }
 
@@ -8211,6 +8316,48 @@ namespace AllflameBot
             }
 
             _nextBoatUtc = DateTime.UtcNow.AddSeconds(8);
+
+            if (AllflameSettings.Instance.UseNativeSovereignTravel)
+            {
+                if (_nativeTravelPending)
+                {
+                    _nativeTravelPending = false;
+                    AllflameLog.Info(
+                        "ACTION|Task=" + Name +
+                        "|Action=GoToTheSovereign" +
+                        "|Mode=Native" +
+                        "|InputSent=True" +
+                        "|Postcondition=False" +
+                        "|Fallback=Chat" +
+                        "|Reason=AreaDidNotChangeWithin8Seconds");
+                }
+                else
+                {
+                    DpbActionResult nativeResult =
+                        DpbNativeApi.GoToTheSovereign();
+                    AllflameLog.Info(
+                        "ACTION|Task=" + Name +
+                        "|Action=GoToTheSovereign" +
+                        "|Mode=" + nativeResult.Mode +
+                        "|InputSent=" + nativeResult.InputSent +
+                        "|Postcondition=" +
+                        nativeResult.PostconditionVerified +
+                        "|Reason=" + nativeResult.Reason +
+                        "|Exception=" + nativeResult.Exception);
+                    if (nativeResult.InputSent)
+                    {
+                        _nativeTravelPending = true;
+                        AllflameRunState.RequireBoatStaging();
+                        return true;
+                    }
+                    AllflameLog.Info(
+                        "UI_FALLBACK|Task=" + Name +
+                        "|From=Native" +
+                        "|To=Chat" +
+                        "|Reason=" + nativeResult.Reason);
+                }
+            }
+
             if (!LokiPoe.ProcessHookManager.IsEnabled)
             {
                 LokiPoe.ProcessHookManager.Enable();
@@ -9987,6 +10134,16 @@ namespace AllflameBot
         private int _stablePlacementConfirmed;
         private int _stablePlacementFailures;
         private DateTime _stablePlacementIssuedUtc = DateTime.MinValue;
+        private int _nativePlannerShadowMatches;
+        private bool _nativeClearPending;
+        private bool _nativeClearFallbackUsed;
+        private DateTime _nativeClearIssuedUtc = DateTime.MinValue;
+        private bool _nativeBeginPending;
+        private bool _nativeBeginFallbackUsed;
+        private DateTime _nativeBeginIssuedUtc = DateTime.MinValue;
+
+        private static readonly TimeSpan NativePlannerConfirmationTimeout =
+            TimeSpan.FromSeconds(4);
 
         public PrepareVoyageTask()
             : base(
@@ -10007,6 +10164,8 @@ namespace AllflameBot
             _chartDetectionAttempts = 0;
             _lastInsufficientChartCount = -1;
             _stableInsufficientChartSnapshots = 0;
+            _nativePlannerShadowMatches = 0;
+            ResetNativePlannerActionState();
         }
 
         public override void Stop()
@@ -10023,10 +10182,60 @@ namespace AllflameBot
             _chartDetectionAttempts = 0;
             _lastInsufficientChartCount = -1;
             _stableInsufficientChartSnapshots = 0;
+            _nativePlannerShadowMatches = 0;
+            ResetNativePlannerActionState();
         }
 
         public override async Task<bool> Run()
         {
+            if (_nativeBeginPending)
+            {
+                if (AllflameContext.IsVoyageMapArea)
+                {
+                    _nativeBeginPending = false;
+                    AllflameRunState.MarkVoyageStarted();
+                    ResetStablePlacement();
+                    _stage = 0;
+                    _planningReadyAtOpen = false;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(500);
+                    AllflameProgressWatchdog.MarkProgress(
+                        "NativeVoyageStarted");
+                    AllflameLog.Info(
+                        "VOYAGE_BEGIN_POSTCONDITION" +
+                        "|Mode=Native" +
+                        "|Postcondition=True" +
+                        "|AreaId=" + AllflameContext.AreaId +
+                        "|AreaHash=" + AllflameContext.AreaHash +
+                        "|Action=StartVoyageRunner");
+                    return false;
+                }
+
+                if (DateTime.UtcNow - _nativeBeginIssuedUtc <
+                    NativePlannerConfirmationTimeout)
+                {
+                    AllflameLog.Throttled(
+                        "voyage_native_begin_pending",
+                        TimeSpan.FromSeconds(1),
+                        "VOYAGE_BEGIN_PENDING" +
+                        "|Mode=Native" +
+                        "|Postcondition=False" +
+                        "|Reason=AwaitVoyageAreaTransition");
+                    return true;
+                }
+
+                _nativeBeginPending = false;
+                _nativeBeginFallbackUsed = true;
+                _retryAfterUtc = DateTime.MinValue;
+                AllflameLog.Info(
+                    "VOYAGE_BEGIN_POSTCONDITION" +
+                    "|Mode=Native" +
+                    "|Postcondition=False" +
+                    "|Reason=VoyageAreaTransitionTimeout" +
+                    "|Fallback=StableElement");
+                return true;
+            }
+
             AllflameSettings settings = AllflameSettings.Instance;
             bool enabled =
                 settings.AutoPlanVoyage ||
@@ -10048,7 +10257,59 @@ namespace AllflameBot
                 _chartDetectionAttempts = 0;
                 _lastInsufficientChartCount = -1;
                 _stableInsufficientChartSnapshots = 0;
+                ResetNativePlannerActionState();
                 return false;
+            }
+
+            if (_nativeClearPending)
+            {
+                if (DateTime.UtcNow < _retryAfterUtc)
+                {
+                    return true;
+                }
+
+                VoyagePlanningUi.StableVoyageSnapshot clearVerification;
+                if (VoyagePlanningUi.TryResolveStable(
+                        out clearVerification) &&
+                    clearVerification.BoardChartCount == 0)
+                {
+                    _nativeClearPending = false;
+                    _stage = 1;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(250);
+                    AllflameLog.Info(
+                        "VOYAGE_CLEAR_BOARD_POSTCONDITION" +
+                        "|Mode=Native" +
+                        "|Postcondition=True" +
+                        "|BoardAfter=0" +
+                        "|Fallback=None");
+                    return true;
+                }
+
+                if (DateTime.UtcNow - _nativeClearIssuedUtc <
+                    NativePlannerConfirmationTimeout)
+                {
+                    AllflameLog.Throttled(
+                        "voyage_native_clear_pending",
+                        TimeSpan.FromSeconds(1),
+                        "VOYAGE_CLEAR_BOARD_PENDING" +
+                        "|Mode=Native" +
+                        "|Postcondition=False" +
+                        "|Reason=AwaitStableBoardSnapshot");
+                    return true;
+                }
+
+                _nativeClearPending = false;
+                _nativeClearFallbackUsed = true;
+                _stage = 0;
+                _retryAfterUtc = DateTime.MinValue;
+                AllflameLog.Info(
+                    "VOYAGE_CLEAR_BOARD_POSTCONDITION" +
+                    "|Mode=Native" +
+                    "|Postcondition=False" +
+                    "|Reason=StableBoardSnapshotTimeout" +
+                    "|Fallback=StableElement");
+                return true;
             }
 
             if (AllflameRunState.VoyageStarted)
@@ -10125,6 +10386,7 @@ namespace AllflameBot
                 nativeVoyageOpen ||
                 (visualScanArmed &&
                  VoyagePlanningUi.IsOpen());
+
             if (voyageOpen)
             {
                 ResetValerieApproachRecovery(0, "VoyageUiOpened");
@@ -10357,6 +10619,41 @@ namespace AllflameBot
                 if (VoyagePlanningUi.TryResolveStable(
                         out stableClear))
                 {
+                    LogNativeVoyagePlannerShadow(stableClear);
+                    if (NativeVoyageActionsEligible(stableClear) &&
+                        !_nativeClearFallbackUsed)
+                    {
+                        string nativeClearReason;
+                        bool nativeCleared =
+                            NativeDeepwaterVoyageUi.TryClearBoard(
+                                out nativeClearReason);
+                        AllflameLog.Info(
+                            "VOYAGE_CLEAR_BOARD" +
+                            "|Mode=Native" +
+                            "|InputSent=" + nativeCleared +
+                            "|Postcondition=False" +
+                            "|Reason=" + nativeClearReason +
+                            "|AvailableBefore=" +
+                            stableClear.AvailableChartSlots.Count +
+                            "|BoardBefore=" +
+                            stableClear.BoardChartCount);
+                        if (nativeCleared)
+                        {
+                            _nativeClearPending = true;
+                            _nativeClearIssuedUtc = DateTime.UtcNow;
+                            _stage = 1;
+                            _retryAfterUtc =
+                                DateTime.UtcNow.AddMilliseconds(150);
+                            return true;
+                        }
+                        _nativeClearFallbackUsed = true;
+                        AllflameLog.Info(
+                            "UI_FALLBACK" +
+                            "|Task=" + Name +
+                            "|From=Native" +
+                            "|To=StableElement" +
+                            "|Reason=" + nativeClearReason);
+                    }
                     AllflameLog.Throttled(
                         "voyage_element_clear",
                         TimeSpan.FromSeconds(2),
@@ -10523,6 +10820,7 @@ namespace AllflameBot
             if (VoyagePlanningUi.TryResolveStable(
                     out stableSnapshot))
             {
+                LogNativeVoyagePlannerShadow(stableSnapshot);
                 AllflameLog.Throttled(
                     "voyage_element_primary",
                     TimeSpan.FromSeconds(2),
@@ -10759,6 +11057,75 @@ namespace AllflameBot
                 snapshot);
         }
 
+        private void LogNativeVoyagePlannerShadow(
+            VoyagePlanningUi.StableVoyageSnapshot stableSnapshot)
+        {
+            if (!AllflameSettings.Instance.UseNativeVoyagePlannerRead ||
+                stableSnapshot == null)
+            {
+                _nativePlannerShadowMatches = 0;
+                return;
+            }
+
+            DeepwaterVoyageSnapshot nativeSnapshot;
+            if (!NativeDeepwaterVoyageUi.TryCapture(
+                    out nativeSnapshot) ||
+                nativeSnapshot == null)
+            {
+                _nativePlannerShadowMatches = 0;
+                return;
+            }
+
+            bool openedMatch = nativeSnapshot.IsOpened;
+            bool availableMatch =
+                nativeSnapshot.AvailableChartCount ==
+                stableSnapshot.AvailableChartSlots.Count;
+            bool boardCountMatch =
+                nativeSnapshot.BoardChartCount ==
+                stableSnapshot.BoardChartCount;
+            bool boardSlotsMatch =
+                nativeSnapshot.BoardSlotCount ==
+                stableSnapshot.BoardSlotCount;
+            bool match = openedMatch &&
+                availableMatch &&
+                boardCountMatch &&
+                boardSlotsMatch;
+            _nativePlannerShadowMatches = match
+                ? Math.Min(3, _nativePlannerShadowMatches + 1)
+                : 0;
+            AllflameLog.Info(
+                "VOYAGE_PLANNER_SHADOW" +
+                "|NativeOpened=" + nativeSnapshot.IsOpened +
+                "|StableOpened=True" +
+                "|NativeAvailable=" +
+                nativeSnapshot.AvailableChartCount +
+                "|StableAvailable=" +
+                stableSnapshot.AvailableChartSlots.Count +
+                "|NativeBoard=" + nativeSnapshot.BoardChartCount +
+                "|StableBoard=" + stableSnapshot.BoardChartCount +
+                "|NativeBoardSlots=" +
+                nativeSnapshot.BoardSlotCount +
+                "|StableBoardSlots=" +
+                stableSnapshot.BoardSlotCount +
+                "|Match=" + match +
+                "|ConsecutiveMatches=" +
+                _nativePlannerShadowMatches +
+                "|NativeActionsEligible=" +
+                (_nativePlannerShadowMatches >= 2));
+        }
+
+        private bool NativeVoyageActionsEligible(
+            VoyagePlanningUi.StableVoyageSnapshot stableSnapshot)
+        {
+            if (!AllflameSettings.Instance.UseNativeVoyagePlannerActions ||
+                stableSnapshot == null ||
+                !AllflameSettings.Instance.UseNativeVoyagePlannerRead)
+            {
+                return false;
+            }
+            return _nativePlannerShadowMatches >= 2;
+        }
+
         private Task<bool> RunStableVoyagePlanner(
             AllflameSettings settings,
             VoyagePlanningUi.StableVoyageSnapshot snapshot)
@@ -10936,6 +11303,37 @@ namespace AllflameBot
                     _manualReady = true;
                     return true;
                 }
+                if (NativeVoyageActionsEligible(snapshot) &&
+                    !_nativeBeginFallbackUsed)
+                {
+                    string nativeBeginReason;
+                    bool nativeBeginSent =
+                        NativeDeepwaterVoyageUi.TryBeginVoyage(
+                            out nativeBeginReason);
+                    AllflameLog.Info(
+                        "VOYAGE_BEGIN" +
+                        "|Mode=Native" +
+                        "|InputSent=" + nativeBeginSent +
+                        "|Postcondition=False" +
+                        "|BoardCharts=" + board +
+                        "|Reason=" + nativeBeginReason +
+                        "|OneActionPerCycle=True");
+                    if (nativeBeginSent)
+                    {
+                        _nativeBeginPending = true;
+                        _nativeBeginIssuedUtc = DateTime.UtcNow;
+                        _retryAfterUtc =
+                            DateTime.UtcNow.AddMilliseconds(150);
+                        return true;
+                    }
+                    _nativeBeginFallbackUsed = true;
+                    AllflameLog.Info(
+                        "UI_FALLBACK" +
+                        "|Task=" + Name +
+                        "|From=Native" +
+                        "|To=StableElement" +
+                        "|Reason=" + nativeBeginReason);
+                }
                 bool clicked = VoyagePlanningUi.ClickStableElement(
                     snapshot.BeginVoyageButton,
                     "BeginVoyage");
@@ -10981,6 +11379,40 @@ namespace AllflameBot
 
             _stablePlacementBeforeAvailable = available;
             _stablePlacementBeforeBoard = board;
+            if (NativeVoyageActionsEligible(snapshot))
+            {
+                FastMoveResult nativeMoveResult;
+                string nativeMoveReason;
+                bool nativeInputSent =
+                    NativeDeepwaterVoyageUi.TryFastMoveFirstChart(
+                        out nativeMoveResult,
+                        out nativeMoveReason);
+                AllflameLog.Info(
+                    "VOYAGE_CHART_MOVE_ISSUED" +
+                    "|Mode=Native" +
+                    "|Placement=" +
+                    (_stablePlacementConfirmed + 1) + "/9" +
+                    "|BeforeAvailable=" + available +
+                    "|BeforeBoard=" + board +
+                    "|InputSent=" + nativeInputSent +
+                    "|FastMoveResult=" + nativeMoveResult +
+                    "|Reason=" + nativeMoveReason +
+                    "|OneActionPerCycle=True");
+                if (nativeInputSent)
+                {
+                    _stablePlacementIssuedUtc = DateTime.UtcNow;
+                    _stablePlacementAwaitingVerification = true;
+                    _retryAfterUtc =
+                        DateTime.UtcNow.AddMilliseconds(90);
+                    return true;
+                }
+                AllflameLog.Info(
+                    "UI_FALLBACK" +
+                    "|Task=" + Name +
+                    "|From=Native" +
+                    "|To=StableElement" +
+                    "|Reason=" + nativeMoveReason);
+            }
             bool inputSent =
                 await VoyagePlanningUi.CtrlClickStableChartSlot(
                     snapshot,
@@ -11026,6 +11458,16 @@ namespace AllflameBot
             _stablePlacementConfirmed = 0;
             _stablePlacementFailures = 0;
             _stablePlacementIssuedUtc = DateTime.MinValue;
+        }
+
+        private void ResetNativePlannerActionState()
+        {
+            _nativeClearPending = false;
+            _nativeClearFallbackUsed = false;
+            _nativeClearIssuedUtc = DateTime.MinValue;
+            _nativeBeginPending = false;
+            _nativeBeginFallbackUsed = false;
+            _nativeBeginIssuedUtc = DateTime.MinValue;
         }
 
         private async Task<bool> RunIncrementalVisualVoyagePlanner(
@@ -19637,6 +20079,10 @@ namespace AllflameBot
             out DeepwaterVoyageSnapshot snapshot)
         {
             snapshot = null;
+            if (!AllflameSettings.Instance.UseNativeVoyagePlannerRead)
+            {
+                return false;
+            }
             try
             {
                 bool isOpened =
@@ -19663,7 +20109,9 @@ namespace AllflameBot
                             try
                             {
                                 var item = control.Item;
-                                if (item != null && item.IsValid)
+                                if (item != null &&
+                                    item.IsValid &&
+                                    AllflameContext.IsChartItem(item))
                                 {
                                     availableCharts++;
                                 }
@@ -19742,6 +20190,101 @@ namespace AllflameBot
                 return false;
             }
         }
+
+        public static bool TryClearBoard(out string reason)
+        {
+            reason = "Unavailable";
+            try
+            {
+                if (!LokiPoe.InGameState.DeepwaterVoyageUi.IsOpened)
+                {
+                    reason = "PanelClosed";
+                    return false;
+                }
+                LokiPoe.InGameState.DeepwaterVoyageUi.ClearBoard();
+                reason = "Invoked";
+                return true;
+            }
+            catch (Exception exception)
+            {
+                reason = exception.GetType().Name;
+                return false;
+            }
+        }
+
+        public static bool TryBeginVoyage(out string reason)
+        {
+            reason = "Unavailable";
+            try
+            {
+                if (!LokiPoe.InGameState.DeepwaterVoyageUi.IsOpened)
+                {
+                    reason = "PanelClosed";
+                    return false;
+                }
+                if (!LokiPoe.InGameState.DeepwaterVoyageUi
+                        .IsBeginVoyageEnabled)
+                {
+                    reason = "ButtonDisabled";
+                    return false;
+                }
+                LokiPoe.InGameState.DeepwaterVoyageUi.BeginVoyage();
+                reason = "Invoked";
+                return true;
+            }
+            catch (Exception exception)
+            {
+                reason = exception.GetType().Name;
+                return false;
+            }
+        }
+
+        public static bool TryFastMoveFirstChart(
+            out FastMoveResult result,
+            out string reason)
+        {
+            result = FastMoveResult.Failed;
+            reason = "Unavailable";
+            try
+            {
+                if (!LokiPoe.InGameState.DeepwaterVoyageUi.IsOpened)
+                {
+                    reason = "PanelClosed";
+                    return false;
+                }
+                var inventory =
+                    LokiPoe.InGameState.DeepwaterVoyageUi.ChartsInventory;
+                if (inventory == null)
+                {
+                    reason = "InventoryNull";
+                    return false;
+                }
+                foreach (var control in inventory)
+                {
+                    if (control == null)
+                    {
+                        continue;
+                    }
+                    var item = control.Item;
+                    if (item == null ||
+                        !item.IsValid ||
+                        !AllflameContext.IsChartItem(item))
+                    {
+                        continue;
+                    }
+                    result = control.FastMove();
+                    reason = result.ToString();
+                    return result == FastMoveResult.None;
+                }
+                reason = "NoChart";
+                return false;
+            }
+            catch (Exception exception)
+            {
+                reason = exception.GetType().Name;
+                return false;
+            }
+        }
     }
 
     internal static class NativeDeepwaterChartDeviceUi
@@ -19750,6 +20293,10 @@ namespace AllflameBot
         {
             get
             {
+                if (!AllflameSettings.Instance.UseNativeChartDevice)
+                {
+                    return false;
+                }
                 try
                 {
                     return LokiPoe.InGameState.DeepwaterChartUi.IsOpened;
@@ -19766,6 +20313,10 @@ namespace AllflameBot
         {
             get
             {
+                if (!AllflameSettings.Instance.UseNativeChartDevice)
+                {
+                    return new List<Item>();
+                }
                 try
                 {
                     InventoryControlWrapper control =
@@ -19792,6 +20343,10 @@ namespace AllflameBot
         {
             get
             {
+                if (!AllflameSettings.Instance.UseNativeChartDevice)
+                {
+                    return false;
+                }
                 try
                 {
                     return LokiPoe.InGameState.DeepwaterChartUi
@@ -19807,6 +20362,10 @@ namespace AllflameBot
 
         public static bool Descend()
         {
+            if (!AllflameSettings.Instance.UseNativeChartDevice)
+            {
+                return false;
+            }
             try
             {
                 return LokiPoe.InGameState.DeepwaterChartUi.Descend();
@@ -28072,8 +28631,12 @@ namespace AllflameBot
         private int _capsuleHardFailsafeCycles;
         private int _sendAttempts;
         private int _sendRecoveryCycles;
+        private bool _nativeSendAttempted;
+        private bool _nativeSendFallbackArmed;
         private int _callAttempts;
         private int _callRecoveryCycles;
+        private bool _nativeCallAttempted;
+        private bool _nativeCallFallbackArmed;
         private DateTime _sendButtonMissingUtc = DateTime.MinValue;
         private DateTime _callButtonMissingUtc = DateTime.MinValue;
         private bool _hasConfirmedCapsuleAnchor;
@@ -28245,6 +28808,10 @@ namespace AllflameBot
         public override void Start()
         {
             ClearPendingTransfer();
+            _nativeSendAttempted = false;
+            _nativeSendFallbackArmed = false;
+            _nativeCallAttempted = false;
+            _nativeCallFallbackArmed = false;
             ResetZeroLanternRescue("TaskStart");
             ResetCapsuleReturnChain("TaskStart");
         }
@@ -28252,6 +28819,10 @@ namespace AllflameBot
         public override void Stop()
         {
             ClearPendingTransfer();
+            _nativeSendAttempted = false;
+            _nativeSendFallbackArmed = false;
+            _nativeCallAttempted = false;
+            _nativeCallFallbackArmed = false;
             ResetZeroLanternRescue("TaskStop");
             ResetCapsuleReturnChain("TaskStop");
             AllflameProgressWatchdog.Clear();
@@ -29324,6 +29895,79 @@ namespace AllflameBot
                 !_surfaceSentForRequest;
             if (sendRequired)
             {
+                if (AllflameSettings.Instance.UseNativeCapsuleActions &&
+                    !_nativeSendAttempted)
+                {
+                    _nativeSendAttempted = true;
+                    DpbActionResult nativeSend =
+                        DpbNativeApi.SendToSurface();
+                    bool nativeAcknowledged = false;
+                    string nativeConfirmation = "None";
+                    if (nativeSend.InputSent)
+                    {
+                        await LokiCoroutine.Sleep(350);
+                        AllflameContext.Refresh(true);
+                        nativeAcknowledged =
+                            TryConfirmNativeCapsuleSend(
+                                out nativeConfirmation);
+                        nativeSend.PostconditionVerified =
+                            nativeAcknowledged;
+                    }
+                    AllflameLog.Info(
+                        "CAPSULE_NATIVE_ACTION" +
+                        "|Action=SendToSurface" +
+                        "|InputSent=" + nativeSend.InputSent +
+                        "|Postcondition=" + nativeAcknowledged +
+                        "|Confirmation=" + nativeConfirmation +
+                        "|Reason=" + nativeSend.Reason +
+                        "|Exception=" + nativeSend.Exception);
+                    if (nativeAcknowledged)
+                    {
+                        _surfaceSentForRequest = true;
+                        _batchHadItems = false;
+                        _sendRecoveryCycles = 0;
+                        VoyageRunState.MarkSurfaceSent();
+                        AllflameVoyageDebug.CompleteSendToSurface(
+                            "NativeAcknowledged:" + nativeConfirmation);
+                        if (!extractionRequired)
+                        {
+                            await Coroutines.CloseBlockingWindows();
+                            ResetRequest();
+                        }
+                        return true;
+                    }
+                    if (nativeSend.InputSent)
+                    {
+                        _nativeSendFallbackArmed = true;
+                        _nextActionUtc =
+                            DateTime.UtcNow.AddMilliseconds(200);
+                        AllflameLog.Info(
+                            "UI_FALLBACK" +
+                            "|Task=" + Name +
+                            "|From=Native" +
+                            "|To=Element" +
+                            "|Reason=SendPostconditionUnverified" +
+                            "|Action=RetryNextCycle");
+                        return true;
+                    }
+                    AllflameLog.Info(
+                        "UI_FALLBACK" +
+                        "|Task=" + Name +
+                        "|From=Native" +
+                        "|To=Element" +
+                        "|Reason=" + nativeSend.Reason);
+                }
+                if (_nativeSendFallbackArmed)
+                {
+                    _nativeSendFallbackArmed = false;
+                    AllflameLog.Info(
+                        "CAPSULE_NATIVE_FALLBACK" +
+                        "|Action=SendToSurface" +
+                        "|Mode=StableElement" +
+                        "|InputSent=False" +
+                        "|Postcondition=False" +
+                        "|Reason=NativeAttemptAlreadyVerifiedUncertain");
+                }
                 Element sendButton;
                 string sendDetectionMode;
                 bool sendFound =
@@ -29487,6 +30131,75 @@ namespace AllflameBot
 
             if (extractionRequired)
             {
+                if (AllflameSettings.Instance.UseNativeCapsuleActions &&
+                    !_nativeCallAttempted)
+                {
+                    _nativeCallAttempted = true;
+                    DpbActionResult nativeCall =
+                        DpbNativeApi.CallBathysphere();
+                    bool nativeAcknowledged = false;
+                    string nativeConfirmation = "None";
+                    if (nativeCall.InputSent)
+                    {
+                        await LokiCoroutine.Sleep(500);
+                        AllflameContext.Refresh(true);
+                        nativeAcknowledged =
+                            TryConfirmNativeCapsuleCall(
+                                out nativeConfirmation);
+                        nativeCall.PostconditionVerified =
+                            nativeAcknowledged;
+                    }
+                    AllflameLog.Info(
+                        "CAPSULE_NATIVE_ACTION" +
+                        "|Action=CallBathysphere" +
+                        "|InputSent=" + nativeCall.InputSent +
+                        "|Postcondition=" + nativeAcknowledged +
+                        "|Confirmation=" + nativeConfirmation +
+                        "|Reason=" + nativeCall.Reason +
+                        "|Exception=" + nativeCall.Exception);
+                    if (nativeAcknowledged)
+                    {
+                        _visualCapsuleUiOpen = false;
+                        await Coroutines.CloseBlockingWindows();
+                        _callRecoveryCycles = 0;
+                        VoyageRunState.SurfaceTransferPending = false;
+                        VoyageRunState.MarkCallIssued();
+                        MarkZeroLanternCallConfirmed();
+                        ResetRequest();
+                        return true;
+                    }
+                    if (nativeCall.InputSent)
+                    {
+                        _nativeCallFallbackArmed = true;
+                        _nextActionUtc =
+                            DateTime.UtcNow.AddMilliseconds(200);
+                        AllflameLog.Info(
+                            "UI_FALLBACK" +
+                            "|Task=" + Name +
+                            "|From=Native" +
+                            "|To=ElementOrVisual" +
+                            "|Reason=CallPostconditionUnverified" +
+                            "|Action=RetryNextCycle");
+                        return true;
+                    }
+                    AllflameLog.Info(
+                        "UI_FALLBACK" +
+                        "|Task=" + Name +
+                        "|From=Native" +
+                        "|To=ElementOrVisual" +
+                        "|Reason=" + nativeCall.Reason);
+                }
+                if (_nativeCallFallbackArmed)
+                {
+                    _nativeCallFallbackArmed = false;
+                    AllflameLog.Info(
+                        "CAPSULE_NATIVE_FALLBACK" +
+                        "|Action=CallBathysphere" +
+                        "|Mode=ElementOrVisual" +
+                        "|InputSent=False" +
+                        "|Postcondition=False" +
+                        "|Reason=NativeAttemptAlreadyVerifiedUncertain");
+                }
                 if (UseDirectDpbCallUi)
                 {
                     Element firstDirectCall;
@@ -33370,6 +34083,97 @@ namespace AllflameBot
             }
         }
 
+        private static bool TryConfirmNativeCapsuleSend(
+            out string confirmation)
+        {
+            confirmation = "None";
+            DpbCapsuleSnapshot snapshot;
+            string reason;
+            if (!DpbNativeApi.TryCaptureCapsule(
+                    out snapshot,
+                    out reason))
+            {
+                confirmation = "SnapshotUnavailable:" + reason;
+                return false;
+            }
+            if (!snapshot.IsOpened)
+            {
+                confirmation = "CapsuleClosed";
+                return true;
+            }
+            if (!snapshot.SendToSurfaceEnabled)
+            {
+                confirmation = "SendDisabled";
+                return true;
+            }
+            int remaining;
+            if (TryCountInventoryItems(
+                    snapshot.InventoryControl,
+                    out remaining) &&
+                remaining == 0)
+            {
+                confirmation = "NativeContainerEmpty";
+                return true;
+            }
+            confirmation = "ContainerStillHasItems";
+            return false;
+        }
+
+        private static bool TryConfirmNativeCapsuleCall(
+            out string confirmation)
+        {
+            confirmation = "None";
+            if (AllflameContext.ExtractionAvailable)
+            {
+                confirmation = "ExtractionAvailable";
+                return true;
+            }
+            if (AllflameContext.BathysphereCallObserved)
+            {
+                confirmation = "BathysphereCallObserved";
+                return true;
+            }
+            DpbCapsuleSnapshot snapshot;
+            string reason;
+            if (DpbNativeApi.TryCaptureCapsule(
+                    out snapshot,
+                    out reason) &&
+                !snapshot.IsOpened)
+            {
+                confirmation = "CapsuleClosed";
+                return true;
+            }
+            confirmation = "ExtractionNotObserved" +
+                (String.IsNullOrEmpty(reason)
+                    ? String.Empty
+                    : ":" + reason);
+            return false;
+        }
+
+        private static bool TryCountInventoryItems(
+            InventoryControlWrapper control,
+            out int count)
+        {
+            count = 0;
+            try
+            {
+                if (control == null ||
+                    control.Inventory == null ||
+                    control.Inventory.Items == null)
+                {
+                    return false;
+                }
+                count = control.Inventory.Items.Count(item =>
+                    item != null && item.IsValid);
+                return true;
+            }
+            catch
+            {
+                count = 0;
+                return false;
+            }
+        }
+
         private static async Task<bool> CtrlClickInventoryItem(
             Item item)
         {
@@ -34052,8 +34856,12 @@ namespace AllflameBot
             _transferRecoveryCycles = 0;
             _sendAttempts = 0;
             _sendRecoveryCycles = 0;
+            _nativeSendAttempted = false;
+            _nativeSendFallbackArmed = false;
             _callAttempts = 0;
             _callRecoveryCycles = 0;
+            _nativeCallAttempted = false;
+            _nativeCallFallbackArmed = false;
             _sendButtonMissingUtc = DateTime.MinValue;
             _callButtonMissingUtc = DateTime.MinValue;
             _hasConfirmedCapsuleAnchor = false;
@@ -34597,16 +35405,46 @@ namespace AllflameBot
                     string source = "None";
                     List<InventoryControlWrapper> rewardControls = null;
                     bool rewardUiOpen = false;
+                    bool nativeLootUiActive = false;
                     bool inventorySourceConfirmed = false;
                     try
                     {
-                        rewardUiOpen =
-                            LokiPoe.InGameState.RewardUi.IsOpened;
-                        if (rewardUiOpen)
+                        bool nativeLootOpened;
+                        InventoryControlWrapper nativeLootControl;
+                        string nativeLootReason;
+                        if (AllflameSettings.Instance.UseNativeLootUi &&
+                            DpbNativeApi.TryCaptureLoot(
+                                out nativeLootOpened,
+                                out nativeLootControl,
+                                out nativeLootReason) &&
+                            nativeLootOpened &&
+                            nativeLootControl != null)
                         {
+                            nativeLootUiActive = true;
+                            rewardUiOpen = true;
                             rewardControls =
-                                LokiPoe.InGameState.RewardUi
-                                    .InventoryControls;
+                                new List<InventoryControlWrapper>
+                                {
+                                    nativeLootControl
+                                };
+                            AllflameLog.Throttled(
+                                "collect_surface_native_loot_ui",
+                                TimeSpan.FromSeconds(2),
+                                "COLLECT_SURFACE_NATIVE_SNAPSHOT" +
+                                "|Opened=True" +
+                                "|Control=True" +
+                                "|Reason=" + nativeLootReason);
+                        }
+                        else
+                        {
+                            rewardUiOpen =
+                                LokiPoe.InGameState.RewardUi.IsOpened;
+                            if (rewardUiOpen)
+                            {
+                                rewardControls =
+                                    LokiPoe.InGameState.RewardUi
+                                        .InventoryControls;
+                            }
                         }
                     }
                     catch
@@ -34631,7 +35469,9 @@ namespace AllflameBot
                             sourceInventory =
                                 containerControl.Inventory;
                             items = sourceInventory.Items;
-                            source = "RewardUi";
+                            source = nativeLootUiActive
+                                ? "NativeLootUi"
+                                : "RewardUi";
                             inventorySourceConfirmed = true;
                         }
                         else if (rewardControls.Any(control =>
@@ -34640,9 +35480,14 @@ namespace AllflameBot
                                      control.Inventory != null &&
                                      control.Inventory.IsValid))
                         {
-                            source = _movedAnyItem
-                                ? "RewardUiVerifiedEmpty"
-                                : "RewardUiUnconfirmedEmpty";
+                            source = nativeLootUiActive
+                                ? ("NativeLootUi" +
+                                   (_movedAnyItem
+                                       ? "VerifiedEmpty"
+                                       : "UnconfirmedEmpty"))
+                                : (_movedAnyItem
+                                    ? "RewardUiVerifiedEmpty"
+                                    : "RewardUiUnconfirmedEmpty");
                             items = new List<Item>();
                             inventorySourceConfirmed =
                                 _movedAnyItem;
@@ -34653,7 +35498,10 @@ namespace AllflameBot
                             TimeSpan.FromSeconds(2),
                             "COLLECT_SURFACE_UI" +
                             "|Found=" + inventorySourceConfirmed +
-                            "|Source=RewardUi" +
+                            "|Source=" +
+                            (nativeLootUiActive
+                                ? "NativeLootUi"
+                                : "RewardUi") +
                             "|Controls=" + rewardControls.Count +
                             "|ControlsWithItems=" +
                             rewardControls.Count(control =>
@@ -35146,6 +35994,24 @@ namespace AllflameBot
         {
             try
             {
+                bool nativeOpened;
+                InventoryControlWrapper nativeControl;
+                string nativeReason;
+                if (AllflameSettings.Instance.UseNativeLootUi &&
+                    DpbNativeApi.TryCaptureLoot(
+                        out nativeOpened,
+                        out nativeControl,
+                        out nativeReason) &&
+                    nativeOpened &&
+                    nativeControl != null)
+                {
+                    AllflameLog.Info(
+                        "COLLECT_SURFACE_UI_ADOPT_PROBE" +
+                        "|Source=NativeLootUi" +
+                        "|Resolved=True" +
+                        "|Reason=" + nativeReason);
+                    return true;
+                }
                 if (LokiPoe.InGameState.RewardUi.IsOpened)
                 {
                     return true;
@@ -37046,6 +37912,8 @@ namespace AllflameBot
         private DateTime _bottleStageDeadlineUtc = DateTime.MinValue;
         private DateTime _nextBottleAcceptClickUtc = DateTime.MinValue;
         private int _bottlePlacementAttempts;
+        private bool _nativeBottleAcceptAttempted;
+        private bool _nativeBottleFallbackArmed;
 
         public SecretBottleProcessingTask()
             : base(
@@ -37798,11 +38666,21 @@ namespace AllflameBot
                 Vector2i cursorSize =
                     LokiPoe.InGameState.CursorItemOverlay.ItemSize;
                 bool cursorReady =
-                    LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
+                    IsBottleRewardCursorOpen() &&
                     cursorItem != null &&
                     cursorSize.X > 0 && cursorSize.Y > 0;
                 if (cursorReady)
                 {
+                    if (_nativeBottleFallbackArmed)
+                    {
+                        AllflameLog.Info(
+                            "SECRET_BOTTLE_ACCEPT_NATIVE_ACK" +
+                            "|Postcondition=True" +
+                            "|Mode=CursorItemOverlay" +
+                            "|CursorMode=OpenBottledItem");
+                    }
+                    _nativeBottleAcceptAttempted = false;
+                    _nativeBottleFallbackArmed = false;
                     _activePlacement.Decision =
                         EvaluateReward(cursorItem, settings);
                     _bottlePlacementAttempts = 0;
@@ -37821,6 +38699,55 @@ namespace AllflameBot
                         "Bottle consumed but reward cursor did not appear.");
                     ClearBottleOpenState();
                     return;
+                }
+
+                if (settings.UseNativeBottleReveal &&
+                    !_nativeBottleAcceptAttempted)
+                {
+                    bool nativeRevealOpened;
+                    InventoryControlWrapper nativeRevealControl;
+                    string nativeRevealReason;
+                    if (DpbNativeApi.TryCaptureBottleReveal(
+                            out nativeRevealOpened,
+                            out nativeRevealControl,
+                            out nativeRevealReason) &&
+                        nativeRevealOpened)
+                    {
+                        _nativeBottleAcceptAttempted = true;
+                        DpbActionResult nativeAccept =
+                            DpbNativeApi.AcceptBottleReveal();
+                        AllflameLog.Info(
+                            "SECRET_BOTTLE_ACCEPT_NATIVE" +
+                            "|InputSent=" + nativeAccept.InputSent +
+                            "|Postcondition=False" +
+                            "|Reason=" + nativeAccept.Reason +
+                            "|Snapshot=" + nativeRevealReason +
+                            "|Control=" +
+                            (nativeRevealControl != null));
+                        if (nativeAccept.InputSent)
+                        {
+                            _nativeBottleFallbackArmed = true;
+                            _nextBottleAcceptClickUtc =
+                                DateTime.UtcNow.AddMilliseconds(600);
+                            return;
+                        }
+                        AllflameLog.Info(
+                            "UI_FALLBACK" +
+                            "|Task=" + Name +
+                            "|From=Native" +
+                            "|To=ElementOrVisual" +
+                            "|Reason=" + nativeAccept.Reason);
+                    }
+                }
+                if (_nativeBottleFallbackArmed)
+                {
+                    _nativeBottleFallbackArmed = false;
+                    AllflameLog.Info(
+                        "UI_FALLBACK" +
+                        "|Task=" + Name +
+                        "|From=Native" +
+                        "|To=ElementOrVisual" +
+                        "|Reason=RewardCursorNotObservedAfterAccept");
                 }
 
                 Vector2i acceptLocation;
@@ -37879,7 +38806,8 @@ namespace AllflameBot
                     LokiPoe.InGameState.CursorItemOverlay.ItemSize;
                 InventoryControlWrapper inventoryControl =
                     MainInventory();
-                if (cursorItem == null || cursorSize.X <= 0 ||
+                if (!IsBottleRewardCursorOpen() ||
+                    cursorItem == null || cursorSize.X <= 0 ||
                     cursorSize.Y <= 0 || inventoryControl == null ||
                     inventoryControl.Inventory == null ||
                     inventoryControl.InventorySlotUiElement == null)
@@ -37945,7 +38873,7 @@ namespace AllflameBot
                 BottleOpenStage.ConfirmPlacement)
             {
                 bool placed =
-                    !LokiPoe.InGameState.CursorItemOverlay.IsOpened;
+                    !IsBottleRewardCursorOpen();
                 if (!placed &&
                     DateTime.UtcNow < _bottleStageDeadlineUtc)
                 {
@@ -38065,7 +38993,7 @@ namespace AllflameBot
                 increasedStacks.Count == 0)
             {
                 _failed++;
-                if (LokiPoe.InGameState.CursorItemOverlay.IsOpened)
+                if (IsBottleRewardCursorOpen())
                 {
                     AllflameStopController.Stop(
                         "SecretBottleCursorStuck",
@@ -38172,6 +39100,25 @@ namespace AllflameBot
             _bottleStageDeadlineUtc = DateTime.MinValue;
             _nextBottleAcceptClickUtc = DateTime.MinValue;
             _bottlePlacementAttempts = 0;
+            _nativeBottleAcceptAttempted = false;
+            _nativeBottleFallbackArmed = false;
+        }
+
+        private static bool IsBottleRewardCursorOpen()
+        {
+            try
+            {
+                return LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
+                       String.Equals(
+                           LokiPoe.InGameState.CursorItemOverlay.Mode
+                               .ToString(),
+                           "OpenBottledItem",
+                           StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static bool TryFindBottleRevealAcceptButton(

@@ -13,6 +13,22 @@ All notable changes to AllflameBot are documented in this file.
 - Remove obsolete release-history sections from `README.md`; release history now
   remains centralized in this changelog.
 
+## 0.23.154 - 2026-08-06
+
+- Add a DPB native adapter for Sovereign travel, Capsule actions, Loot UI,
+  Bottle reveal, Chart Device state and Deepwater counters.
+- Use native Capsule actions first with fresh semantic postconditions and
+  bounded Element/visual fallback for covered-process scenarios.
+- Prefer native Loot and Bottle state while preserving filtered
+  `FastMoveReward()` collection and requiring `CursorItemOverlay.Mode` to be
+  `OpenBottledItem` before handling a reward.
+- Add Voyage Planner native shadow comparison and opt-in native actions gated
+  by two consecutive matches with the stable Element snapshot.
+- Verify native Clear Board and Begin Voyage on fresh follow-up state; fall back
+  to the stable Element path after a bounded timeout.
+- Record compatibility against DPB `0.3.29.27` and migrate settings schema to
+  enable low-risk native features by default.
+
 ## 0.23.153 - 2026-08-06
 
 - Add a native `DeepwaterVoyageSnapshot` backed by DPB's Voyage Planner API for

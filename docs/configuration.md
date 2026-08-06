@@ -35,6 +35,7 @@ user data and must not be committed.
 - Stash and transfer behavior.
 - Bathysphere, lantern and extraction behavior.
 - Secret Bottle processing.
+- Native DPB adapters and Voyage Planner canary behavior.
 - Pricing and unique artwork resolution.
 - Discord notifications.
 
@@ -44,3 +45,9 @@ A setting visible in the GUI is not automatically a runtime guarantee. Before
 documenting or relying on a property, confirm a source consumer and a log or
 postcondition. In particular, audit settings whose names imply terrain planning,
 unlit-area avoidance or repeated-failure stopping.
+
+Native low-risk feature flags default to enabled after settings migration. They
+cover Sovereign travel, Capsule actions, Loot UI reads, Bottle reveal,
+Chart Device reads and Deepwater counters. Native Voyage Planner reads run as a
+shadow comparison; native Planner actions are opt-in and remain behind their
+postcondition/canary gate. Voyage Stash stays on the stable stash adapter.

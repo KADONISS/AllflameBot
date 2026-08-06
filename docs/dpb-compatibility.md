@@ -23,9 +23,28 @@ and the actual DPB binaries used for a build.
 - Target framework: .NET Framework 4.8.
 - Platform: x64.
 - Language: C# 7.3.
+- Build reference verified on 2026-08-06: `DreamPoeBot` `0.3.29.27`.
 - External references: `DreamPoeBot.exe` and `Newtonsoft.Json.dll`.
 - Runtime integrations include `LokiPoe`, `ExilePather`, `Element`, inventory/UI
   controls, process hook and `LokiCoroutine`.
+
+## Verified native API surface
+
+- `WorldUi.GoToTheSovereign()` for semantic hub travel.
+- `AllflameCapsuleUi` state, `SendToSurface()` and `CaalBathysphere()`.
+- `AllflameLootUi` state and reward `InventoryControl` reads.
+- `BottledItemRevealUi` state, reward control and `Accept()`.
+- `DeepwaterChartUi` state, loaded inventory and `Descend()`.
+- `DeepwaterVoyageUi` state, Chart wrappers, `ClearBoard()` and
+  `BeginVoyage()`.
+- `InstanceInfo.Deepwater` lantern and sulphur counters.
+
+`AllflameLootUi.TakeAll()` is intentionally not used for filtered collection;
+the bot keeps `FastMoveReward()` so loot policy remains authoritative. Native
+Voyage board occupancy is shadow evidence only because map direction/border
+fields are not proven to equal stable UI slot occupancy. Voyage Stash remains on
+the existing personal `StashUi` path because the native feature API does not
+provide a validated equivalent for that workflow.
 
 ## Compatibility checklist
 

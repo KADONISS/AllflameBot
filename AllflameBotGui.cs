@@ -368,6 +368,14 @@ namespace AllflameBot
                 Note("Version " + AllflameVersion.Current + " adds Secret Bottle stash withdrawal and independent processing in the Sovereign Hub."),
                 Note("Topology rooms are optional discovery hints; invalid or blocked rooms automatically fall back to the existing frontier planner."),
                 Note("The planner uses 9 Crossing Charts without rotation."),
+                Check("Use native Sovereign travel API", "UseNativeSovereignTravel"),
+                Check("Use native Capsule actions", "UseNativeCapsuleActions"),
+                Check("Use native Loot UI state", "UseNativeLootUi"),
+                Check("Use native Bottle reveal", "UseNativeBottleReveal"),
+                Check("Use native Chart Device", "UseNativeChartDevice"),
+                Check("Use native Deepwater counters", "UseNativeDeepwaterCounters"),
+                Check("Shadow-read native Voyage Planner", "UseNativeVoyagePlannerRead"),
+                Check("Enable native Voyage Planner actions", "UseNativeVoyagePlannerActions"),
                 Note("Settings are persisted by DreamPoeBot JsonSettings."))));
             Grid.SetColumn(grid.Children[2], 2);
             return grid;
