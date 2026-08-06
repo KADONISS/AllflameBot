@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.151";
+        public const string Current = "0.23.152";
     }
 
     public sealed class AllflameBot : IBot
@@ -15109,6 +15109,9 @@ namespace AllflameBot
             }
         }
         private const int FullPageChartCount = 12;
+        private const int MaximumOpenAttempts = 3;
+        private const int StorageOpenTimeoutSeconds = 8;
+        private const int StorageResolveTimeoutSeconds = 8;
         private int _stage;
         private int _mainTab;
         private int _subTab;
@@ -15154,6 +15157,11 @@ namespace AllflameBot
         private InventoryControlWrapper _storageControl;
         private InventorySlotUiElement _storageSlot;
         private int _observedDepositRevision;
+        private Task<bool> _storageOpenTask;
+        private DateTime _storageOpenIssuedUtc = DateTime.MinValue;
+        private DateTime _storageResolveDeadlineUtc = DateTime.MinValue;
+        private bool _blockingWindowsPrepared;
+        private int _storageUiRecoveryAttempts;
 
         private sealed class StorageChartEntry
         {
@@ -15307,9 +15315,26 @@ namespace AllflameBot
 
             if (_stage == 0)
             {
-                if (TryResolveStorageUi())
+                if (_storageOpenTask != null)
                 {
-                    BeginScan();
+                    return await ContinueStorageOpenInteraction();
+                }
+
+                // Only resolve the UI after the cached observation proves that
+                // Chart Storage is visible. Resolving the full Element tree
+                // on the ordinary boat scene can block the task cycle.
+                if (IsChartStorageUiVisibleInSnapshot())
+                {
+                    _openAttempts = Math.Max(1, _openAttempts);
+                    _stage = 1;
+                    _scanAfterUtc = DateTime.UtcNow;
+                    _storageResolveDeadlineUtc = DateTime.UtcNow.AddSeconds(
+                        StorageResolveTimeoutSeconds);
+                    AllflameLog.Info(
+                        "CHART_STORAGE_STAGE" +
+                        "|Stage=Resolve" +
+                        "|Reason=ExistingUiSnapshot" +
+                        "|Postcondition=PageLayerResolved");
                     return true;
                 }
 
@@ -15320,10 +15345,10 @@ namespace AllflameBot
                     AllflameLog.Info(
                         "CHART_STORAGE_RETRY" +
                         "|Attempt=" + _openAttempts +
-                        "|Maximum=3" +
+                        "|Maximum=" + MaximumOpenAttempts +
                         "|Reason=ObjectMissing" +
                         "|NextAction=ReacquireStorage");
-                    if (_openAttempts >= 3)
+                    if (_openAttempts >= MaximumOpenAttempts)
                     {
                         return await CompleteSourceFailure(
                             "StorageObjectMissing");
@@ -15333,33 +15358,61 @@ namespace AllflameBot
                     return true;
                 }
 
+                AllflameProgressWatchdog.Begin(
+                    Name,
+                    storage.Id,
+                    "Chart Storage");
+
+                if (!_blockingWindowsPrepared)
+                {
+                    bool closed = true;
+                    try
+                    {
+                        await Coroutines.CloseBlockingWindows();
+                    }
+                    catch (Exception ex)
+                    {
+                        closed = false;
+                        AllflameLog.Info(
+                            "CHART_STORAGE_UI_PREP_FAILED" +
+                            "|Type=" + ex.GetType().Name +
+                            "|Message=" +
+                            (ex.Message ?? String.Empty).Replace("|", "/"));
+                    }
+                    _blockingWindowsPrepared = true;
+                    AllflameLog.Info(
+                        "CHART_STORAGE_UI_PREP" +
+                        "|BlockingWindowsClosed=" + closed +
+                        "|Action=PrepareBeforeInteract" +
+                        "|Postcondition=NoBlockingUi");
+                    AllflameProgressWatchdog.MarkProgress(
+                        "ChartStorageUiPrepared");
+                    _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(250);
+                    return true;
+                }
+
                 if (storage.Distance > AllflameSettings.Instance.InteractDistance)
                 {
                     await MoveOrInteract(storage, "Chart Storage");
                     return true;
                 }
 
-                bool interacted = await InteractWithRecovery(storage);
                 _openAttempts++;
                 AllflameLog.Info(
-                    "CHART_STORAGE_OPEN|Success=" + interacted +
+                    "CHART_STORAGE_STAGE" +
+                    "|Stage=Interact" +
+                    "|ObjectId=" + storage.Id +
+                    "|Distance=" + storage.Distance.ToString("0.0") +
                     "|Attempt=" + _openAttempts +
-                    "|Maximum=3");
-                if (interacted)
-                {
-                    _openAttempts = 0;
-                    _stage = 1;
-                    _scanAfterUtc = DateTime.UtcNow.AddMilliseconds(1200);
-                }
-                else if (_openAttempts >= 3)
-                {
-                    return await CompleteSourceFailure(
-                        "StorageInteractionRejected");
-                }
-                else
-                {
-                    _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(600);
-                }
+                    "|Maximum=" + MaximumOpenAttempts +
+                    "|Action=Interact" +
+                    "|Postcondition=ChartStorageUi");
+                _storageOpenIssuedUtc = DateTime.UtcNow;
+                _storageOpenTask = InteractWithRecovery(
+                    storage,
+                    "Chart Storage");
+                AllflameProgressWatchdog.MarkProgress(
+                    "ChartStorageInteractionIssued");
                 return true;
             }
 
@@ -15370,38 +15423,83 @@ namespace AllflameBot
                     return true;
                 }
 
-                if (!TryResolveStorageUi())
+                if (!IsChartStorageUiVisibleInSnapshot())
+                {
+                    AllflameLog.Throttled(
+                        "chart_storage_confirm_wait",
+                        TimeSpan.FromSeconds(2),
+                        "CHART_STORAGE_CONFIRM_WAIT" +
+                        "|Stage=Confirm" +
+                        "|Visible=False" +
+                        "|Postcondition=ChartStorageUiVisible" +
+                        "|ElapsedMs=" + Math.Max(
+                            0,
+                            (int)(DateTime.UtcNow -
+                                _scanAfterUtc).TotalMilliseconds));
+                    if (DateTime.UtcNow >= _storageResolveDeadlineUtc)
+                    {
+                        return await RecoverStorageUi(
+                            "StorageUiVisibilityTimeout");
+                    }
+                    return true;
+                }
+
+                Stopwatch resolveTimer = Stopwatch.StartNew();
+                bool resolved = TryResolveStorageUi();
+                resolveTimer.Stop();
+                AllflameLog.Info(
+                    "CHART_STORAGE_RESOLVE" +
+                    "|Stage=Confirm" +
+                    "|Visible=True" +
+                    "|Resolved=" + resolved +
+                    "|ElapsedMs=" + resolveTimer.ElapsedMilliseconds +
+                    "|Postcondition=PageLayerResolved");
+                if (!resolved)
                 {
                     _resolveAttempts++;
                     AllflameLog.Info(
                         "CHART_STORAGE_RETRY" +
                         "|Attempt=" + _resolveAttempts +
-                        "|Maximum=3" +
+                        "|Maximum=" + MaximumOpenAttempts +
                         "|Reason=PageLayerNotResolved" +
-                        "|NextAction=ReopenStorage");
-                    if (_resolveAttempts >= 3)
+                        "|NextAction=RetryResolve");
+                    if (_resolveAttempts >= MaximumOpenAttempts ||
+                        DateTime.UtcNow >= _storageResolveDeadlineUtc)
                     {
-                        return await CompleteSourceFailure(
+                        return await RecoverStorageUi(
                             "PageLayerNotResolved");
                     }
-                    _stage = 0;
-                    _retryAfterUtc = DateTime.UtcNow.AddSeconds(1);
+                    _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(350);
                     return true;
                 }
 
                 _resolveAttempts = 0;
+                _openAttempts = 0;
+                _storageResolveDeadlineUtc = DateTime.MinValue;
+                AllflameProgressWatchdog.MarkProgress(
+                    "ChartStoragePageResolved");
                 BeginScan();
                 return true;
             }
 
             if (_stage == 2)
             {
+                if (!IsChartStorageUiVisibleInSnapshot())
+                {
+                    return await RecoverStorageUi(
+                        "StorageUiLostDuringScan");
+                }
                 await ProbeCurrentPage();
                 return true;
             }
 
             if (_stage == 3)
             {
+                if (!IsChartStorageUiVisibleInSnapshot())
+                {
+                    return await RecoverStorageUi(
+                        "StorageUiLostDuringWithdraw");
+                }
                 await WithdrawRawChartCycle();
                 return true;
             }
@@ -15409,8 +15507,161 @@ namespace AllflameBot
             return true;
         }
 
+        private async Task<bool> ContinueStorageOpenInteraction()
+        {
+            Task<bool> openTask = _storageOpenTask;
+            if (openTask == null)
+            {
+                return true;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (!openTask.IsCompleted)
+            {
+                TimeSpan elapsed = now - _storageOpenIssuedUtc;
+                if (elapsed < TimeSpan.FromSeconds(StorageOpenTimeoutSeconds))
+                {
+                    AllflameLog.Throttled(
+                        "chart_storage_interact_wait",
+                        TimeSpan.FromSeconds(2),
+                        "CHART_STORAGE_INTERACT_WAIT" +
+                        "|Stage=Interact" +
+                        "|Attempt=" + _openAttempts +
+                        "|ElapsedMs=" + Math.Max(
+                            0,
+                            (int)elapsed.TotalMilliseconds) +
+                        "|TimeoutSeconds=" + StorageOpenTimeoutSeconds +
+                        "|Postcondition=InteractionCompleted");
+                    return true;
+                }
+
+                _storageOpenTask = null;
+                AllflameLog.Info(
+                    "CHART_STORAGE_INTERACTION_TIMEOUT" +
+                    "|Attempt=" + _openAttempts +
+                    "|ElapsedMs=" + Math.Max(
+                        0,
+                        (int)elapsed.TotalMilliseconds) +
+                    "|TimeoutSeconds=" + StorageOpenTimeoutSeconds +
+                    "|Action=RefreshReacquire");
+                return await RecoverStorageUi(
+                    "StorageInteractionTimeout");
+            }
+
+            _storageOpenTask = null;
+            bool interacted = false;
+            try
+            {
+                interacted = await openTask;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_OPEN_EXCEPTION" +
+                    "|Type=" + ex.GetType().Name +
+                    "|Message=" +
+                    (ex.Message ?? String.Empty).Replace("|", "/"));
+            }
+
+            AllflameLog.Info(
+                "CHART_STORAGE_OPEN" +
+                "|InputSent=True" +
+                "|Success=" + interacted +
+                "|Attempt=" + _openAttempts +
+                "|Maximum=" + MaximumOpenAttempts +
+                "|Postcondition=AwaitChartStorageUi");
+            if (!interacted)
+            {
+                if (_openAttempts >= MaximumOpenAttempts)
+                {
+                    return await CompleteSourceFailure(
+                        "StorageInteractionRejected");
+                }
+                _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(600);
+                return true;
+            }
+
+            _stage = 1;
+            _scanAfterUtc = DateTime.UtcNow.AddMilliseconds(1200);
+            _storageResolveDeadlineUtc = DateTime.UtcNow.AddSeconds(
+                StorageResolveTimeoutSeconds);
+            _resolveAttempts = 0;
+            AllflameProgressWatchdog.MarkProgress(
+                "ChartStorageUiOpened");
+            return true;
+        }
+
+        private async Task<bool> RecoverStorageUi(string reason)
+        {
+            DateTime startedUtc = DateTime.UtcNow;
+            AllflameLog.Info(
+                "CHART_STORAGE_UI_RECOVERY" +
+                "|Reason=" + reason +
+                "|Attempt=" + _openAttempts +
+                "|Action=CloseRefreshReacquire");
+            try
+            {
+                await Coroutines.CloseBlockingWindows();
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_UI_RECOVERY_CLOSE_FAILED" +
+                    "|Type=" + ex.GetType().Name);
+            }
+            try
+            {
+                AllflameContext.Refresh(true);
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_UI_RECOVERY_REFRESH_FAILED" +
+                    "|Type=" + ex.GetType().Name);
+            }
+            try
+            {
+                ExilePather.Reload(true);
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "CHART_STORAGE_UI_RECOVERY_PATH_FAILED" +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            _stage = 0;
+            _storageOpenTask = null;
+            _storageOpenIssuedUtc = DateTime.MinValue;
+            _storageResolveDeadlineUtc = DateTime.MinValue;
+            _blockingWindowsPrepared = false;
+            _storageUiRecoveryAttempts++;
+            _resolveAttempts = 0;
+            _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(800);
+            AllflameProgressWatchdog.SetRetry(_openAttempts);
+            AllflameLog.Info(
+                "CHART_STORAGE_UI_RECOVERY_DONE" +
+                "|Reason=" + reason +
+                "|Attempt=" + _openAttempts +
+                "|RecoveryAttempt=" + _storageUiRecoveryAttempts +
+                "|ElapsedMs=" + Math.Max(
+                    0,
+                    (int)(DateTime.UtcNow - startedUtc).TotalMilliseconds) +
+                "|NextAction=" + (_openAttempts >= MaximumOpenAttempts ||
+                    _storageUiRecoveryAttempts >= MaximumOpenAttempts
+                    ? "VoyageStashFallback"
+                    : "RetryStorage"));
+            if (_openAttempts >= MaximumOpenAttempts ||
+                _storageUiRecoveryAttempts >= MaximumOpenAttempts)
+            {
+                return await CompleteSourceFailure(reason);
+            }
+            return true;
+        }
+
         private void BeginScan()
         {
+            _storageUiRecoveryAttempts = 0;
             ResetTabSelection();
             _mainTab = -1;
             _subTab = -1;
@@ -16037,6 +16288,15 @@ namespace AllflameBot
             return false;
         }
 
+        private static bool IsChartStorageUiVisibleInSnapshot()
+        {
+            string summary = AllflameContext.ChartStorageSummary ??
+                String.Empty;
+            return summary.IndexOf(
+                "Chart Storage",
+                StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
         private bool TryResolveStorageUi(int mainTab, int subTab)
         {
             InventoryControlWrapper resolvedControl;
@@ -16446,6 +16706,11 @@ namespace AllflameBot
             _nativeBindFailed = false;
             _rawWithdrawFailed = false;
             _inventoryFull = false;
+            _storageOpenTask = null;
+            _storageOpenIssuedUtc = DateTime.MinValue;
+            _storageResolveDeadlineUtc = DateTime.MinValue;
+            _blockingWindowsPrepared = false;
+            _storageUiRecoveryAttempts = 0;
         }
     }
 

@@ -20,10 +20,13 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
 - Progress evidence and retry accounting.
 - Movement ownership and priority leases.
 - Recoverable runtime rebuild.
+- Bounded Chart Storage UI open/resolve recovery and Voyage Stash fallback.
 - Recording stop reasons.
 
 ## Required checks
 
 Distinguish transient recovery from terminal stop. Prefer fresh observation,
 reacquisition, path reload, target invalidation and retry-state reset. Do not
-add an automatic stop merely because a loop is inconvenient to diagnose.
+add an automatic stop merely because a loop is inconvenient to diagnose. Chart
+Storage UI failures must remain bounded and return to the configured supply
+fallback without converting a transient UI fault into a bot stop.

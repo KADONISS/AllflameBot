@@ -25,3 +25,4 @@ supersedes them instead of rewriting history.
 - [`0002-ordered-observer-task-pipeline.md`](0002-ordered-observer-task-pipeline.md)
 - [`0003-layered-ui-fallbacks.md`](0003-layered-ui-fallbacks.md)
 - [`0004-hybrid-terrain-planning.md`](0004-hybrid-terrain-planning.md)
+- [`0005-bounded-chart-storage-recovery.md`](0005-bounded-chart-storage-recovery.md)

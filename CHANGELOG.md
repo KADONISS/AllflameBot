@@ -13,6 +13,18 @@ All notable changes to AllflameBot are documented in this file.
 - Remove obsolete release-history sections from `README.md`; release history now
   remains centralized in this changelog.
 
+## 0.23.152 - 2026-08-06
+
+- Keep Chart Storage Element resolution out of the ordinary boat scene until a
+  fresh UI snapshot confirms that the window is visible.
+- Close blocking windows before the storage interaction, track the interaction
+  cooperatively with an eight-second timeout, and confirm the opened page from
+  a later UI snapshot and page-layer resolution.
+- Bound storage open/resolve recovery to three attempts, refresh and reacquire
+  the UI after a timeout, then continue through the existing Voyage Stash
+  fallback without adding a bot stop.
+- Add stage, postcondition, timeout and recovery diagnostics for Chart Storage.
+
 ## 0.23.151 - 2026-08-05
 
 - Confirm the Call Bathysphere unused-Capsule warning through DPB Element

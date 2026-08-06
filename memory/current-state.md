@@ -7,7 +7,7 @@
 ## Repository
 
 - Branch: `main`
-- Current source release: `0.23.151`
+- Current source release: `0.23.152`
 - Target: .NET Framework 4.8, x64, C# 7.3
 - Runtime shape: one DPB plugin assembly with ordered ObserverTasks
 - Automated tests/CI: not currently present
