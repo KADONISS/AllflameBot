@@ -20,6 +20,7 @@ UI adapters are in [`AllflameBot.cs`](../../AllflameBot.cs); WPF settings UI is 
 - Native DPB semantic controls for process-covered actions.
 - Input dispatch and held-input cleanup.
 - Postcondition snapshot and fallback mode logging.
+- Notification settings UI, masked webhook entry and delivery-status display.
 
 ## Required checks
 

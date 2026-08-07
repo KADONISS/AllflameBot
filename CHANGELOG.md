@@ -2,6 +2,20 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.163 - 2026-08-07
+
+- Rebuild Discord notifications around Allflame Chart Runner and Voyage Runner
+  content, including current phase, Lantern, Sulphur, Chart supply, Voyage
+  Stash, confirmed loot and profit.
+- Add a bounded immediate notification queue with delivery status, HTTPS Discord
+  webhook validation, retry handling, 429 support and dashboard message recovery.
+- Wire periodic dashboard refresh, Chart/Voyage boundaries, Sulphur updates,
+  low-supply warnings, price warnings, deaths, recovery stops and terminal-stop
+  settings into runtime behavior.
+- Redesign the Notifications tab with masked webhook input, delivery status,
+  Allflame supply/reward/reliability groups and fractional Divine thresholds.
+- Migrate notification settings to schema 44 while preserving existing values.
+
 ## 0.23.162 - 2026-08-07
 
 - Release held Allflame Mover/process-hook input during bot stop, runtime

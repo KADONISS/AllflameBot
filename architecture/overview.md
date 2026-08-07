@@ -65,6 +65,8 @@ target documentation structure names the boundaries before any source split.
 - State objects do not perform network, filesystem or UI work.
 - Feature workflows consume context and services rather than reaching into DPB
   everywhere.
-- Notifications observe session/domain results and never decide movement.
+- Notifications observe session/domain results and never decide movement. Discord
+  delivery is queued outside the main task cycle; transport failures cannot
+  request movement, recovery or terminal stop.
 - Fallbacks must be ordered, logged and bounded per action; they must not silently
   become a second competing state machine.

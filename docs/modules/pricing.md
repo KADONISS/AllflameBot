@@ -23,6 +23,11 @@ Agents changing item valuation or notification calculations.
 - Fixed-price overlay.
 - Artwork-based unique resolution.
 
+Notification calculations consume only confirmed pickup quantities and current
+price quotes. Valuable-loot alerts use the configured fractional Divine
+threshold; stale or missing prices produce an optional warning and are not
+treated as proof of zero value.
+
 ## Required checks
 
 Treat unavailable or stale prices as uncertainty, not zero-value proof. Preserve

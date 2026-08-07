@@ -207,16 +207,23 @@ namespace AllflameBot
         public bool SendPeriodicSummary { get; set; }
         public int NotificationIntervalMinutes { get; set; }
         public int DiscordMaxItemCount { get; set; }
+        public bool NotifyLowChartSupply { get; set; }
+        public bool NotifyEmptyChartSupply { get; set; }
         public int LowChartWarningThreshold { get; set; }
+        public bool NotifyLowVoyageStash { get; set; }
         public bool TagEveryoneForLowVoyageStash { get; set; }
         public int VoyageStashEveryoneThreshold { get; set; }
         public bool NotifyValuableItems { get; set; }
         public bool NotifySecretBottleRewards { get; set; }
-        public int ValuableItemMinDivines { get; set; }
+        public double ValuableItemMinDivines { get; set; }
         public bool TagEveryoneForValuableItems { get; set; }
         public bool NotifyMapStarted { get; set; }
         public bool NotifyMapCompleted { get; set; }
         public bool NotifySulphurCollected { get; set; }
+        public bool NotifyPriceWarnings { get; set; }
+        public bool NotifyDeaths { get; set; }
+        public bool NotifyRecoveryFailures { get; set; }
+        public bool NotifyTerminalStop { get; set; }
 
         public int SettingsSchemaVersion { get; set; }
 
@@ -227,7 +234,7 @@ namespace AllflameBot
             {
                 ApplyRecommendedDefaults();
             }
-            else if (SettingsSchemaVersion < 43)
+            else if (SettingsSchemaVersion < 44)
             {
                 int oldSchema = SettingsSchemaVersion;
                 if (oldSchema < 3)
@@ -433,7 +440,20 @@ namespace AllflameBot
                     // evidence proves the board semantics for this DPB build.
                     UseNativeVoyagePlannerActions = false;
                 }
-                SettingsSchemaVersion = 43;
+                if (oldSchema < 44)
+                {
+                    NotifyLowChartSupply = true;
+                    NotifyEmptyChartSupply = true;
+                    NotifyLowVoyageStash = true;
+                    NotifyPriceWarnings = true;
+                    NotifyDeaths = true;
+                    NotifyRecoveryFailures = true;
+                    NotifyTerminalStop = true;
+                    NotificationIntervalMinutes = Math.Max(
+                        1,
+                        Math.Min(60, NotificationIntervalMinutes));
+                }
+                SettingsSchemaVersion = 44;
                 Save();
             }
         }
@@ -814,19 +834,26 @@ namespace AllflameBot
             DiscordNotificationsEnabled = false;
             DiscordWebhookUrl = String.Empty;
             SendPeriodicSummary = true;
-            NotificationIntervalMinutes = 60;
+            NotificationIntervalMinutes = 5;
             DiscordMaxItemCount = 12;
+            NotifyLowChartSupply = true;
+            NotifyEmptyChartSupply = true;
             LowChartWarningThreshold = 10;
+            NotifyLowVoyageStash = true;
             TagEveryoneForLowVoyageStash = false;
             VoyageStashEveryoneThreshold = 10;
             NotifyValuableItems = true;
             NotifySecretBottleRewards = true;
-            ValuableItemMinDivines = 10;
+            ValuableItemMinDivines = 10d;
             TagEveryoneForValuableItems = false;
             NotifyMapStarted = true;
             NotifyMapCompleted = true;
             NotifySulphurCollected = true;
-            SettingsSchemaVersion = 41;
+            NotifyPriceWarnings = true;
+            NotifyDeaths = true;
+            NotifyRecoveryFailures = true;
+            NotifyTerminalStop = true;
+            SettingsSchemaVersion = 44;
         }
 
         private void ApplySecretBottleDefaults()

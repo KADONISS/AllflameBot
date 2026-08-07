@@ -84,21 +84,28 @@ Trong tab `Prices`:
 
 Trong tab `Notifications`:
 
-- Dán Discord webhook vào `Webhook URL`.
+- Dán Discord webhook HTTPS vào `Discord webhook URL`; ô nhập mặc định được
+  che và chỉ cho phép endpoint Discord hợp lệ.
 - Bật `Enable Discord notifications`.
 - Bấm `Send test notification` để kiểm tra webhook.
-- Ngay khi session bắt đầu, bot tạo đúng một message gồm bốn phần `Session
-  Summary`, `Remaining Resources`, `Items Found`, `Total Profit`, rồi edit
-  trực tiếp message đó khi dữ liệu thay đổi.
-- Muốn tag toàn bộ server khi có đồ giá trị, bật `Notify valuable item drops`
+- `Refresh dashboard periodically` cập nhật một message dashboard duy nhất;
+  có thể đặt chu kỳ bằng `Refresh interval (minutes)` hoặc bấm `Send dashboard
+  now`.
+- Dashboard hiển thị trạng thái Chart Runner/Voyage Runner, area, Lantern,
+  Sulphur, Chart inventory, Chart Storage, Voyage Stash, loot đã xác nhận và
+  profit.
+- Muốn tag toàn bộ server khi có đồ giá trị, bật `Notify valuable confirmed
+  loot`
   và `Tag @everyone for valuable items`, sau đó đặt `Minimum value (Divine
-  Orbs)`. Ví dụ đặt `1` để tag khi món đã nhặt có tổng giá trị từ 1 Divine.
+  Orbs`. Có thể dùng giá trị lẻ như `0.5`.
 - Alert `@everyone` chỉ được gửi sau khi pickup đã xác nhận; dashboard session
   vẫn được edit bình thường.
-- Chọn chu kỳ refresh dự phòng, số item tối đa, ngưỡng cảnh báo Chart và ngưỡng
-  giá trị item cần báo riêng.
-- Map, chest, loot, profit, Sulphur, trạng thái dừng và mọi cảnh báo đều cập
-  nhật trên dashboard; bot không gửi thêm card riêng cho từng sự kiện.
+- Nhóm `Chart and Voyage Supply` điều khiển cảnh báo Chart thấp/hết và Voyage
+  Stash thấp. Nhóm `Loot and Rewards` điều khiển loot giá trị và Bottle reward.
+- Nhóm `Run and Reliability Alerts` điều khiển price warning, death, recovery
+  failure và terminal stop.
+- Notification chạy qua queue nền, không giữ movement/task cycle và không tự
+  quyết định stop bot.
 
 Bot chỉ cộng item sau khi xác nhận item đã biến mất khỏi mặt đất. Vì vậy các
 lần click retry không làm tăng trùng số lượng hoặc lợi nhuận.

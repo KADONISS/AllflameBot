@@ -30,7 +30,7 @@ introduced.
 | `Element` tree | Stable DPB UI discovery and interaction | UI adapter region |
 | GDI screenshot APIs | Visual fallback matching | UI fallback region |
 | `poe.ninja` | Price feed | `AllflamePrices` |
-| Discord webhook | Session dashboard and alerts | `AllflameNotifications` |
+| Discord webhook | Allflame session dashboard and bounded alerts | `AllflameNotifications` queue/transport |
 | Local JSON/files | Settings, prices, mapping and backups | Infrastructure |
 
 ## Target direction

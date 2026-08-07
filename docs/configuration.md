@@ -39,6 +39,33 @@ user data and must not be committed.
 - Pricing and unique artwork resolution.
 - Discord notifications.
 
+## Discord notification settings
+
+Notification settings are migrated with `SettingsSchemaVersion` and remain
+runtime user data. The webhook is accepted only when it is an HTTPS Discord
+webhook URL; it is never written to structured logs.
+
+- `DiscordNotificationsEnabled` controls outbound delivery.
+- `SendPeriodicSummary` and `NotificationIntervalMinutes` control periodic
+  updates to the single live dashboard message. Boundary updates remain
+  controlled by `NotifyMapStarted`, `NotifyMapCompleted` and the throttled
+  `NotifySulphurCollected` setting.
+- Chart/Voyage supply alerts use `NotifyLowChartSupply`,
+  `NotifyEmptyChartSupply`, `LowChartWarningThreshold`,
+  `NotifyLowVoyageStash` and `VoyageStashEveryoneThreshold`.
+- Loot/reward alerts use `NotifyValuableItems`, fractional
+  `ValuableItemMinDivines`, `TagEveryoneForValuableItems` and
+  `NotifySecretBottleRewards`.
+- Runtime alerts use `NotifyPriceWarnings`, `NotifyDeaths`,
+  `NotifyRecoveryFailures` and `NotifyTerminalStop`.
+- Delivery runs outside the main task cycle through a bounded queue. Discord
+  failures are retried and logged without changing movement, recovery or stop
+  ownership.
+
+The dashboard content is Allflame-specific: it reports Chart/Voyage progress,
+Lantern, Sulphur, Chart inventory, Chart Storage, Voyage Stash, confirmed loot,
+profit, current activity and the latest alert.
+
 ## Caution
 
 A setting visible in the GUI is not automatically a runtime guarantee. Before

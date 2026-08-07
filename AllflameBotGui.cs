@@ -459,15 +459,14 @@ namespace AllflameBot
 
         private UIElement BuildNotificationsTab()
         {
-            var grid = PanelGrid(4);
-            grid.RowDefinitions.Add(new RowDefinition
+            var grid = PanelGrid(2);
+            for (int row = 0; row < 3; row++)
             {
-                Height = GridLength.Auto
-            });
-            grid.RowDefinitions.Add(new RowDefinition
-            {
-                Height = GridLength.Auto
-            });
+                grid.RowDefinitions.Add(new RowDefinition
+                {
+                    Height = GridLength.Auto
+                });
+            }
             _notificationStatus = new TextBlock
             {
                 Foreground = MutedBrush,
@@ -475,44 +474,60 @@ namespace AllflameBot
             };
             RefreshNotificationStatus();
 
-            grid.Children.Add(Card("DISCORD", Stack(
+            grid.Children.Add(Card("DISCORD CONNECTION", Stack(
                 Check("Enable Discord notifications", "DiscordNotificationsEnabled"),
-                Text("Webhook URL", "DiscordWebhookUrl"),
+                SecretText("Discord webhook URL (HTTPS)", "DiscordWebhookUrl"),
                 Button("Send test notification", delegate
                 {
                     _settings.Save();
                     AllflameNotifications.SendTest();
                 }),
+                Button("Send dashboard now", delegate
+                {
+                    _settings.Save();
+                    AllflameNotifications.RequestDashboardUpdate(true);
+                }),
+                Note("The webhook is stored in user settings and is never written to the bot log."),
                 _notificationStatus)));
             Grid.SetColumn(grid.Children[0], 0);
 
-            grid.Children.Add(Card("SESSION SUMMARY", Stack(
-                Number("Maximum item rows", "DiscordMaxItemCount", 1, 15),
-                Note("The dashboard updates only at session start, map enter, map exit and terminal stop."),
-                Note("Loot, chests, Sulphur, deaths and alerts are staged until the next boundary."))));
+            grid.Children.Add(Card("LIVE ALLFLAME DASHBOARD", Stack(
+                Check("Refresh dashboard periodically", "SendPeriodicSummary"),
+                Number("Refresh interval (minutes)", "NotificationIntervalMinutes", 1, 60),
+                Number("Maximum confirmed loot rows", "DiscordMaxItemCount", 1, 15),
+                Check("Update when Chart or Voyage starts", "NotifyMapStarted"),
+                Check("Update when Chart or Voyage completes", "NotifyMapCompleted"),
+                Check("Update on confirmed Sulphur changes", "NotifySulphurCollected"),
+                Note("The dashboard is one edited Discord message containing Chart, Voyage, Lantern, supply, loot and profit state."))));
             Grid.SetColumn(grid.Children[1], 1);
 
-            grid.Children.Add(Card("SUPPLY WARNINGS", Stack(
-                Number("Warn when total Charts reach", "LowChartWarningThreshold", 0, 1000),
-                Check("Tag @everyone when Voyage Stash is low", "TagEveryoneForLowVoyageStash"),
-                Number("Voyage Stash @everyone threshold", "VoyageStashEveryoneThreshold", 0, 1000),
-                Note("Remaining resources combine inventory Charts and the last scanned Voyage Stash count."),
-                Note("The Voyage Stash alert is sent once when the confirmed count reaches the configured threshold."))));
-            Grid.SetColumn(grid.Children[2], 2);
+            grid.Children.Add(Card("CHART AND VOYAGE SUPPLY", Stack(
+                Check("Notify when Chart supply is low", "NotifyLowChartSupply"),
+                Number("Warn when total Charts are at or below", "LowChartWarningThreshold", 0, 1000),
+                Check("Notify when no Charts remain", "NotifyEmptyChartSupply"),
+                Check("Notify when Voyage Stash is low", "NotifyLowVoyageStash"),
+                Number("Voyage Stash warning threshold", "VoyageStashEveryoneThreshold", 0, 1000),
+                Check("Tag @everyone for low Voyage Stash", "TagEveryoneForLowVoyageStash"),
+                Note("Supply combines confirmed inventory Charts and the latest known Voyage Stash count. Chart Storage is shown when its last scan is known."))));
+            Grid.SetRow(grid.Children[2], 1);
+            Grid.SetColumn(grid.Children[2], 0);
 
-            grid.Children.Add(Card("VALUABLE ITEMS", Stack(
-                Check("Notify valuable item drops", "NotifyValuableItems"),
+            grid.Children.Add(Card("LOOT AND REWARDS", Stack(
+                Check("Notify valuable confirmed loot", "NotifyValuableItems"),
                 Check("Tag @everyone for valuable items", "TagEveryoneForValuableItems"),
-                Number("Minimum value (Divine Orbs)", "ValuableItemMinDivines", 1, 10000),
-                Note("Set the minimum to 1 to ping @everyone for confirmed pickups worth at least 1 Divine."),
-                Note("The alert is emitted only after the pickup is confirmed, so retries do not duplicate it."))));
-            Grid.SetColumn(grid.Children[3], 3);
+                DecimalNumber("Minimum value (Divine Orbs)", "ValuableItemMinDivines", 0d, 10000d),
+                Check("Notify confirmed Message in a Bottle rewards", "NotifySecretBottleRewards"),
+                Note("Valuable and Bottle alerts are emitted only after inventory/pickup confirmation."))));
+            Grid.SetRow(grid.Children[3], 1);
+            Grid.SetColumn(grid.Children[3], 1);
 
-            grid.Children.Add(Card("BOTTLE REWARDS", Stack(
-                Check("Notify rewards opened from Message in a Bottle", "NotifySecretBottleRewards"),
-                Note("A notification is sent only after the reward is confirmed in inventory."),
-                Note("Rewards meeting the Valuable Items threshold also use that alert independently."))));
-            Grid.SetRow(grid.Children[4], 1);
+            grid.Children.Add(Card("RUN AND RELIABILITY ALERTS", Stack(
+                Check("Notify deaths and abandoned runs", "NotifyDeaths"),
+                Check("Notify failed recovery conditions", "NotifyRecoveryFailures"),
+                Check("Notify terminal bot stop", "NotifyTerminalStop"),
+                Check("Notify stale or missing price data", "NotifyPriceWarnings"),
+                Note("Notification delivery never owns movement, recovery or stop decisions. Network failures are logged and bounded."))));
+            Grid.SetRow(grid.Children[4], 2);
             Grid.SetColumn(grid.Children[4], 0);
             Grid.SetColumnSpan(grid.Children[4], 2);
             return grid;
@@ -546,9 +561,7 @@ namespace AllflameBot
                 return;
             }
             _notificationStatus.Text =
-                String.IsNullOrWhiteSpace(_settings.DiscordWebhookUrl)
-                    ? "Webhook is not configured."
-                    : "Webhook configured. Use the test button to verify delivery.";
+                AllflameNotifications.GetStatusDescription();
         }
 
         private void RebuildChestRows()
@@ -886,6 +899,91 @@ namespace AllflameBot
                 _settings.Save();
             };
 
+            return panel;
+        }
+
+        private UIElement SecretText(string label, string propertyName)
+        {
+            var property = typeof(AllflameSettings).GetProperty(propertyName);
+            string value = Convert.ToString(
+                property.GetValue(_settings, null),
+                CultureInfo.InvariantCulture) ?? String.Empty;
+            var panel = new Grid { Margin = new Thickness(0, 5, 0, 5) };
+            panel.RowDefinitions.Add(new RowDefinition());
+            panel.RowDefinitions.Add(new RowDefinition());
+
+            panel.Children.Add(new TextBlock
+            {
+                Text = label,
+                Foreground = TextBrush,
+                FontSize = 13
+            });
+
+            var row = new Grid { Margin = new Thickness(0, 4, 0, 0) };
+            row.ColumnDefinitions.Add(new ColumnDefinition());
+            row.ColumnDefinitions.Add(new ColumnDefinition
+            {
+                Width = new GridLength(52)
+            });
+            var password = new PasswordBox
+            {
+                Password = value,
+                Foreground = Brushes.White,
+                Background = Brush("#3a3a3a"),
+                BorderBrush = Brush("#b0b0b0"),
+                Padding = new Thickness(5),
+                FontSize = 13
+            };
+            var visible = new TextBox
+            {
+                Text = value,
+                Visibility = Visibility.Collapsed,
+                Foreground = Brushes.White,
+                Background = Brush("#3a3a3a"),
+                BorderBrush = Brush("#b0b0b0"),
+                Padding = new Thickness(5),
+                FontSize = 13
+            };
+            var show = new CheckBox
+            {
+                Content = "Show",
+                Foreground = TextBrush,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(6, 0, 0, 0)
+            };
+            row.Children.Add(password);
+            row.Children.Add(visible);
+            Grid.SetColumn(visible, 0);
+            Grid.SetColumn(show, 1);
+            row.Children.Add(show);
+            Grid.SetRow(row, 1);
+            panel.Children.Add(row);
+
+            password.PasswordChanged += delegate
+            {
+                property.SetValue(_settings, password.Password ?? String.Empty, null);
+                _settings.Save();
+            };
+            visible.TextChanged += delegate
+            {
+                if (visible.Visibility == Visibility.Visible)
+                {
+                    property.SetValue(_settings, visible.Text ?? String.Empty, null);
+                    _settings.Save();
+                }
+            };
+            show.Checked += delegate
+            {
+                visible.Text = password.Password;
+                password.Visibility = Visibility.Collapsed;
+                visible.Visibility = Visibility.Visible;
+            };
+            show.Unchecked += delegate
+            {
+                password.Password = visible.Text;
+                visible.Visibility = Visibility.Collapsed;
+                password.Visibility = Visibility.Visible;
+            };
             return panel;
         }
 

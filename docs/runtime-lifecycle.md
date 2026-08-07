@@ -24,7 +24,9 @@ changes.
 - `Initialize`: logging, settings, prices and task registration.
 - `Start`: state reset, session start, mover selection, process hook and main
   coroutine.
-- `Tick`: task-manager tick, notification tick and coroutine resume.
+- `Tick`: task-manager tick, notification tick and coroutine resume. Notification
+  tick schedules bounded periodic dashboard work and price/supply checks; it
+  does not perform network I/O synchronously in the task cycle.
 - `Logic`: forwards logic requests to enabled tasks.
 - `Message`: forwards messages; `allflame_bot.snapshot` requests a main-cycle
   context snapshot.

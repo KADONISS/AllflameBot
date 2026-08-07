@@ -98,6 +98,15 @@ namespace AllflameBot
         public List<string> Parse { get; set; }
     }
 
+    internal sealed class AllflameNotificationRequest
+    {
+        public List<DiscordEmbed> Embeds { get; set; }
+        public string Content { get; set; }
+        public bool MentionEveryone { get; set; }
+        public string EventName { get; set; }
+        public int Generation { get; set; }
+    }
+
     internal static class AllflameSession
     {
         private const string SulphurPriceName = "Dead Man's Sulphur";
@@ -601,9 +610,11 @@ namespace AllflameBot
     {
         private static readonly object Sync = new object();
         private static readonly HttpClient Client = CreateClient();
+        private static readonly Queue<AllflameNotificationRequest> ImmediateQueue =
+            new Queue<AllflameNotificationRequest>();
         private static bool _lowChartsSent;
         private static bool _noChartsSent;
-        private static bool _lowVoyageStashEveryoneSent;
+        private static bool _lowVoyageStashSent;
         private static bool _priceWarningSent;
         private static string _stopReason = String.Empty;
         private static string _stopDetail = String.Empty;
@@ -622,7 +633,13 @@ namespace AllflameBot
         private static bool _dashboardWorkerRunning;
         private static bool _dashboardStopped;
         private static DateTime _dashboardNotBeforeUtc = DateTime.MinValue;
+        private static DateTime _lastPeriodicUpdateUtc = DateTime.MinValue;
+        private static DateTime _lastSulphurUpdateUtc = DateTime.MinValue;
+        private static bool _immediateWorkerRunning;
         private static int _dashboardGeneration;
+        private static DateTime _lastDeliveryUtc = DateTime.MinValue;
+        private static string _lastDeliveryStatus = "Never";
+        private static string _lastDeliveryError = String.Empty;
 
         public static void Reset()
         {
@@ -630,7 +647,7 @@ namespace AllflameBot
             {
                 _lowChartsSent = false;
                 _noChartsSent = false;
-                _lowVoyageStashEveryoneSent = false;
+                _lowVoyageStashSent = false;
                 _priceWarningSent = false;
                 _stopReason = String.Empty;
                 _stopDetail = String.Empty;
@@ -649,6 +666,10 @@ namespace AllflameBot
                 _dashboardWorkerRunning = false;
                 _dashboardStopped = false;
                 _dashboardNotBeforeUtc = DateTime.MinValue;
+                _lastPeriodicUpdateUtc = DateTime.MinValue;
+                _lastSulphurUpdateUtc = DateTime.MinValue;
+                ImmediateQueue.Clear();
+                _immediateWorkerRunning = false;
                 _dashboardGeneration++;
             }
             AllflameLog.Info(
@@ -666,6 +687,7 @@ namespace AllflameBot
                 _activityStatus = "Session running";
                 _lastEvent = "Session started";
                 _boundaryEvent = "SessionStart";
+                _lastPeriodicUpdateUtc = DateTime.UtcNow;
             }
             RequestBoundaryUpdate("SessionStart");
         }
@@ -713,7 +735,16 @@ namespace AllflameBot
                 "|MapNumber=" + snapshot.Number +
                 "|AreaId=" + AllflameContext.AreaId +
                 "|AreaHash=" + AllflameContext.AreaHash);
-            RequestBoundaryUpdate("MapEnter");
+            if (AllflameSettings.Instance.NotifyMapStarted)
+            {
+                RequestBoundaryUpdate(
+                    String.Equals(
+                        mapType,
+                        "Voyage",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? "VoyageStart"
+                        : "ChartStart");
+            }
         }
 
         public static void SendMapCompleted(
@@ -741,22 +772,41 @@ namespace AllflameBot
                     ? mapType +
                       " finished; session totals updated"
                     : mapType + " ended without successful completion";
-                _boundaryEvent = "MapExit";
+                _boundaryEvent = String.Equals(
+                    mapType,
+                    "Voyage",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? "VoyageComplete"
+                    : "ChartComplete";
             }
             ResolveCharacterNameAtBoundary();
-            RequestBoundaryUpdate("MapExit");
+            if (AllflameSettings.Instance.NotifyMapCompleted)
+            {
+                RequestDashboardUpdate(true);
+            }
         }
 
         public static void SendSulphurCollected(int quantity, int total)
         {
+            bool updateDashboard = false;
             lock (Sync)
             {
                 _lastEvent =
                     "Sulphur +" + Math.Max(1, quantity) +
                     " confirmed | Session total: " +
                     Math.Max(0, total);
+                if (AllflameSettings.Instance.NotifySulphurCollected &&
+                    (DateTime.UtcNow - _lastSulphurUpdateUtc).TotalSeconds >= 30d)
+                {
+                    _lastSulphurUpdateUtc = DateTime.UtcNow;
+                    _boundaryEvent = "SulphurUpdate";
+                    updateDashboard = true;
+                }
             }
-            // Sulphur changes session state only; the next boundary publishes it.
+            if (updateDashboard)
+            {
+                RequestDashboardUpdate(false);
+            }
         }
 
         public static void Tick()
@@ -772,9 +822,36 @@ namespace AllflameBot
                 return;
             }
 
+            if (settings.SendPeriodicSummary)
+            {
+                bool periodicUpdate;
+                lock (Sync)
+                {
+                    periodicUpdate =
+                        _lastPeriodicUpdateUtc == DateTime.MinValue ||
+                        DateTime.UtcNow - _lastPeriodicUpdateUtc >=
+                        TimeSpan.FromMinutes(
+                            Math.Max(
+                                1,
+                                Math.Min(
+                                    60,
+                                    settings.NotificationIntervalMinutes)));
+                    if (periodicUpdate)
+                    {
+                        _lastPeriodicUpdateUtc = DateTime.UtcNow;
+                        _boundaryEvent = "PeriodicSummary";
+                    }
+                }
+                if (periodicUpdate)
+                {
+                    RequestDashboardUpdate(false);
+                }
+            }
+
             DateTime priceUpdated = AllflamePrices.UpdatedUtc;
             bool priceDataStale =
                 settings.EnablePricing &&
+                settings.NotifyPriceWarnings &&
                 AllflameSession.Duration >= TimeSpan.FromMinutes(2) &&
                 (priceUpdated == DateTime.MinValue ||
                  DateTime.UtcNow - priceUpdated >=
@@ -815,24 +892,31 @@ namespace AllflameBot
             {
                 lock (Sync)
                 {
-                    _lowVoyageStashEveryoneSent = false;
+                    _lowVoyageStashSent = false;
                 }
             }
-            else if (settings.TagEveryoneForLowVoyageStash)
+            else if (!settings.NotifyLowVoyageStash)
+            {
+                lock (Sync)
+                {
+                    _lowVoyageStashSent = false;
+                }
+            }
+            else if (settings.NotifyLowVoyageStash)
             {
                 bool sendVoyageStashAlert;
                 lock (Sync)
                 {
                     sendVoyageStashAlert =
-                        !_lowVoyageStashEveryoneSent;
-                    _lowVoyageStashEveryoneSent = true;
+                        !_lowVoyageStashSent;
+                    _lowVoyageStashSent = true;
                 }
                 if (sendVoyageStashAlert)
                 {
                     MarkPendingAlert(
                         "Low Voyage Stash supply: " + stash +
                         " (threshold " + voyageStashThreshold + ").",
-                        true);
+                        settings.TagEveryoneForLowVoyageStash);
                 }
             }
             int total = inventory + stash;
@@ -841,7 +925,7 @@ namespace AllflameBot
                 bool shouldSend;
                 lock (Sync)
                 {
-                    shouldSend = !_noChartsSent;
+                    shouldSend = settings.NotifyEmptyChartSupply && !_noChartsSent;
                     _noChartsSent = true;
                 }
                 if (shouldSend)
@@ -854,12 +938,35 @@ namespace AllflameBot
                 bool shouldSend;
                 lock (Sync)
                 {
-                    shouldSend = !_lowChartsSent;
+                    shouldSend = settings.NotifyLowChartSupply && !_lowChartsSent;
                     _lowChartsSent = true;
                 }
                 if (shouldSend)
                 {
                     SendChartSupply(false, inventory, stash);
+                }
+            }
+            else
+            {
+                lock (Sync)
+                {
+                    _lowChartsSent = false;
+                    _noChartsSent = false;
+                    _lowVoyageStashSent = false;
+                }
+            }
+            if (!settings.NotifyEmptyChartSupply)
+            {
+                lock (Sync)
+                {
+                    _noChartsSent = false;
+                }
+            }
+            if (!settings.NotifyLowChartSupply)
+            {
+                lock (Sync)
+                {
+                    _lowChartsSent = false;
                 }
             }
         }
@@ -870,6 +977,8 @@ namespace AllflameBot
             {
                 _stopReason = reason ?? String.Empty;
                 _stopDetail = detail ?? String.Empty;
+                _lastEvent = "Stop requested: " +
+                    HumanizeStopReason(_stopReason);
             }
         }
 
@@ -898,6 +1007,21 @@ namespace AllflameBot
                 (String.IsNullOrWhiteSpace(stopType) ? "UserStop" : stopType) +
                 "|Reason=" + reason.Replace("|", "/") +
                 "|ConfirmedItems=Committed|DiscardedPendingItems=0");
+            if (AllflameSettings.Instance.NotifyRecoveryFailures &&
+                !String.Equals(
+                    stopType,
+                    "UserStop",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                MarkPendingAlert(
+                    "Bot stopped after a runtime recovery or terminal condition: " +
+                    reason,
+                    false);
+            }
+            if (!AllflameSettings.Instance.NotifyTerminalStop)
+            {
+                return;
+            }
             SendSessionSummary(reason, true);
             if (!String.IsNullOrWhiteSpace(detail))
             {
@@ -922,7 +1046,14 @@ namespace AllflameBot
                 _warningText =
                     "The current Chart cannot be re-entered after death.";
             }
-            MarkPendingAlert(_warningText, false);
+            if (AllflameSettings.Instance.NotifyDeaths)
+            {
+                MarkPendingAlert(_warningText, false);
+            }
+            else
+            {
+                RequestDashboardUpdate(false);
+            }
         }
 
         public static void SendVoyageAbandoned()
@@ -935,7 +1066,14 @@ namespace AllflameBot
                 _warningText =
                     "The current Voyage could not be resumed.";
             }
-            MarkPendingAlert(_warningText, false);
+            if (AllflameSettings.Instance.NotifyDeaths)
+            {
+                MarkPendingAlert(_warningText, false);
+            }
+            else
+            {
+                RequestDashboardUpdate(false);
+            }
         }
 
         public static void SendValuableItem(
@@ -970,10 +1108,28 @@ namespace AllflameBot
                     " x" + quote.Quantity +
                     " | " + valueText;
             }
-            MarkPendingAlert(
-                "Valuable item: " + quote.Name + " x" + quote.Quantity +
-                " (" + valueText + ")",
-                AllflameSettings.Instance.TagEveryoneForValuableItems);
+            var embed = NewEmbed(
+                "Allflame Bot - Valuable Loot",
+                BuildTable(new[]
+                {
+                    Pair("Item", quote.Name),
+                    Pair("Quantity", quote.Quantity.ToString()),
+                    Pair("Value", valueText),
+                    Pair("Source", source ?? "Confirmed pickup")
+                }),
+                0xF1C40F);
+            embed.Footer = new DiscordEmbedFooter
+            {
+                Text = PriceFooter()
+            };
+            Send(
+                new List<DiscordEmbed> { embed },
+                AllflameSettings.Instance.TagEveryoneForValuableItems
+                    ? "@everyone"
+                    : null,
+                AllflameSettings.Instance.TagEveryoneForValuableItems,
+                "ValuableLoot");
+            RequestDashboardUpdate(false);
         }
 
         public static void SendSecretBottleReward(
@@ -1030,8 +1186,8 @@ namespace AllflameBot
                         : "Unpriced";
                 var embed = NewEmbed(
                     valuableNotification
-                        ? "Valuable bottle reward added to inventory"
-                        : "Bottle reward added to inventory",
+                        ? "Allflame Bot - Valuable Bottle Reward"
+                        : "Allflame Bot - Bottle Reward Confirmed",
                     BuildTable(new[]
                     {
                         Pair("Item", quote.Name ?? "Unknown"),
@@ -1048,7 +1204,8 @@ namespace AllflameBot
                 Send(
                     new List<DiscordEmbed> { embed },
                     tagEveryone ? "@everyone" : null,
-                    tagEveryone);
+                    tagEveryone,
+                    "BottleReward");
             }
 
             if (valuableNotification)
@@ -1061,10 +1218,28 @@ namespace AllflameBot
                         " | " + FormatDivines(valuableValue);
                 }
             }
+            else if (bottleNotification)
+            {
+                lock (Sync)
+                {
+                    _lastEvent =
+                        "Bottle reward: " + quote.Name +
+                        " x" + quantity +
+                        " | " + (decision ?? "Keep");
+                }
+            }
+            if (immediateNotification)
+            {
+                RequestDashboardUpdate(false);
+            }
         }
 
         public static void SendPriceWarning(string message)
         {
+            if (!AllflameSettings.Instance.NotifyPriceWarnings)
+            {
+                return;
+            }
             bool shouldSend;
             lock (Sync)
             {
@@ -1085,7 +1260,7 @@ namespace AllflameBot
         public static void SendTest()
         {
             var embed = NewEmbed(
-                "🔥 Allflame Notifications",
+                "Allflame Bot - Notification Test",
                 null,
                 0x0D4DCC);
             embed.Description = BuildTable(new[]
@@ -1099,7 +1274,11 @@ namespace AllflameBot
                         ? "Not configured"
                         : AllflamePrices.League)
             });
-            Send(embed);
+            Send(
+                new List<DiscordEmbed> { embed },
+                null,
+                false,
+                "Test");
         }
 
         public static void SendSessionSummary(string stopReason, bool stopped)
@@ -1132,19 +1311,28 @@ namespace AllflameBot
             string warningText;
             string stopDetail;
             string characterName;
+            string activityStatus;
+            string lastEvent;
+            AllflameRealtimeMap activeMap;
             lock (Sync)
             {
                 warningText = _warningText;
                 stopDetail = _stopDetail;
                 characterName = _characterName;
+                activityStatus = _activityStatus;
+                lastEvent = _lastEvent;
+                activeMap = _activeVoyage ?? _activeChart;
             }
 
             DiscordEmbed stats = NewEmbed(
-                characterName + " — 🔥 Allflame Session Summary",
+                characterName + " - Allflame Bot Session Dashboard",
                 null,
                 stopped ? 0xD64545 : 0x0D4DCC);
             var statsRows = new List<KeyValuePair<string, string>>
             {
+                Pair("Status", activityStatus),
+                Pair("Last event", lastEvent),
+                Pair("Phase", AllflameContext.Phase.ToString()),
                 Pair("Duration", FormatDuration(AllflameSession.Duration)),
                 Pair("Chart Areas completed", AllflameSession.ChartsCompleted.ToString()),
                 Pair("Voyages completed", AllflameSession.VoyagesCompleted.ToString()),
@@ -1153,6 +1341,32 @@ namespace AllflameBot
                 Pair("Chests opened", AllflameSession.ChestsOpened.ToString()),
                 Pair("Sulphur collected", AllflameSession.SulphurCollected.ToString())
             };
+            if (activeMap != null)
+            {
+                statsRows.Add(Pair(
+                    "Current run",
+                    activeMap.Type + " #" + activeMap.Number));
+                statsRows.Add(Pair(
+                    "Current area",
+                    String.IsNullOrWhiteSpace(activeMap.AreaName)
+                        ? AllflameContext.AreaId
+                        : activeMap.AreaName));
+                statsRows.Add(Pair(
+                    "Run duration",
+                    FormatDuration(DateTime.UtcNow - activeMap.StartedUtc)));
+                statsRows.Add(Pair(
+                    "Run Sulphur",
+                    Math.Max(
+                        0,
+                        AllflameSession.SulphurCollected -
+                        activeMap.SulphurAtStart).ToString()));
+                statsRows.Add(Pair(
+                    "Run chests",
+                    Math.Max(
+                        0,
+                        AllflameSession.ChestsOpened -
+                        activeMap.ChestsAtStart).ToString()));
+            }
             if (stopped)
             {
                 statsRows.Add(Pair("Stop reason", stopReason));
@@ -1167,13 +1381,15 @@ namespace AllflameBot
                 stats.Fields.Add(new DiscordEmbedField
                 {
                     Name = "Alert",
-                    Value = warningText,
+                    Value = Truncate(warningText, 1000),
                     Inline = false
                 });
             }
             embeds.Add(stats);
 
-            DiscordEmbed resources = NewEmbed("🗺️ Remaining Resources", null, 0x3498DB);
+            DiscordEmbed resources = NewEmbed("Allflame Bot - Supply and Runner", null, 0x3498DB);
+            int voyageRequired = Math.Max(1, settings.ChartsRequiredForVoyage);
+            int voyageAvailable = Math.Max(0, AllflameRunState.VoyageAvailableCharts);
             resources.Description = BuildTable(new[]
             {
                 Pair(
@@ -1183,16 +1399,26 @@ namespace AllflameBot
                     "Charts in Voyage Stash",
                     Math.Max(0, settings.LastVoyageStashTotal).ToString()),
                 Pair(
+                    "Charts in Chart Storage",
+                    Math.Max(0, settings.LastChartStorageTotal).ToString()),
+                Pair(
                     "Voyage progress",
-                    Math.Min(
-                        Math.Max(0, AllflameRunState.VoyageAvailableCharts),
-                        Math.Max(1, settings.ChartsRequiredForVoyage)) + "/" +
-                    Math.Max(1, settings.ChartsRequiredForVoyage))
+                    Math.Min(voyageAvailable, voyageRequired) + "/" +
+                    voyageRequired),
+                Pair(
+                    "Next runner",
+                    voyageAvailable >= voyageRequired
+                        ? "Voyage Runner"
+                        : "Chart Runner"),
+                Pair(
+                    "Lantern",
+                    Math.Max(0, AllflameContext.LanternCounterCurrent) + "/" +
+                    Math.Max(0, AllflameContext.LanternCounterMaximum))
             });
             embeds.Add(resources);
 
             List<AllflameLootEntry> loot = AllflameSession.GetLootSnapshot();
-            DiscordEmbed items = NewEmbed("🎁 Items Found", null, 0x9B59B6);
+            DiscordEmbed items = NewEmbed("Allflame Bot - Confirmed Loot", null, 0x9B59B6);
             int maxItems = Math.Max(1, Math.Min(15, settings.DiscordMaxItemCount));
             int sulphurQuantity = AllflameSession.SulphurCollected;
             if (loot.Count == 0 && sulphurQuantity <= 0)
@@ -1210,7 +1436,7 @@ namespace AllflameBot
                     string sulphurValue = sulphurQuantity.ToString();
                     if (AllflameSession.SulphurUnitDivines > 0d)
                     {
-                        sulphurValue += " • " +
+                        sulphurValue += " | " +
                             FormatDivines(
                                 AllflameSession.SulphurProfitDivines);
                     }
@@ -1226,7 +1452,7 @@ namespace AllflameBot
                     string value = entry.Quantity.ToString();
                     if (entry.IsPriced)
                     {
-                        value += " • " + FormatDivines(entry.TotalDivines);
+                        value += " | " + FormatDivines(entry.TotalDivines);
                     }
                     itemRows.Add(Pair(entry.Name, value));
                 }
@@ -1240,7 +1466,7 @@ namespace AllflameBot
             }
             embeds.Add(items);
 
-            DiscordEmbed profit = NewEmbed("💰 Total Profit", null, 0x2ECC71);
+            DiscordEmbed profit = NewEmbed("Allflame Bot - Total Profit", null, 0x2ECC71);
             profit.Description = BuildTable(new[]
             {
                 Pair("Chest loot", FormatDivines(AllflameSession.LootProfitDivines)),
@@ -1278,9 +1504,13 @@ namespace AllflameBot
         public static void RequestDashboardUpdate(bool immediate)
         {
             AllflameSettings settings = AllflameSettings.Instance;
-            if (!settings.DiscordNotificationsEnabled ||
-                String.IsNullOrWhiteSpace(settings.DiscordWebhookUrl))
+            string webhook;
+            string validationError;
+            if (!TryGetWebhook(settings, out webhook, out validationError))
             {
+                SetDeliveryStatus(
+                    "Suppressed",
+                    validationError);
                 return;
             }
 
@@ -1310,7 +1540,26 @@ namespace AllflameBot
             {
                 Task.Run(async delegate
                 {
-                    await DashboardWorkerAsync(generation);
+                    try
+                    {
+                        await DashboardWorkerAsync(generation);
+                    }
+                    catch (Exception ex)
+                    {
+                        SetDeliveryStatus(
+                            "Failed",
+                            ex.GetType().Name);
+                        AllflameLog.Error(
+                            "NOTIFICATION_WORKER_FAILED",
+                            ex);
+                        lock (Sync)
+                        {
+                            if (generation == _dashboardGeneration)
+                            {
+                                _dashboardWorkerRunning = false;
+                            }
+                        }
+                    }
                 });
             }
         }
@@ -1330,16 +1579,22 @@ namespace AllflameBot
             {
                 return;
             }
+            bool changed = false;
             lock (Sync)
             {
                 if (_pendingAlert.IndexOf(message, StringComparison.Ordinal) < 0)
                 {
                     _pendingAlert = String.IsNullOrWhiteSpace(_pendingAlert)
                         ? message
-                        : _pendingAlert + "\n" + message;
+                        : Truncate(_pendingAlert + "\n" + message, 1800);
+                    changed = true;
                 }
                 _pendingEveryone = _pendingEveryone || everyone;
                 _warningText = _pendingAlert;
+            }
+            if (changed)
+            {
+                RequestDashboardUpdate(true);
             }
         }
 
@@ -1458,13 +1713,14 @@ namespace AllflameBot
             bool mentionEveryone)
         {
             AllflameSettings settings = AllflameSettings.Instance;
-            if (!settings.DiscordNotificationsEnabled ||
-                String.IsNullOrWhiteSpace(settings.DiscordWebhookUrl))
+            string webhook;
+            string validationError;
+            if (!TryGetWebhook(settings, out webhook, out validationError))
             {
+                SetDeliveryStatus("Suppressed", validationError);
                 return false;
             }
 
-            string webhook = settings.DiscordWebhookUrl.Trim();
             string messageId;
             lock (Sync)
             {
@@ -1521,6 +1777,7 @@ namespace AllflameBot
                                 lastStatus = (int)response.StatusCode;
                                 if (response.IsSuccessStatusCode)
                                 {
+                                    SetDeliveryStatus("Dashboard updated", String.Empty);
                                     AllflameLog.Info("NOTIFICATION_UPDATE_SUCCESS|Action=Edit|Event=" + eventName + "|Attempt=" + attempt);
                                     return true;
                                 }
@@ -1570,6 +1827,7 @@ namespace AllflameBot
                                         }
                                     }
                                     AllflameLog.Info("NOTIFICATION_UPDATE_SUCCESS|Action=Create|Event=" + eventName + "|Attempt=" + attempt);
+                                    SetDeliveryStatus("Dashboard created", String.Empty);
                                     if (messageRecovery)
                                     {
                                         AllflameLog.Info("NOTIFICATION_MESSAGE_RECOVERY|Reason=MessageNotFound|OldMessageIdPresent=True|CreateResult=Success");
@@ -1599,6 +1857,11 @@ namespace AllflameBot
                 }
             }
             AllflameLog.Info("NOTIFICATION_UPDATE_FAILED|Action=" + (String.IsNullOrWhiteSpace(messageId) ? "Create" : "Edit") + "|Event=" + eventName + "|Attempts=3|StatusCode=" + lastStatus + "|ExceptionType=" + lastException);
+            SetDeliveryStatus(
+                "Failed",
+                lastStatus == 0
+                    ? lastException
+                    : "HTTP " + lastStatus);
             if (messageRecovery)
             {
                 AllflameLog.Info("NOTIFICATION_MESSAGE_RECOVERY|Reason=MessageNotFound|OldMessageIdPresent=True|CreateResult=Failed");
@@ -1645,6 +1908,34 @@ namespace AllflameBot
             };
         }
 
+        public static string GetStatusDescription()
+        {
+            AllflameSettings settings = AllflameSettings.Instance;
+            string webhook;
+            string validationError;
+            if (!TryGetWebhook(settings, out webhook, out validationError))
+            {
+                return settings.DiscordNotificationsEnabled
+                    ? "Status: " + validationError
+                    : "Status: Disabled";
+            }
+
+            lock (Sync)
+            {
+                string pending = (ImmediateQueue.Count +
+                    (_dashboardDirty ? 1 : 0)).ToString();
+                string last = _lastDeliveryUtc == DateTime.MinValue
+                    ? "Never"
+                    : _lastDeliveryUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+                string error = String.IsNullOrWhiteSpace(_lastDeliveryError)
+                    ? String.Empty
+                    : " | Error: " + _lastDeliveryError;
+                return "Status: Ready | Last delivery: " +
+                    _lastDeliveryStatus + " at " + last +
+                    " | Pending: " + pending + error;
+            }
+        }
+
         private static void Send(DiscordEmbed embed)
         {
             Send(new List<DiscordEmbed> { embed });
@@ -1652,7 +1943,7 @@ namespace AllflameBot
 
         private static void Send(List<DiscordEmbed> embeds)
         {
-            Send(embeds, null, false);
+            Send(embeds, null, false, "ImmediateAlert");
         }
 
         private static void Send(
@@ -1660,28 +1951,148 @@ namespace AllflameBot
             string contentText,
             bool allowEveryone)
         {
+            Send(embeds, contentText, allowEveryone, "ImmediateAlert");
+        }
+
+        private static void Send(
+            List<DiscordEmbed> embeds,
+            string contentText,
+            bool allowEveryone,
+            string eventName)
+        {
+            EnqueueImmediate(
+                embeds,
+                contentText,
+                allowEveryone,
+                eventName);
+        }
+
+        private static void EnqueueImmediate(
+            List<DiscordEmbed> embeds,
+            string contentText,
+            bool allowEveryone,
+            string eventName)
+        {
             AllflameSettings settings = AllflameSettings.Instance;
-            if (!settings.DiscordNotificationsEnabled ||
-                String.IsNullOrWhiteSpace(settings.DiscordWebhookUrl))
+            string webhook;
+            string validationError;
+            if (!TryGetWebhook(settings, out webhook, out validationError))
             {
+                SetDeliveryStatus("Suppressed", validationError);
                 return;
             }
 
-            string webhook = settings.DiscordWebhookUrl.Trim();
+            bool startWorker = false;
+            int queueSize;
+            lock (Sync)
+            {
+                if (ImmediateQueue.Count >= 25)
+                {
+                    SetDeliveryStatus("Dropped", "Immediate queue is full");
+                    AllflameLog.Info(
+                        "NOTIFICATION_QUEUE_DROP|Event=" +
+                        (eventName ?? "ImmediateAlert") +
+                        "|Reason=QueueFull");
+                    return;
+                }
+                ImmediateQueue.Enqueue(new AllflameNotificationRequest
+                {
+                    Embeds = (embeds ?? new List<DiscordEmbed>()).Take(10).ToList(),
+                    Content = contentText,
+                    MentionEveryone = allowEveryone,
+                    EventName = eventName ?? "ImmediateAlert",
+                    Generation = _dashboardGeneration
+                });
+                queueSize = ImmediateQueue.Count;
+                if (!_immediateWorkerRunning)
+                {
+                    _immediateWorkerRunning = true;
+                    startWorker = true;
+                }
+            }
+            AllflameLog.Info(
+                "NOTIFICATION_EVENT_ENQUEUED|Event=" +
+                (eventName ?? "ImmediateAlert") +
+                "|Queue=" + queueSize +
+                "|MentionEveryone=" + allowEveryone);
+            if (startWorker)
+            {
+                Task.Run(async delegate
+                {
+                    try
+                    {
+                        await ImmediateWorkerAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        SetDeliveryStatus("Failed", ex.GetType().Name);
+                        AllflameLog.Error(
+                            "NOTIFICATION_IMMEDIATE_WORKER_FAILED",
+                            ex);
+                        lock (Sync)
+                        {
+                            _immediateWorkerRunning = false;
+                        }
+                    }
+                });
+            }
+        }
+
+        private static async Task ImmediateWorkerAsync()
+        {
+            while (true)
+            {
+                AllflameNotificationRequest request;
+                lock (Sync)
+                {
+                    if (ImmediateQueue.Count == 0)
+                    {
+                        _immediateWorkerRunning = false;
+                        return;
+                    }
+                    request = ImmediateQueue.Dequeue();
+                }
+                bool currentGeneration;
+                lock (Sync)
+                {
+                    currentGeneration =
+                        request.Generation == _dashboardGeneration;
+                }
+                if (currentGeneration)
+                {
+                    await SendImmediateAsync(request);
+                }
+            }
+        }
+
+        private static async Task SendImmediateAsync(
+            AllflameNotificationRequest request)
+        {
+            AllflameSettings settings = AllflameSettings.Instance;
+            string webhook;
+            string validationError;
+            if (!TryGetWebhook(settings, out webhook, out validationError))
+            {
+                SetDeliveryStatus("Suppressed", validationError);
+                return;
+            }
+
             var payload = new DiscordWebhookPayload
             {
                 Username = "Allflame Bot",
-                Content = contentText,
-                AllowedMentions = allowEveryone
+                Content = request.Content,
+                AllowedMentions = request.MentionEveryone
                     ? new DiscordAllowedMentions
                     {
                         Parse = new List<string> { "everyone" }
                     }
                     : null,
-                Embeds = embeds.Take(10).ToList()
+                Embeds = request.Embeds.Take(10).ToList()
             };
             string json = JsonConvert.SerializeObject(payload);
-            Task.Run(async delegate
+            int lastStatus = 0;
+            string lastError = "None";
+            for (int attempt = 1; attempt <= 3; attempt++)
             {
                 try
                 {
@@ -1692,28 +2103,112 @@ namespace AllflameBot
                     using (HttpResponseMessage response =
                         await Client.PostAsync(webhook, content))
                     {
-                        if (!response.IsSuccessStatusCode)
+                        lastStatus = (int)response.StatusCode;
+                        if (response.IsSuccessStatusCode)
                         {
-                            string body = await response.Content.ReadAsStringAsync();
+                            SetDeliveryStatus("Sent", String.Empty);
                             AllflameLog.Info(
-                                "DISCORD_SEND_FAILED|Status=" +
-                                (int)response.StatusCode +
-                                "|Response=" + Truncate(
-                                    body.Replace("\r", " ").Replace("\n", " "),
-                                    300));
+                                "DISCORD_SEND|Event=" + request.EventName +
+                                "|Embeds=" + request.Embeds.Count +
+                                "|MentionEveryone=" + request.MentionEveryone +
+                                "|Attempt=" + attempt +
+                                "|Result=Success");
                             return;
                         }
+                        lastError = "HTTP " + lastStatus;
+                        if (attempt < 3)
+                        {
+                            int retryDelay = GetRetryDelaySeconds(response, attempt);
+                            AllflameLog.Info(
+                                "NOTIFICATION_SEND_RETRY|Event=" +
+                                request.EventName +
+                                "|Attempt=" + attempt +
+                                "|DelaySeconds=" + retryDelay +
+                                "|StatusCode=" + lastStatus);
+                            await Task.Delay(TimeSpan.FromSeconds(retryDelay));
+                        }
                     }
-                    AllflameLog.Info(
-                        "DISCORD_SEND|Embeds=" + embeds.Count +
-                        "|MentionEveryone=" + allowEveryone +
-                        "|Result=Success");
                 }
                 catch (Exception ex)
                 {
-                    AllflameLog.Error("DISCORD_SEND_FAILED", ex);
+                    lastError = ex.GetType().Name;
+                    if (attempt < 3)
+                    {
+                        int retryDelay = attempt == 1 ? 3 : 10;
+                        AllflameLog.Info(
+                            "NOTIFICATION_SEND_RETRY|Event=" +
+                            request.EventName +
+                            "|Attempt=" + attempt +
+                            "|DelaySeconds=" + retryDelay +
+                            "|StatusCode=0");
+                        await Task.Delay(TimeSpan.FromSeconds(retryDelay));
+                    }
                 }
-            });
+            }
+            SetDeliveryStatus("Failed", lastError);
+            AllflameLog.Info(
+                "DISCORD_SEND_FAILED|Event=" + request.EventName +
+                "|Attempts=3|StatusCode=" + lastStatus +
+                "|Error=" + lastError);
+        }
+
+        private static bool TryGetWebhook(
+            AllflameSettings settings,
+            out string webhook,
+            out string error)
+        {
+            webhook = String.Empty;
+            error = String.Empty;
+            if (settings == null || !settings.DiscordNotificationsEnabled)
+            {
+                error = "Notifications are disabled.";
+                return false;
+            }
+            webhook = (settings.DiscordWebhookUrl ?? String.Empty).Trim();
+            if (String.IsNullOrWhiteSpace(webhook))
+            {
+                error = "Webhook is not configured.";
+                return false;
+            }
+
+            Uri uri;
+            if (!Uri.TryCreate(webhook, UriKind.Absolute, out uri) ||
+                !String.Equals(
+                    uri.Scheme,
+                    Uri.UriSchemeHttps,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                error = "Webhook must be an HTTPS URL.";
+                return false;
+            }
+
+            string host = uri.Host ?? String.Empty;
+            bool validHost =
+                String.Equals(host, "discord.com", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(host, "discordapp.com", StringComparison.OrdinalIgnoreCase) ||
+                host.EndsWith(".discord.com", StringComparison.OrdinalIgnoreCase) ||
+                host.EndsWith(".discordapp.com", StringComparison.OrdinalIgnoreCase);
+            if (!validHost ||
+                uri.AbsolutePath.IndexOf(
+                    "/api/webhooks/",
+                    StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                error = "Webhook host or path is not a Discord webhook.";
+                return false;
+            }
+            return true;
+        }
+
+        private static void SetDeliveryStatus(string status, string error)
+        {
+            lock (Sync)
+            {
+                _lastDeliveryUtc = DateTime.UtcNow;
+                _lastDeliveryStatus = status ?? "Unknown";
+                _lastDeliveryError = String.IsNullOrWhiteSpace(error)
+                    ? String.Empty
+                    : Truncate(error.Replace("|", "/"), 180);
+            }
         }
 
         private static HttpClient CreateClient()

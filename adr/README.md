@@ -29,4 +29,5 @@ supersedes them instead of rewriting history.
 - [`0006-bounded-chart-device-descend-recovery.md`](0006-bounded-chart-device-descend-recovery.md)
 - [`0007-cooperative-voyage-runtime-budget.md`](0007-cooperative-voyage-runtime-budget.md)
 - [`0008-bounded-zero-lantern-chest-loot.md`](0008-bounded-zero-lantern-chest-loot.md)
+- [`0009-allflame-notification-delivery.md`](0009-allflame-notification-delivery.md)
 - [`0009-stop-owned-input-cleanup.md`](0009-stop-owned-input-cleanup.md)

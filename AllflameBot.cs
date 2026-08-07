@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.162";
+        public const string Current = "0.23.163";
     }
 
     public sealed class AllflameBot : IBot
