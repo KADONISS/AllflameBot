@@ -2,6 +2,16 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.161 - 2026-08-07
+
+- Recover Bathysphere approach path failures by reloading navigation, resetting
+  the mover and rotating bounded world-space approach anchors around the live
+  portal position.
+- Keep the Chart Device transaction alive after Descend while reacquiring the
+  Bathysphere; do not route a portal-entry timeout into Chart Device recovery.
+- Release the Chart Device request back to the Chart Runner after bounded
+  Bathysphere recovery exhaustion and add explicit approach-stall diagnostics.
+
 ## 0.23.160 - 2026-08-07
 
 - Optimize Chart Storage approach movement by reusing validated paths longer

@@ -26,6 +26,8 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
 - Bounded Chart Storage UI open/resolve recovery and Voyage Stash fallback.
 - Bounded Chart Device Descend confirmation recovery with Space, UI close,
   deferred fresh observation and Chart Runner handoff.
+- Bounded Bathysphere approach recovery with path reload, mover reset, live
+  portal reacquisition and Chart Runner handoff after exhaustion.
 - Chart zero-Lantern recovery that cancels unopened chest routes, preserves a
   confirmed committed chest loot session and waits for loot before return.
 - Recording stop reasons.
@@ -37,6 +39,10 @@ reacquisition, path reload, target invalidation and retry-state reset. Do not
 add an automatic stop merely because a loop is inconvenient to diagnose. Chart
 Storage UI failures must remain bounded and return to the configured supply
 fallback without converting a transient UI fault into a bot stop.
+Once Chart Device Descend is confirmed, a Bathysphere path or portal-entry
+timeout is an extraction recovery, not a new Chart Device transaction; the
+recovery must preserve capsule priority and release the Chart request only
+after its bounded budget is exhausted.
 Normal Voyage exploration must use its explicit watchdog and bounded recovery
 budget before yielding to the generic stuck-recovery task. Chart zero-Lantern
 loot preservation applies only to Chart Areas; Voyage extraction priorities are

@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.160";
+        public const string Current = "0.23.161";
     }
 
     public sealed class AllflameBot : IBot
@@ -22601,6 +22601,20 @@ namespace AllflameBot
         private const int MaximumDescendAttempts = 3;
         private const int MaximumDescendConfirmationRecoveries = 2;
         private const int MaximumEmptyDeviceRecoveries = 2;
+        private const int MaximumPortalApproachRecoveries = 3;
+        private const int MaximumPortalPathFailuresPerAnchor = 2;
+        private static readonly Vector2i[] PortalApproachOffsets =
+        {
+            new Vector2i(0, 0),
+            new Vector2i(42, 0),
+            new Vector2i(0, 42),
+            new Vector2i(-42, 0),
+            new Vector2i(0, -42),
+            new Vector2i(30, 30),
+            new Vector2i(-30, 30),
+            new Vector2i(-30, -30),
+            new Vector2i(30, -30)
+        };
         private static readonly TimeSpan CapacityFullConfirmation =
             TimeSpan.FromSeconds(3);
         private static readonly TimeSpan EmptyDeviceRecoveryDelay =
@@ -22636,6 +22650,14 @@ namespace AllflameBot
         private int _emptyDeviceRecoveries;
         private bool _portalAppearanceProgressMarked;
         private bool _portalInteractionProgressMarked;
+        private int _portalMoveFailures;
+        private int _portalApproachAnchorIndex;
+        private int _portalApproachRecoveries;
+        private int _portalTargetId;
+        private Vector2i _portalTargetPosition;
+        private DateTime _nextPortalApproachRecoveryUtc =
+            DateTime.MinValue;
+        private bool _portalPathBlocked;
 
         public EnterBathysphereTask()
             : base("LoadChartDeviceTask", "Loads a Chart into the device and presses Descend.") { }
@@ -22676,6 +22698,13 @@ namespace AllflameBot
             _emptyDeviceRecoveries = 0;
             _portalAppearanceProgressMarked = false;
             _portalInteractionProgressMarked = false;
+            _portalMoveFailures = 0;
+            _portalApproachAnchorIndex = 0;
+            _portalApproachRecoveries = 0;
+            _portalTargetId = 0;
+            _portalTargetPosition = new Vector2i();
+            _nextPortalApproachRecoveryUtc = DateTime.MinValue;
+            _portalPathBlocked = false;
         }
 
         private void ResetCustomLoadState()
@@ -22765,7 +22794,8 @@ namespace AllflameBot
             TimeSpan transactionElapsed =
                 DateTime.UtcNow - _transactionStartedUtc;
             LogTransitionHeartbeat(transactionElapsed);
-            if (transactionElapsed >= TransactionTimeout)
+            if (!_descendConfirmed &&
+                transactionElapsed >= TransactionTimeout)
             {
                 string detail =
                     "ActiveTask=" + Name +
@@ -22849,11 +22879,9 @@ namespace AllflameBot
                         "|UiRecoveries=" + _portalUiRecoveries +
                         "|ElapsedMs=" +
                         (int)portalEntryElapsed.TotalMilliseconds +
-                        "|Action=RefreshContextAndRetry");
-                    await RecoverChartDeviceTransaction(
-                        "PortalEntryTimeout",
-                        true);
-                    return true;
+                        "|Action=RefreshPathAndReacquire");
+                    return RecoverBathysphereApproach(
+                        "PortalEntryTimeout");
                 }
 
                 if (chartUiReopened)
@@ -22886,6 +22914,7 @@ namespace AllflameBot
             {
                 NetworkObject portal =
                     AllflameContext.BathysphereObject;
+                EnsurePortalApproachTarget(portal);
                 if (!_portalAppearanceProgressMarked)
                 {
                     _portalAppearanceProgressMarked = true;
@@ -22933,10 +22962,23 @@ namespace AllflameBot
                     }
                 }
 
+                Vector2i approachTarget =
+                    PortalApproachTarget(portal);
                 bool moving =
                     AllflameMovementCoordinator.MoveTowards(
-                        portal.Position,
-                        Name);
+                        approachTarget,
+                        Name + " Bathysphere Capsule Extraction");
+                if (moving)
+                {
+                    _portalMoveFailures = 0;
+                    _portalPathBlocked = false;
+                }
+                else
+                {
+                    HandlePortalApproachFailure(
+                        portal,
+                        approachTarget);
+                }
                 AllflameLog.Throttled(
                     "bathysphere_approach",
                     TimeSpan.FromSeconds(2),
@@ -22944,7 +22986,13 @@ namespace AllflameBot
                     portal.Id +
                     "|Name=" + portal.Name +
                     "|RequestedPosition=" +
+                    approachTarget +
+                    "|PortalPosition=" +
                     portal.Position +
+                    "|AnchorIndex=" +
+                    _portalApproachAnchorIndex +
+                    "|PathFailures=" +
+                    _portalMoveFailures +
                     "|Distance=" +
                     portal.Distance.ToString("0.0") +
                     "|Moving=" + moving);
@@ -22974,11 +23022,9 @@ namespace AllflameBot
                     "|ElapsedMs=" +
                     (int)(DateTime.UtcNow -
                           _portalConfirmedUtc).TotalMilliseconds +
-                    "|Action=RefreshContextAndRetry");
-                await RecoverChartDeviceTransaction(
-                    "PortalAppearanceTimeout",
-                    true);
-                return true;
+                    "|Action=RefreshPathAndReacquire");
+                return RecoverBathysphereApproach(
+                    "PortalAppearanceTimeout");
             }
 
             Element descendButton;
@@ -23357,6 +23403,189 @@ namespace AllflameBot
             return true;
         }
 
+        private void EnsurePortalApproachTarget(NetworkObject portal)
+        {
+            if (_portalTargetId == portal.Id &&
+                _portalTargetPosition == portal.Position)
+            {
+                return;
+            }
+
+            _portalTargetId = portal.Id;
+            _portalTargetPosition = portal.Position;
+            _portalMoveFailures = 0;
+            _portalApproachAnchorIndex = 0;
+            _portalPathBlocked = false;
+            AllflameLog.Info(
+                "BATHYSPHERE_APPROACH_TARGET_REFRESHED" +
+                "|Id=" + portal.Id +
+                "|Target=" + portal.Position +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|NavigationRevision=" +
+                AllflameMovementCoordinator.NavigationRevision);
+        }
+
+        private Vector2i PortalApproachTarget(NetworkObject portal)
+        {
+            int index = Math.Max(
+                0,
+                Math.Min(
+                    _portalApproachAnchorIndex,
+                    PortalApproachOffsets.Length - 1));
+            Vector2i offset = PortalApproachOffsets[index];
+            return new Vector2i(
+                portal.Position.X + offset.X,
+                portal.Position.Y + offset.Y);
+        }
+
+        private void HandlePortalApproachFailure(
+            NetworkObject portal,
+            Vector2i approachTarget)
+        {
+            _portalPathBlocked = true;
+            _portalMoveFailures++;
+            AllflameProgressWatchdog.SetRetry(
+                _portalApproachRecoveries *
+                    PortalApproachOffsets.Length +
+                _portalApproachAnchorIndex +
+                _portalMoveFailures);
+            AllflameLog.Info(
+                "BATHYSPHERE_APPROACH_PATH_FAILURE" +
+                "|Id=" + portal.Id +
+                "|PortalPosition=" + portal.Position +
+                "|ApproachTarget=" + approachTarget +
+                "|Distance=" + portal.Distance.ToString("0.0") +
+                "|Failures=" + _portalMoveFailures +
+                "|AnchorIndex=" + _portalApproachAnchorIndex +
+                "|NavigationRevision=" +
+                AllflameMovementCoordinator.NavigationRevision +
+                "|Action=RotateAnchorOrRecover");
+
+            if (_portalMoveFailures < MaximumPortalPathFailuresPerAnchor)
+            {
+                return;
+            }
+
+            _portalMoveFailures = 0;
+            if (_portalApproachAnchorIndex <
+                PortalApproachOffsets.Length - 1)
+            {
+                _portalApproachAnchorIndex++;
+                ResetBathyspherePath("BathysphereApproachAnchorRotation");
+                AllflameContext.RequestManualSnapshot();
+                AllflameProgressWatchdog.MarkProgress(
+                    "BathysphereAnchorRotated");
+                AllflameLog.Info(
+                    "BATHYSPHERE_APPROACH_ANCHOR_ROTATED" +
+                    "|Id=" + portal.Id +
+                    "|AnchorIndex=" + _portalApproachAnchorIndex +
+                    "|AnchorTarget=" + PortalApproachTarget(portal) +
+                    "|Action=RefreshPathAndContinue");
+                return;
+            }
+
+            if (DateTime.UtcNow >= _nextPortalApproachRecoveryUtc)
+            {
+                RecoverBathysphereApproach("PathFailed");
+            }
+        }
+
+        private bool RecoverBathysphereApproach(string reason)
+        {
+            if (_portalApproachRecoveries >=
+                MaximumPortalApproachRecoveries)
+            {
+                AllflameLog.Info(
+                    "BATHYSPHERE_APPROACH_RECOVERY_EXHAUSTED" +
+                    "|Recoveries=" + _portalApproachRecoveries +
+                    "|Max=" + MaximumPortalApproachRecoveries +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Action=ReleaseChartDeviceAndResumeChartRunner");
+                AllflameRunState.ReleaseChartDeviceRequest(
+                    "BathysphereApproachRecoveryExhausted");
+                ResetBathyspherePath(
+                    "BathysphereApproachRecoveryExhausted");
+                ResetTransactionState();
+                AllflameProgressWatchdog.Clear(Name);
+                AllflameContext.RequestManualSnapshot();
+                return false;
+            }
+
+            _portalApproachRecoveries++;
+            _portalMoveFailures = 0;
+            _portalApproachAnchorIndex = 0;
+            _portalPathBlocked = false;
+            _portalConfirmedUtc = DateTime.UtcNow;
+            _portalWaitUntilUtc =
+                DateTime.UtcNow + PortalAppearanceTimeout;
+            _nextPortalInteractUtc = DateTime.MinValue;
+            _transactionStartedUtc = DateTime.UtcNow;
+            _nextPortalApproachRecoveryUtc =
+                DateTime.UtcNow.AddSeconds(2);
+            ResetBathyspherePath(
+                "BathysphereApproachRecovery");
+            AllflameContext.RequestManualSnapshot();
+            AllflameProgressWatchdog.SetRetry(
+                _portalApproachRecoveries);
+            AllflameProgressWatchdog.MarkProgress(
+                "BathysphereApproachRecovery");
+            AllflameLog.Info(
+                "BATHYSPHERE_APPROACH_RECOVERY" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|Recovery=" + _portalApproachRecoveries +
+                "/" + MaximumPortalApproachRecoveries +
+                "|Action=RefreshPathAndReacquire" +
+                "|KeepChartTransaction=True");
+            return true;
+        }
+
+        private static void ResetBathyspherePath(string reason)
+        {
+            bool pathReloaded = false;
+            try
+            {
+                ExilePather.Reload(true);
+                pathReloaded = true;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BATHYSPHERE_PATH_RELOAD_FAILED" +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            bool moverReset = false;
+            try
+            {
+                AllflameMover mover =
+                    PlayerMoverManager.Current as AllflameMover;
+                if (mover != null)
+                {
+                    mover.ReleaseMovementInput();
+                    mover.ResetApproachState();
+                    moverReset = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BATHYSPHERE_MOVER_RESET_FAILED" +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            int revision =
+                AllflameMovementCoordinator.AdvanceNavigation(
+                    reason ?? "BathyspherePathReset");
+            AllflameLog.Info(
+                "BATHYSPHERE_PATH_RESET" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|PathReloaded=" + pathReloaded +
+                "|MoverReset=" + moverReset +
+                "|NavigationRevision=" + revision);
+        }
+
         private async Task<bool> RecoverDescendConfirmation(
             TimeSpan issuedFor,
             bool nativeUiOpen,
@@ -23606,8 +23835,23 @@ namespace AllflameBot
             }
 
             _lastTransitionHeartbeatUtc = now;
-            AllflameProgressWatchdog.MarkProgress(
-                "ChartDeviceHeartbeat");
+            if (!_descendConfirmed || !_portalPathBlocked)
+            {
+                AllflameProgressWatchdog.MarkProgress(
+                    "ChartDeviceHeartbeat");
+            }
+            else
+            {
+                AllflameLog.Throttled(
+                    "bathysphere_approach_watchdog",
+                    TimeSpan.FromSeconds(2),
+                    "BATHYSPHERE_APPROACH_WATCHDOG" +
+                    "|PathBlocked=True" +
+                    "|Failures=" + _portalMoveFailures +
+                    "|AnchorIndex=" + _portalApproachAnchorIndex +
+                    "|Recoveries=" + _portalApproachRecoveries +
+                    "|Action=BoundedRecovery");
+            }
             bool nativeUiOpen = false;
             bool stableUiOpen = false;
             int deviceItems = 0;

@@ -32,4 +32,10 @@ Update when source and runtime evidence confirm a changed Voyage rule.
 - Frontier, topology, detour and watchdog recovery share a bounded per-target
   budget; exhausting it rotates the strategy and does not stop the bot.
 - Bathysphere call, wait and surface transfer are separate stages.
+- A Bathysphere path failure must invalidate/rebuild movement context and may
+  rotate bounded approach anchors derived from the observed portal position;
+  it must not restart Chart Device recovery after Descend is confirmed.
+- If Bathysphere approach recovery is exhausted, release the Chart Device
+  request so the Chart Runner can resume instead of leaving a stale cycle
+  active.
 - Returning to the hub must reconcile pending surface loot and Voyage state.
