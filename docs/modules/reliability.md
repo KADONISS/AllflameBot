@@ -28,6 +28,8 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
   deferred fresh observation and Chart Runner handoff.
 - Bounded Bathysphere approach recovery with path reload, mover reset, live
   portal reacquisition and Chart Runner handoff after exhaustion.
+- Lifecycle stop and deinitialization release held Allflame Mover input and
+  clear process-hook key states before task teardown.
 - Chart zero-Lantern recovery that cancels unopened chest routes, preserves a
   confirmed committed chest loot session and waits for loot before return.
 - Recording stop reasons.

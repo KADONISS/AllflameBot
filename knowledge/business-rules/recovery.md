@@ -21,6 +21,8 @@ Update when a recovery contract or terminal condition is intentionally changed.
 - Existing `AllflameStopController.Stop` call sites are legacy terminal paths and
   must be audited before modification.
 - Recovery must leave input and movement ownership in a known state.
+- Bot stop, runtime rebuild and mover deinitialization must release owned held
+  movement input and clear process-hook key states before teardown completes.
 - Every recovery action needs a structured log with reason and next action.
 - A recovery refresh should be coalesced into the next task cycle when the
   current action does not require an immediate postcondition snapshot.

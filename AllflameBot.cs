@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.161";
+        public const string Current = "0.23.162";
     }
 
     public sealed class AllflameBot : IBot
@@ -219,18 +219,63 @@ namespace AllflameBot
             }
         }
 
-        public void Stop()
+        private static void ReleaseOwnedInput(string source)
         {
-            if (!_started)
+            bool moverHeld = false;
+            bool hookCleared = false;
+            try
             {
-                return;
+                AllflameMover mover =
+                    PlayerMoverManager.Current as AllflameMover;
+                if (mover != null)
+                {
+                    moverHeld = mover.ReleaseMovementInput();
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BOT_INPUT_MOVER_CLEANUP_FAILED" +
+                    "|Source=" + (source ?? String.Empty) +
+                    "|Type=" + ex.GetType().Name);
             }
 
-            _started = false;
+            try
+            {
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                hookCleared = true;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "BOT_INPUT_HOOK_CLEANUP_FAILED" +
+                    "|Source=" + (source ?? String.Empty) +
+                    "|Type=" + ex.GetType().Name);
+            }
+
+            AllflameLog.Info(
+                "BOT_INPUT_CLEANUP" +
+                "|Source=" + (source ?? String.Empty) +
+                "|MoverHeld=" + moverHeld +
+                "|HookCleared=" + hookCleared +
+                "|Postcondition=" +
+                (hookCleared ? "ProcessHookKeyStatesCleared" : "Unknown"));
+        }
+
+        public void Stop()
+        {
             string stopSource =
                 AllflameStopController.StopRequested
                     ? "RecoveryStop"
                     : "UserStop";
+            if (!_started)
+            {
+                ReleaseOwnedInput(stopSource + "NotStarted");
+                return;
+            }
+
+            _started = false;
+            ReleaseOwnedInput(stopSource);
             try
             {
                 if (_coroutine != null)
@@ -451,16 +496,7 @@ namespace AllflameBot
                     "|Type=" + ex.GetType().Name);
             }
 
-            try
-            {
-                LokiPoe.ProcessHookManager.ClearAllKeyStates();
-            }
-            catch (Exception ex)
-            {
-                AllflameLog.Info(
-                    "BOT_REBUILD_INPUT_CLEANUP_FAILED" +
-                    "|Type=" + ex.GetType().Name);
-            }
+            ReleaseOwnedInput("RuntimeRebuild");
         }
 
         public Task<LogicResult> Logic(Logic logic)
@@ -12142,6 +12178,7 @@ namespace AllflameBot
             {
                 bool inputSent = false;
                 bool focusSent = false;
+                bool inputCleanupSucceeded = false;
                 string inputReason = "Space";
                 try
                 {
@@ -12178,6 +12215,23 @@ namespace AllflameBot
                         (exception.Message ?? String.Empty)
                             .Replace("|", "/"));
                 }
+                finally
+                {
+                    try
+                    {
+                        LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                        inputCleanupSucceeded = true;
+                    }
+                    catch (Exception exception)
+                    {
+                        AllflameLog.Info(
+                            "VOYAGE_PLANNER_CLOSE_INPUT_CLEANUP_FAILED" +
+                            "|Reason=" + (reason ?? String.Empty) +
+                            "|Attempt=" + attempt + "/" +
+                            MaximumVoyagePlannerCloseAttempts +
+                            "|Exception=" + exception.GetType().Name);
+                    }
+                }
 
                 await LokiCoroutine.Sleep(
                     (int)VoyagePlannerCloseVerificationDelay.TotalMilliseconds);
@@ -12193,6 +12247,7 @@ namespace AllflameBot
                     "|Mode=" + inputReason +
                     "|FocusSent=" + focusSent +
                     "|InputSent=" + inputSent +
+                    "|InputCleanup=" + inputCleanupSucceeded +
                     "|Postcondition=" + closed +
                     "|Source=" + verificationSource);
                 if (closed)
@@ -16226,14 +16281,38 @@ namespace AllflameBot
                 AllflameContext.PlanVoyageVisible ||
                 VoyagePlanningUi.IsOpen();
             bool spaceSent = false;
+            bool spaceCleanupSucceeded = false;
             if (planningOpenAfterApi)
             {
-                LokiPoe.Input.SimulateKeyEvent(
-                    System.Windows.Forms.Keys.Space,
-                    true,
-                    false,
-                    true);
-                spaceSent = true;
+                try
+                {
+                    LokiPoe.Input.SimulateKeyEvent(
+                        System.Windows.Forms.Keys.Space,
+                        true,
+                        false,
+                        true);
+                    spaceSent = true;
+                }
+                catch (Exception ex)
+                {
+                    AllflameLog.Info(
+                        "VOYAGE_STASH_SPACE_FAILED" +
+                        "|Type=" + ex.GetType().Name);
+                }
+                finally
+                {
+                    try
+                    {
+                        LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                        spaceCleanupSucceeded = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        AllflameLog.Info(
+                            "VOYAGE_STASH_SPACE_CLEANUP_FAILED" +
+                            "|Type=" + ex.GetType().Name);
+                    }
+                }
                 await LokiCoroutine.Sleep(350);
                 AllflameContext.Refresh(true);
             }
@@ -16258,6 +16337,7 @@ namespace AllflameBot
                 "|PlanningOpenBefore=" + planningOpenBefore +
                 "|PlanningOpenAfterApi=" + planningOpenAfterApi +
                 "|SpaceSent=" + spaceSent +
+                "|SpaceCleanup=" + spaceCleanupSucceeded +
                 "|PlanningOpenAfterRecovery=" +
                 planningOpenAfterRecovery +
                 "|Action=ReloadPathAndReacquireStash");

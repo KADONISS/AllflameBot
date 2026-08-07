@@ -18,7 +18,7 @@ Voyage tasks, `VoyagePlanningUi`, `VoyageRunState` and voyage planners are in
 
 - Voyage planning UI and chart placement verification.
 - Native Voyage Planner shadow reads and opt-in action canary.
-- Planner-open target override and bounded Escape close verification.
+- Planner-open target override and bounded Space close verification.
 - Voyage spawn, capsule anchors, lantern coverage and sector progress.
 - Rolling frontier and topology routing share bounded path-query and recovery
   budgets; terrain snapshots are rebuilt only when their metadata signature

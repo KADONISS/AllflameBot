@@ -31,6 +31,7 @@ namespace AllflameBot
         private ApproachProfile _stableApproachProfile;
         private string _lastLoggedSkill = String.Empty;
         private bool _heldMoveActive;
+        private bool _lastInputCleanupSucceeded = true;
         private string _lastApproachProfile = String.Empty;
         private bool _fallbackSearchActive;
         private Vector2i _fallbackRequestedPosition;
@@ -58,7 +59,7 @@ namespace AllflameBot
         public string Name => "Allflame Mover";
         public string Description => "Pathfinding mover for Allflame Chart Areas.";
         public string Author => "Codex";
-        public string Version => "0.23.161";
+        public string Version => "0.23.162";
         public UserControl Control => null;
         public JsonSettings Settings => AllflameSettings.Instance;
         public PathfindingCommand CurrentCommand => _currentCommand;
@@ -69,6 +70,7 @@ namespace AllflameBot
 
         public void Deinitialize()
         {
+            ReleaseMovementInput();
         }
 
         public void Start()
@@ -84,12 +86,21 @@ namespace AllflameBot
 
         public void Stop()
         {
+            bool heldMovement = ReleaseMovementInput();
             _currentCommand = null;
             ClearStableApproach();
             _lastLoggedSkill = String.Empty;
-            _heldMoveActive = false;
             _lastApproachProfile = String.Empty;
             ResetFallbackSearch();
+            AllflameLog.Info(
+                "MOVER_INPUT_CLEANUP" +
+                "|Source=Stop" +
+                "|HeldMovement=" + heldMovement +
+                "|InputCleanup=" + _lastInputCleanupSucceeded +
+                "|Postcondition=" +
+                (_lastInputCleanupSucceeded
+                    ? "ProcessHookKeyStatesCleared"
+                    : "Unknown"));
         }
 
         public void Tick()
@@ -251,8 +262,23 @@ namespace AllflameBot
         public bool ReleaseMovementInput()
         {
             bool wasHeld = _heldMoveActive;
-            LokiPoe.ProcessHookManager.ClearAllKeyStates();
-            _heldMoveActive = false;
+            _lastInputCleanupSucceeded = false;
+            try
+            {
+                LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                _lastInputCleanupSucceeded = true;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "MOVER_INPUT_RELEASE_FAILED" +
+                    "|Type=" + ex.GetType().Name +
+                    "|Postcondition=Unknown");
+            }
+            finally
+            {
+                _heldMoveActive = false;
+            }
             return wasHeld;
         }
 

@@ -2,6 +2,14 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.162 - 2026-08-07
+
+- Release held Allflame Mover/process-hook input during bot stop, runtime
+  rebuild and mover deinitialization so the game remains clickable afterward.
+- Keep Voyage Planner and Voyage Stash recovery close actions on Space and
+  clear key states after each simulated close input.
+- Add input-cleanup diagnostics with explicit postcondition status.
+
 ## 0.23.161 - 2026-08-07
 
 - Recover Bathysphere approach path failures by reloading navigation, resetting
