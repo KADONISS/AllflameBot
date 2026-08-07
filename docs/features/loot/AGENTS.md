@@ -14,14 +14,16 @@ stash transfer.
 
 ## Ownership
 
-Preserve chest priority, loot debt, inventory postconditions, cursor reward
-handling and stash reconciliation.
+Preserve chest priority, committed loot debt, inventory postconditions, cursor
+reward handling and stash reconciliation.
 
 ## Common mistakes
 
 - Treating an item disappearance as proof of successful pickup or transfer.
 - Ignoring inventory capacity during a multi-stage reward flow.
 - Letting loot work override safety or extraction.
+- Clearing a confirmed Chart chest loot session merely because the Lantern
+  counter reached `0/x`.
 - Pricing an unresolved unique as a confirmed low-value item.
 
 ## Update when

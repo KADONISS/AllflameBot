@@ -2,6 +2,18 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.158 - 2026-08-07
+
+- Commit a Chart chest loot session only after the chest open is confirmed while
+  the Lantern counter is positive.
+- When the Chart counter reaches confirmed `0/x`, cancel pending unopened chest
+  routes and block new chest movement/open actions.
+- Finish eligible drops from the already-opened committed chest, then continue
+  through the existing Bathysphere/extraction return flow.
+- Keep Voyage zero-Lantern extraction behavior unchanged and add structured
+  `CHEST_LOOT_COMMITTED`, `CHEST_ZERO_LANTERN_LOOT` and `CHART_RETURN_WAIT`
+  diagnostics.
+
 ## 0.23.157 - 2026-08-07
 
 - Require Valerie's alternate approach to reach its selected waypoint before

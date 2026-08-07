@@ -18,6 +18,8 @@ Price/filter support is in [`AllflamePrices.cs`](../../AllflamePrices.cs) and
 ## Owns
 
 - Chest priority and open-session debt.
+- Committed Chart chest loot that must finish across a confirmed zero-Lantern
+  transition, without admitting a new chest.
 - Ground-item acceptance/rejection and pickup verification.
 - Inventory capacity, surface loot and stash handoff.
 - Native Allflame Loot UI state with filtered reward transfer.
@@ -26,5 +28,6 @@ Price/filter support is in [`AllflamePrices.cs`](../../AllflamePrices.cs) and
 
 Preserve safety/capsule/extraction priority, verify inventory deltas, account for
 Message in a Bottle cursor behavior and avoid declaring completion from a stale
-inventory snapshot. Do not replace filtered `FastMoveReward()` with native
-`TakeAll()`.
+inventory snapshot. Keep committed Chart chest loot ahead of Bathysphere return
+until its eligible drops are resolved. Do not replace filtered
+`FastMoveReward()` with native `TakeAll()`.

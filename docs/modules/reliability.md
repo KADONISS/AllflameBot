@@ -26,6 +26,8 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
 - Bounded Chart Storage UI open/resolve recovery and Voyage Stash fallback.
 - Bounded Chart Device Descend confirmation recovery with Space, UI close,
   deferred fresh observation and Chart Runner handoff.
+- Chart zero-Lantern recovery that cancels unopened chest routes, preserves a
+  confirmed committed chest loot session and waits for loot before return.
 - Recording stop reasons.
 
 ## Required checks
@@ -36,4 +38,6 @@ add an automatic stop merely because a loop is inconvenient to diagnose. Chart
 Storage UI failures must remain bounded and return to the configured supply
 fallback without converting a transient UI fault into a bot stop.
 Normal Voyage exploration must use its explicit watchdog and bounded recovery
-budget before yielding to the generic stuck-recovery task.
+budget before yielding to the generic stuck-recovery task. Chart zero-Lantern
+loot preservation applies only to Chart Areas; Voyage extraction priorities are
+unchanged.

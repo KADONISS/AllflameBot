@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.157";
+        public const string Current = "0.23.158";
     }
 
     public sealed class AllflameBot : IBot
@@ -2704,11 +2704,16 @@ namespace AllflameBot
             string source,
             Vector2i target)
         {
+            bool preserveCommittedLoot =
+                !voyage && AllflameLootState.CommittedChestLootActive;
             int cancelledChests =
                 AllflameChestRoute.CancelPendingForMandatoryReturn();
             bool lootWasActive = AllflameLootState.IsActive;
-            AllflameLootState.Clear();
-            BottleSafetyMovement.Reset();
+            if (!preserveCommittedLoot)
+            {
+                AllflameLootState.Clear();
+                BottleSafetyMovement.Reset();
+            }
             AllflameLog.Info(
                 "ZERO_LANTERN_MANDATORY_RETURN" +
                 "|Runner=" + (voyage ? "Voyage" : "Chart") +
@@ -2718,9 +2723,14 @@ namespace AllflameBot
                 "|ChestCancelled=" + (cancelledChests > 0) +
                 "|CancelledChests=" + cancelledChests +
                 "|LootCancelled=" + lootWasActive +
+                "|LootPreserved=" + preserveCommittedLoot +
                 "|Source=" + (source ?? String.Empty) +
                 "|Action=" +
-                (voyage ? "FindCapsule" : "ReturnToExtraction"));
+                (voyage
+                    ? "FindCapsule"
+                    : (preserveCommittedLoot
+                        ? "FinishCommittedChestLoot"
+                        : "ReturnToExtraction")));
             AllflameLog.Info(
                 "ZERO_LANTERN_SAFETY_ABORT" +
                 "|Runner=" + (voyage ? "Voyage" : "Chart") +
@@ -2728,7 +2738,10 @@ namespace AllflameBot
                 "|AuraActive=" +
                 AllflameContext.LanternAuraActive +
                 "|Target=" + target +
-                "|Action=CancelChestAndLootThenExit");
+                "|Action=" +
+                (preserveCommittedLoot
+                    ? "CancelNewChestsThenFinishLoot"
+                    : "CancelChestAndLootThenExit"));
         }
     }
 
@@ -4864,6 +4877,9 @@ namespace AllflameBot
         private static DateTime _messageReservationStartedUtc =
             DateTime.MinValue;
         private static int _sessionRevision;
+        private static uint _sessionAreaHash;
+        private static bool _pendingChestOpenBeforeLanternExhaustion;
+        private static bool _committedChestLoot;
         private static readonly List<Vector2i> ChestPositions =
             new List<Vector2i>();
         private static readonly HashSet<int> WorldItemsBeforeOpen =
@@ -4883,6 +4899,17 @@ namespace AllflameBot
         public static int SessionRevision
         {
             get { return _sessionRevision; }
+        }
+
+        public static bool CommittedChestLootActive
+        {
+            get
+            {
+                return _committedChestLoot &&
+                    IsActive &&
+                    _sessionAreaHash == AllflameContext.AreaHash &&
+                    AllflameContext.Phase == AllflamePhase.ChartArea;
+            }
         }
 
         public static string CurrentChestName
@@ -4941,6 +4968,11 @@ namespace AllflameBot
             bool continueCluster =
                 IsActive &&
                 IsNearbyClusterPosition(chest.Position, 120);
+            _pendingChestOpenBeforeLanternExhaustion =
+                AllflameContext.Phase == AllflamePhase.ChartArea &&
+                AllflameContext.LanternCounterMaximum > 0 &&
+                AllflameContext.LanternCounterCurrent > 0 &&
+                !AllflameRunState.LanternsExhausted;
             bool isMessageInBottle = IsMessageInBottle(chest);
             _lastOpenedChestWasMessage = isMessageInBottle;
             if (isMessageInBottle)
@@ -4960,6 +4992,8 @@ namespace AllflameBot
             if (!continueCluster)
             {
                 _sessionRevision++;
+                _sessionAreaHash = AllflameContext.AreaHash;
+                _committedChestLoot = false;
                 _openedUtc = DateTime.MinValue;
                 _sessionStartedUtc =
                     isMessageInBottle &&
@@ -4995,7 +5029,12 @@ namespace AllflameBot
                 "CHEST_LOOT_BASELINE|ChestId=" + _chestId +
                 "|ExistingWorldItems=" + WorldItemsBeforeOpen.Count +
                 "|ContinueCluster=" + continueCluster +
-                "|ClusterChests=" + ChestPositions.Count);
+                "|ClusterChests=" + ChestPositions.Count +
+                "|LanternCounter=" +
+                AllflameContext.LanternCounterCurrent + "/" +
+                AllflameContext.LanternCounterMaximum +
+                "|CommitEligible=" +
+                _pendingChestOpenBeforeLanternExhaustion);
         }
 
         public static bool ReserveMessageInBottleWindow(
@@ -5045,6 +5084,21 @@ namespace AllflameBot
             _chestPosition = chestPosition;
             _openedUtc = DateTime.UtcNow;
             _activeUntilUtc = DateTime.UtcNow.AddSeconds(20);
+            if (_pendingChestOpenBeforeLanternExhaustion &&
+                AllflameContext.Phase == AllflamePhase.ChartArea)
+            {
+                _committedChestLoot = true;
+                _sessionAreaHash = AllflameContext.AreaHash;
+                AllflameLog.Info(
+                    "CHEST_LOOT_COMMITTED" +
+                    "|ChestId=" + chestId +
+                    "|AreaHash=" + _sessionAreaHash +
+                    "|LanternCounter=" +
+                    AllflameContext.LanternCounterCurrent + "/" +
+                    AllflameContext.LanternCounterMaximum +
+                    "|Reason=OpenedBeforeLanternZero");
+            }
+            _pendingChestOpenBeforeLanternExhaustion = false;
         }
 
         public static bool EmptyWindowCanClose
@@ -5297,6 +5351,9 @@ namespace AllflameBot
             _lastOpenedChestWasMessage = false;
             _reservedMessageChestId = 0;
             _messageReservationStartedUtc = DateTime.MinValue;
+            _sessionAreaHash = 0;
+            _pendingChestOpenBeforeLanternExhaustion = false;
+            _committedChestLoot = false;
             ChestPositions.Clear();
             WorldItemsBeforeOpen.Clear();
             ChestDropWorldIds.Clear();
@@ -28387,6 +28444,9 @@ namespace AllflameBot
             if (!AllflameSettings.Instance.OpenKnownChestsFirst ||
                 (AllflameContext.Phase == AllflamePhase.ChartArea &&
                  AllflameRunState.LanternsExhausted) ||
+                (AllflameContext.Phase == AllflamePhase.ChartArea &&
+                 AllflameContext.LanternCounterMaximum > 0 &&
+                 AllflameContext.LanternCounterCurrent <= 0) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
                   (VoyageRunState.LanternsExhausted ||
                    VoyageRunState.SurfaceTransferPending)) ||
@@ -28720,6 +28780,9 @@ namespace AllflameBot
                 !AllflameSettings.Instance.OpenKnownChestsFirst ||
                 (AllflameContext.Phase == AllflamePhase.ChartArea &&
                  AllflameRunState.LanternsExhausted) ||
+                (AllflameContext.Phase == AllflamePhase.ChartArea &&
+                 AllflameContext.LanternCounterMaximum > 0 &&
+                 AllflameContext.LanternCounterCurrent <= 0) ||
                 (AllflameContext.Phase == AllflamePhase.Voyage &&
                   (VoyageRunState.LanternsExhausted ||
                    VoyageRunState.SurfaceTransferPending)) ||
@@ -28892,6 +28955,7 @@ namespace AllflameBot
                     AllflameContext.IsVoyageMapArea &&
                     AllflameContext.Phase == AllflamePhase.Voyage;
                 if (ZeroLanternSafety.IsExhausted(voyage) &&
+                    !AllflameLootState.CommittedChestLootActive &&
                     !AllflameContext.LanternAuraActive)
                 {
                     ZeroLanternSafety.AbortChestAndLootWork(
@@ -29242,7 +29306,10 @@ namespace AllflameBot
             bool voyage =
                 AllflameContext.IsVoyageMapArea &&
                 AllflameContext.Phase == AllflamePhase.Voyage;
-            if (ZeroLanternSafety.IsExhausted(voyage))
+            bool committedChartLoot =
+                !voyage && AllflameLootState.CommittedChestLootActive;
+            if (ZeroLanternSafety.IsExhausted(voyage) &&
+                !committedChartLoot)
             {
                 ClearPendingPickup();
                 ZeroLanternSafety.AbortChestAndLootWork(
@@ -29252,6 +29319,18 @@ namespace AllflameBot
                         ? new Vector2i()
                         : LokiPoe.Me.Position);
                 return false;
+            }
+            if (committedChartLoot)
+            {
+                AllflameLog.Throttled(
+                    "chart_zero_lantern_committed_loot",
+                    TimeSpan.FromSeconds(1),
+                    "CHEST_ZERO_LANTERN_LOOT" +
+                    "|State=Continue" +
+                    "|Action=FinishCommittedChestLoot" +
+                    "|Counter=" +
+                    AllflameContext.LanternCounterCurrent + "/" +
+                    AllflameContext.LanternCounterMaximum);
             }
 
             if (!settings.EnableGroundLoot || !AllflameLootState.IsActive)
@@ -29335,7 +29414,9 @@ namespace AllflameBot
                     }
                     AllflameLog.Info(
                         "GROUND_LOOT_DONE|Reason=NoEligibleItems" +
-                        "|WorldItems=" + visibleWorldItems);
+                        "|WorldItems=" + visibleWorldItems +
+                        "|CommittedChestLoot=" +
+                        AllflameLootState.CommittedChestLootActive);
                     AllflameLootState.Clear();
                     return false;
                 }
@@ -29592,11 +29673,15 @@ namespace AllflameBot
                 _unlootableUntil[worldId] = cooldownUntil;
                 _retryAfter[worldId] = cooldownUntil;
                 AllflameLootState.MarkDropUnlootable(worldId);
+                bool committedChartLoot =
+                    !AllflameContext.IsVoyageMapArea &&
+                    AllflameLootState.CommittedChestLootActive;
                 bool returnToSafeZone = HasNearbyMonster() ||
                     (ZeroLanternSafety.IsExhausted(
                         AllflameContext.IsVoyageMapArea &&
                         AllflameContext.Phase == AllflamePhase.Voyage) &&
-                     !AllflameContext.LanternAuraActive);
+                     !AllflameContext.LanternAuraActive &&
+                     !committedChartLoot);
                 if (returnToSafeZone)
                 {
                     AllflameLootState.Clear();
@@ -42491,6 +42576,20 @@ namespace AllflameBot
             if (!AllflameRunState.ChartTimedOut &&
                 !lanternsExhausted)
             {
+                return false;
+            }
+
+            if (AllflameLootState.CommittedChestLootActive)
+            {
+                AllflameLog.Throttled(
+                    "chart_return_wait_committed_loot",
+                    TimeSpan.FromSeconds(1),
+                    "CHART_RETURN_WAIT" +
+                    "|Reason=CommittedChestLoot" +
+                    "|Action=WaitForLootBeforeBathysphere" +
+                    "|Counter=" +
+                    AllflameContext.LanternCounterCurrent + "/" +
+                    AllflameContext.LanternCounterMaximum);
                 return false;
             }
 

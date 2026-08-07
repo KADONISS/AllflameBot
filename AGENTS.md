@@ -63,7 +63,9 @@ Read it before any code, documentation, test, build or release change.
 4. Make the smallest coherent change.
 5. Update tests, logs, architecture, knowledge and changelog as applicable.
 6. Build with the matching DPB dependencies and report any unavailable check.
-7. Review `git diff`, then commit with an action-oriented message.
+7. Review `git diff`, then commit with an action-oriented message. For a
+   release, create and push the version tag, publish the release asset and
+   verify it against the source commit.
 
 ## When to ask the human
 

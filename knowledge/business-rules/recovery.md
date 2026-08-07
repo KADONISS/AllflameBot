@@ -27,3 +27,6 @@ Update when a recovery contract or terminal condition is intentionally changed.
 - A Chart Device action without a confirmed UI postcondition must send Space,
   close/reacquire the UI on a fresh cycle and remain bounded before returning
   control to the Chart Runner.
+- When Chart Lanterns reach a confirmed `0/x`, mandatory-return recovery
+  cancels only unopened chest work when a chest loot session was already
+  committed; the loot task finishes that debt before Bathysphere return.
