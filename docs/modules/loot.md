@@ -22,6 +22,9 @@ Price/filter support is in [`AllflamePrices.cs`](../../AllflamePrices.cs) and
   transition, without admitting a new chest.
 - Ground-item acceptance/rejection and pickup verification.
 - Inventory capacity, surface loot and stash handoff.
+- Before Voyage, the stash policy transfers eligible non-Chart items while
+  retaining Charts in inventory; reserved Message in a Bottle items keep their
+  existing processing exception.
 - Native Allflame Loot UI state with filtered reward transfer.
 
 ## Required checks

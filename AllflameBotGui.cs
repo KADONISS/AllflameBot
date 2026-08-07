@@ -195,7 +195,7 @@ namespace AllflameBot
 
             grid.Children.Add(Card("STASH POLICY", Stack(
                 Check("Stash after Collect Loot", "StashAfterCollectLoot"),
-                Check("Stash loot + Charts before Voyage", "StashBeforeVoyage"),
+                Check("Stash non-Chart loot before Voyage", "StashBeforeVoyage"),
                 Number("Stash when free slots reach", "StashWhenFreeSlotsAtOrBelow", 0, 60),
                 Number("Item delay minimum (ms)", "ItemTransferDelayMinMilliseconds", 40, 1500),
                 Number("Item delay maximum (ms)", "ItemTransferDelayMaxMilliseconds", 40, 1500),

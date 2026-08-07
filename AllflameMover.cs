@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Controls;
@@ -22,8 +23,12 @@ namespace AllflameBot
         private Vector2i _stableRequestedPosition;
         private Vector2i _stableResolvedPosition;
         private DateTime _stableApproachExpiresUtc = DateTime.MinValue;
+        private DateTime _stableApproachCreatedUtc = DateTime.MinValue;
         private float _stableBestDistance = Single.MaxValue;
         private DateTime _stableLastProgressUtc = DateTime.MinValue;
+        private uint _stableAreaHash;
+        private int _stableNavigationRevision;
+        private ApproachProfile _stableApproachProfile;
         private string _lastLoggedSkill = String.Empty;
         private bool _heldMoveActive;
         private string _lastApproachProfile = String.Empty;
@@ -36,12 +41,16 @@ namespace AllflameBot
             { 14, 20, 28, 36, 46, 58, 70 };
         private const int FallbackAngleSamples = 16;
         private const int FallbackChecksPerCycle = 6;
+        private const long SlowPathMilliseconds = 1000;
+        private static readonly TimeSpan StableNoProgressTimeout =
+            TimeSpan.FromSeconds(3);
 
         private enum ApproachProfile
         {
             Traversal,
             Loot,
             Chest,
+            ChartStorage,
             Object,
             Capsule
         }
@@ -49,7 +58,7 @@ namespace AllflameBot
         public string Name => "Allflame Mover";
         public string Description => "Pathfinding mover for Allflame Chart Areas.";
         public string Author => "Codex";
-        public string Version => "0.23.158";
+        public string Version => "0.23.160";
         public UserControl Control => null;
         public JsonSettings Settings => AllflameSettings.Instance;
         public PathfindingCommand CurrentCommand => _currentCommand;
@@ -139,6 +148,7 @@ namespace AllflameBot
             if (!TryBuildPath(
                 playerPosition,
                 position,
+                profile,
                 out resolvedPosition))
             {
                 if (DateTime.UtcNow >= _nextPathWarningUtc)
@@ -313,15 +323,53 @@ namespace AllflameBot
         private bool TryBuildPath(
             Vector2i playerPosition,
             Vector2i requestedPosition,
+            ApproachProfile profile,
             out Vector2i resolvedPosition)
         {
             resolvedPosition = requestedPosition;
+            DateTime now = DateTime.UtcNow;
+            uint areaHash = AllflameContext.AreaHash;
+            int navigationRevision =
+                AllflameMovementCoordinator.NavigationRevision;
             bool sameStableTarget =
                 _hasStableApproach &&
                 _stableRequestedPosition.DistanceF(
                     requestedPosition) <= 10f;
-            if (sameStableTarget &&
-                DateTime.UtcNow < _stableApproachExpiresUtc)
+            if (_hasStableApproach && !sameStableTarget)
+            {
+                LogPathReplan(
+                    "TargetChanged",
+                    requestedPosition,
+                    profile,
+                    areaHash,
+                    navigationRevision);
+                ClearStableApproach();
+            }
+            else if (_hasStableApproach &&
+                     (_stableAreaHash != areaHash ||
+                      _stableNavigationRevision != navigationRevision ||
+                      _stableApproachProfile != profile))
+            {
+                LogPathReplan(
+                    "NavigationContextChanged",
+                    requestedPosition,
+                    profile,
+                    areaHash,
+                    navigationRevision);
+                ClearStableApproach();
+                ResetFallbackSearch();
+            }
+            else if (sameStableTarget && now >= _stableApproachExpiresUtc)
+            {
+                LogPathReplan(
+                    "CacheExpired",
+                    requestedPosition,
+                    profile,
+                    areaHash,
+                    navigationRevision);
+                ClearStableApproach();
+            }
+            else if (sameStableTarget)
             {
                 float stableDistance =
                     playerPosition.DistanceF(
@@ -331,7 +379,7 @@ namespace AllflameBot
                     float improvement =
                         _stableBestDistance - stableDistance;
                     _stableBestDistance = stableDistance;
-                    _stableLastProgressUtc = DateTime.UtcNow;
+                    _stableLastProgressUtc = now;
                     AllflameLog.Throttled(
                         "mover_approach_convergence",
                         TimeSpan.FromSeconds(1),
@@ -343,8 +391,8 @@ namespace AllflameBot
 
                 bool stableStale =
                     stableDistance <= 12f ||
-                    DateTime.UtcNow - _stableLastProgressUtc >
-                    TimeSpan.FromSeconds(3);
+                    now - _stableLastProgressUtc >
+                    StableNoProgressTimeout;
                 if (!stableStale &&
                     _currentCommand != null &&
                     _currentCommand.Path != null &&
@@ -352,13 +400,34 @@ namespace AllflameBot
                 {
                     resolvedPosition =
                         _stableResolvedPosition;
+                    AllflameLog.Throttled(
+                        "mover_path_cache_hit",
+                        TimeSpan.FromSeconds(2),
+                        "MOVER_PATH_CACHE_HIT" +
+                        "|Profile=" + profile +
+                        "|Target=" + requestedPosition +
+                        "|Resolved=" + _stableResolvedPosition +
+                        "|Distance=" + stableDistance.ToString("0.0") +
+                        "|AgeMs=" +
+                        Math.Max(
+                            0,
+                            (long)(now - _stableApproachCreatedUtc).TotalMilliseconds) +
+                        "|AreaHash=" + areaHash +
+                        "|NavigationRevision=" + navigationRevision);
                     return true;
                 }
 
-                ClearStableApproach();
-            }
-            else if (_hasStableApproach)
-            {
+                LogPathReplan(
+                    stableDistance <= 12f
+                        ? "NearInteraction"
+                        : now - _stableLastProgressUtc >
+                          StableNoProgressTimeout
+                            ? "NoProgress"
+                            : "CachedPathMissing",
+                    requestedPosition,
+                    profile,
+                    areaHash,
+                    navigationRevision);
                 ClearStableApproach();
             }
 
@@ -367,14 +436,15 @@ namespace AllflameBot
                 _fallbackRequestedPosition.DistanceF(
                     requestedPosition) <= 10f;
             if (!continueFallback &&
-                TryPath(playerPosition, requestedPosition))
+                TryPath(playerPosition, requestedPosition, profile))
             {
                 ResetFallbackSearch();
                 RememberStableApproach(
                     playerPosition,
                     requestedPosition,
                     requestedPosition,
-                    TimeSpan.FromSeconds(2));
+                    profile,
+                    ApproachPathLifetime(profile));
                 return true;
             }
 
@@ -415,7 +485,11 @@ namespace AllflameBot
                         playerPosition,
                         candidate,
                         3f);
-                if (!ExilePather.FindPath(ref candidateCommand) ||
+                if (!FindPathWithTelemetry(
+                        ref candidateCommand,
+                        playerPosition,
+                        candidate,
+                        profile + "/Fallback") ||
                     candidateCommand.Path == null ||
                     candidateCommand.Path.Count == 0)
                 {
@@ -429,7 +503,8 @@ namespace AllflameBot
                     playerPosition,
                     requestedPosition,
                     candidate,
-                    TimeSpan.FromSeconds(6));
+                    profile,
+                    ApproachPathLifetime(profile));
                 return true;
             }
 
@@ -458,14 +533,19 @@ namespace AllflameBot
 
         private bool TryPath(
             Vector2i playerPosition,
-            Vector2i destination)
+            Vector2i destination,
+            ApproachProfile profile)
         {
             PathfindingCommand command =
                 new PathfindingCommand(
                     playerPosition,
                     destination,
                     3f);
-            if (!ExilePather.FindPath(ref command) ||
+            if (!FindPathWithTelemetry(
+                    ref command,
+                    playerPosition,
+                    destination,
+                    profile + "/Direct") ||
                 command.Path == null ||
                 command.Path.Count == 0)
             {
@@ -476,27 +556,105 @@ namespace AllflameBot
             return true;
         }
 
+        private static bool FindPathWithTelemetry(
+            ref PathfindingCommand command,
+            Vector2i playerPosition,
+            Vector2i destination,
+            string mode)
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            bool found = false;
+            Exception failure = null;
+            try
+            {
+                found = ExilePather.FindPath(ref command);
+                return found;
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+                throw;
+            }
+            finally
+            {
+                timer.Stop();
+                if (timer.ElapsedMilliseconds >= SlowPathMilliseconds)
+                {
+                    AllflameLog.Info(
+                        "MOVER_PATHFIND_SLOW" +
+                        "|Mode=" + (mode ?? String.Empty) +
+                        "|ElapsedMs=" + timer.ElapsedMilliseconds +
+                        "|Found=" + found +
+                        "|PathPoints=" +
+                        (command.Path == null ? 0 : command.Path.Count) +
+                        "|Start=" + playerPosition +
+                        "|Destination=" + destination +
+                        "|Error=" +
+                        (failure == null
+                            ? String.Empty
+                            : failure.GetType().Name));
+                }
+            }
+        }
+
         private void ClearStableApproach()
         {
             _hasStableApproach = false;
             _stableApproachExpiresUtc = DateTime.MinValue;
+            _stableApproachCreatedUtc = DateTime.MinValue;
             _stableBestDistance = Single.MaxValue;
             _stableLastProgressUtc = DateTime.MinValue;
+            _stableAreaHash = 0;
+            _stableNavigationRevision = 0;
+            _stableApproachProfile = ApproachProfile.Traversal;
         }
 
         private void RememberStableApproach(
             Vector2i playerPosition,
             Vector2i requestedPosition,
             Vector2i resolvedPosition,
+            ApproachProfile profile,
             TimeSpan lifetime)
         {
+            DateTime createdUtc = DateTime.UtcNow;
             _hasStableApproach = true;
             _stableRequestedPosition = requestedPosition;
             _stableResolvedPosition = resolvedPosition;
-            _stableApproachExpiresUtc = DateTime.UtcNow.Add(lifetime);
+            _stableApproachCreatedUtc = createdUtc;
+            _stableApproachExpiresUtc = createdUtc.Add(lifetime);
             _stableBestDistance =
                 playerPosition.DistanceF(resolvedPosition);
-            _stableLastProgressUtc = DateTime.UtcNow;
+            _stableLastProgressUtc = createdUtc;
+            _stableAreaHash = AllflameContext.AreaHash;
+            _stableNavigationRevision =
+                AllflameMovementCoordinator.NavigationRevision;
+            _stableApproachProfile = profile;
+        }
+
+        private static TimeSpan ApproachPathLifetime(
+            ApproachProfile profile)
+        {
+            return profile == ApproachProfile.ChartStorage
+                ? TimeSpan.FromSeconds(12)
+                : TimeSpan.FromSeconds(8);
+        }
+
+        private static void LogPathReplan(
+            string reason,
+            Vector2i requestedPosition,
+            ApproachProfile profile,
+            uint areaHash,
+            int navigationRevision)
+        {
+            AllflameLog.Throttled(
+                "mover_path_replan_" + (reason ?? String.Empty),
+                TimeSpan.FromSeconds(2),
+                "MOVER_PATH_REPLAN" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|Profile=" + profile +
+                "|Target=" + requestedPosition +
+                "|AreaHash=" + areaHash +
+                "|NavigationRevision=" + navigationRevision);
         }
 
         private static Vector2i SelectWaypoint(
@@ -562,6 +720,15 @@ namespace AllflameBot
             {
                 return ApproachProfile.Chest;
             }
+            if (context.IndexOf(
+                    "chart storage",
+                    StringComparison.OrdinalIgnoreCase) >= 0 ||
+                context.IndexOf(
+                    "chartstorage",
+                    StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return ApproachProfile.ChartStorage;
+            }
             return ApproachProfile.Object;
         }
 
@@ -573,6 +740,8 @@ namespace AllflameBot
                     return 78f;
                 case ApproachProfile.Chest:
                     return 95f;
+                case ApproachProfile.ChartStorage:
+                    return 42f;
                 case ApproachProfile.Object:
                     return 90f;
                 case ApproachProfile.Capsule:
@@ -598,6 +767,10 @@ namespace AllflameBot
             if (profile == ApproachProfile.Loot)
             {
                 return remainingDistance < 42f ? 110 : 165;
+            }
+            if (profile == ApproachProfile.ChartStorage)
+            {
+                return remainingDistance < 25f ? 110 : 160;
             }
             return remainingDistance < 50f ? 130 : 185;
         }

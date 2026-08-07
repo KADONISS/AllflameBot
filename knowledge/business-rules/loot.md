@@ -25,3 +25,6 @@ Update when item acceptance, transfer or inventory postconditions change.
 - Committed chest loot still requires the normal item-filter, inventory and
   pickup postconditions before the return flow can proceed.
 - Stash and surface transfer require transfer and reconciliation evidence.
+- The pre-Voyage stash policy transfers eligible non-Chart inventory items but
+  must retain Chart items in inventory. The existing reserved-bottle exception
+  remains unchanged, and Voyage Stash withdrawal remains the Chart supply path.

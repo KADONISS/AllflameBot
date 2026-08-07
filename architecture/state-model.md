@@ -22,7 +22,7 @@ context.
 | --- | --- | --- | --- |
 | `AllflameContext` | Phase, area, player, objects, UI and inventory snapshot | Bot reset or observation invalidation | All tasks and planners |
 | `VoyageRunState` | Voyage spawn, capsules, lanterns, breadcrumbs, sectors, extraction | Voyage entry/return | Voyage, capsule, lantern and extraction tasks |
-| `AllflameRunState` | Chart request, planning, chart spawn, exploration and boat staging | Chart entry/return | Chart, stash, planning and chart exploration tasks |
+| `AllflameRunState` | Chart request, planning, chart spawn, exploration, boat staging and pre-Voyage non-Chart stash completion | Chart entry/return | Chart, stash, planning and chart exploration tasks |
 | `AllflameLootState` | Chest session, reserved drops, bottle chest grace, item debt and committed Chart chest loot | Chest loot completion or area change | Chest, loot, recovery and return tasks |
 | `AllflameProgressWatchdog` | Active task, target, retry and progress timestamps | Task completion or runtime reset | Base task and recovery logic |
 | `AllflameMovementCoordinator` | Movement owner, priority, lease and navigation revision | Area change or explicit release | Tasks and `AllflameMover` |

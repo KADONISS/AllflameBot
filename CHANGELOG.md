@@ -2,6 +2,16 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.160 - 2026-08-07
+
+- Optimize Chart Storage approach movement by reusing validated paths longer
+  and switching to precision clicks only in the final interaction range.
+- Invalidate approach paths when the target, area or navigation revision
+  changes, or when movement loses progress, with slow pathfinding diagnostics.
+- Keep Charts in inventory during the pre-Voyage stash phase while continuing
+  to stash eligible non-Chart items; preserve Voyage Stash withdrawal for Chart
+  supply.
+
 ## 0.23.158 - 2026-08-07
 
 - Commit a Chart chest loot session only after the chest open is confirmed while

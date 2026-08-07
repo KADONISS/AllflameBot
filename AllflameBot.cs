@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.158";
+        public const string Current = "0.23.160";
     }
 
     public sealed class AllflameBot : IBot
@@ -4761,6 +4761,7 @@ namespace AllflameBot
             AllflameLog.Info(
                 "VOYAGE_PRE_STASH|State=Complete" +
                 "|NonChartItems=0" +
+                "|ChartPolicy=KeepInInventory" +
                 "|Action=ProceedToBeginVoyage");
         }
 
@@ -9333,7 +9334,7 @@ namespace AllflameBot
         public PreVoyageChartStashTask()
             : base(
                 "PreVoyageChartStashTask",
-                "Stores remaining Charts in Chart Storage, with an optional personal Stash fallback, before entering a Voyage.") { }
+                "Finalizes the non-Chart stash before entering a Voyage while retaining Charts in inventory.") { }
 
         public override void Start()
         {
@@ -9363,16 +9364,26 @@ namespace AllflameBot
                 return false;
             }
 
-            if (CountNonChartInventoryItems() > 0)
+            int nonChartItems = CountNonChartInventoryItems();
+            if (nonChartItems > 0)
             {
                 AllflameLog.Throttled(
                     "voyage_pre_stash_wait_loot",
                     TimeSpan.FromSeconds(2),
                     "VOYAGE_PRE_STASH|Stage=Loot|State=Waiting" +
                     "|NonChartItems=" +
-                    CountNonChartInventoryItems());
+                    nonChartItems);
                 AllflameProgressWatchdog.Clear();
                 return true;
+            }
+
+            // StashLootTask already transferred every eligible non-Chart item.
+            // Charts must remain in inventory; only finalize the state gate so
+            // EnterStartedVoyageTask can proceed to the Bathysphere.
+            if (!ShouldTransferChartsBeforeVoyage())
+            {
+                return await CompletePreStashWithoutChartTransfer(
+                    GetInventoryCharts().Count);
             }
 
             AllflameProgressWatchdog.Begin(
@@ -10175,6 +10186,36 @@ namespace AllflameBot
             ResetLocalState();
             AllflameProgressWatchdog.Clear();
             return true;
+        }
+
+        private async Task<bool> CompletePreStashWithoutChartTransfer(
+            int chartsRetained)
+        {
+            AllflameLog.Info(
+                "CHART_STORAGE_DEPOSIT_SKIPPED" +
+                "|Reason=ChartsRetainedInInventory" +
+                "|ChartsRetained=" + chartsRetained +
+                "|NextAction=ProceedToBeginVoyage");
+            AllflameLog.Info(
+                "VOYAGE_PRE_STASH|Stage=Chart|State=Skipped" +
+                "|NonChartItems=0" +
+                "|ChartsRetainedInInventory=" + chartsRetained +
+                "|Reason=ChartsRetainedInInventory" +
+                "|Action=ProceedToBeginVoyage");
+            AllflameRunState.MarkVoyagePreStashCompleted();
+            AllflameProgressWatchdog.MarkProgress(
+                "ProceedToBeginVoyageWithChartsRetained");
+            await Coroutines.CloseBlockingWindows();
+            ResetLocalState();
+            AllflameProgressWatchdog.Clear();
+            return true;
+        }
+
+        private static bool ShouldTransferChartsBeforeVoyage()
+        {
+            // Chart transfer is intentionally disabled. Charts remain in the
+            // inventory; this seam keeps the legacy recovery code isolated.
+            return false;
         }
 
         private static List<Item> GetInventoryCharts()
