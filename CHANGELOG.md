@@ -2,6 +2,23 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.164 - 2026-08-08
+
+- Bound DPB interaction and movement-finish waits so a stalled process-hook
+  action releases held input, requests a fresh snapshot and returns control to
+  the ordered task pipeline.
+- Remove the synchronous `Task.Result` wait from the Voyage metrics wrapper;
+  an incomplete Voyage cycle can now yield back to DPB instead of deadlocking
+  the main loop after a path failure.
+- Release mover and process-hook input before and after Bathysphere path reload
+  and immediately on pathfinding failure, with explicit cleanup postconditions.
+- Add task-manager/task, context-refresh, native-counter, pathfinding and
+  Bathysphere reset boundary telemetry to identify the first operation that
+  stops producing progress.
+- Reject invalid Deepwater native counters and phase-mismatched reads while
+  preserving the text counter fallback; keep bounded Bathysphere exhaustion on
+  the Chart Runner recovery path.
+
 ## 0.23.163 - 2026-08-07
 
 - Rebuild Discord notifications around Allflame Chart Runner and Voyage Runner

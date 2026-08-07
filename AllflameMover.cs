@@ -59,7 +59,7 @@ namespace AllflameBot
         public string Name => "Allflame Mover";
         public string Description => "Pathfinding mover for Allflame Chart Areas.";
         public string Author => "Codex";
-        public string Version => "0.23.163";
+        public string Version => AllflameVersion.Current;
         public UserControl Control => null;
         public JsonSettings Settings => AllflameSettings.Instance;
         public PathfindingCommand CurrentCommand => _currentCommand;
@@ -157,14 +157,23 @@ namespace AllflameBot
 
             Vector2i resolvedPosition;
             if (!TryBuildPath(
-                playerPosition,
-                position,
-                profile,
-                out resolvedPosition))
+                    playerPosition,
+                    position,
+                    profile,
+                    out resolvedPosition))
             {
+                bool heldMovement = ReleaseMovementInput();
                 if (DateTime.UtcNow >= _nextPathWarningUtc)
                 {
-                    AllflameLog.Info($"MOVER_PATH_FAILED|Destination={position}");
+                    AllflameLog.Info(
+                        "MOVER_PATH_FAILED" +
+                        "|Destination=" + position +
+                        "|HeldMovement=" + heldMovement +
+                        "|InputCleanup=" + _lastInputCleanupSucceeded +
+                        "|Postcondition=" +
+                        (_lastInputCleanupSucceeded
+                            ? "ProcessHookKeyStatesCleared"
+                            : "Unknown"));
                     _nextPathWarningUtc = DateTime.UtcNow.AddSeconds(2);
                 }
 
@@ -589,6 +598,13 @@ namespace AllflameBot
             string mode)
         {
             Stopwatch timer = Stopwatch.StartNew();
+            AllflameLog.Throttled(
+                "mover_pathfind_begin_" + (mode ?? "Unknown"),
+                TimeSpan.FromSeconds(2),
+                "MOVER_PATHFIND_BEGIN" +
+                "|Mode=" + (mode ?? String.Empty) +
+                "|Start=" + playerPosition +
+                "|Destination=" + destination);
             bool found = false;
             Exception failure = null;
             try
@@ -607,7 +623,25 @@ namespace AllflameBot
                 if (timer.ElapsedMilliseconds >= SlowPathMilliseconds)
                 {
                     AllflameLog.Info(
-                        "MOVER_PATHFIND_SLOW" +
+                        "MOVER_PATHFIND_END" +
+                        "|Mode=" + (mode ?? String.Empty) +
+                        "|ElapsedMs=" + timer.ElapsedMilliseconds +
+                        "|Found=" + found +
+                        "|PathPoints=" +
+                        (command.Path == null ? 0 : command.Path.Count) +
+                        "|Start=" + playerPosition +
+                        "|Destination=" + destination +
+                        "|Error=" +
+                        (failure == null
+                            ? String.Empty
+                            : failure.GetType().Name));
+                }
+                else if (!found || failure != null)
+                {
+                    AllflameLog.Throttled(
+                        "mover_pathfind_end_" + (mode ?? "Unknown"),
+                        TimeSpan.FromSeconds(2),
+                        "MOVER_PATHFIND_END" +
                         "|Mode=" + (mode ?? String.Empty) +
                         "|ElapsedMs=" + timer.ElapsedMilliseconds +
                         "|Found=" + found +

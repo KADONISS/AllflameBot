@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.163";
+        public const string Current = "0.23.164";
     }
 
     public sealed class AllflameBot : IBot
@@ -219,7 +219,7 @@ namespace AllflameBot
             }
         }
 
-        private static void ReleaseOwnedInput(string source)
+        internal static bool ReleaseOwnedInput(string source)
         {
             bool moverHeld = false;
             bool hookCleared = false;
@@ -260,6 +260,7 @@ namespace AllflameBot
                 "|HookCleared=" + hookCleared +
                 "|Postcondition=" +
                 (hookCleared ? "ProcessHookKeyStatesCleared" : "Unknown"));
+            return hookCleared;
         }
 
         public void Stop()
@@ -533,20 +534,36 @@ namespace AllflameBot
                         TimeSpan.FromSeconds(2),
                         "TASK_MANAGER_RUN_BEGIN|" +
                         AllflameProgressWatchdog.Describe());
-                    await _taskManager.Run(
-                        TaskGroup.Enabled,
-                        RunBehavior.UntilHandled);
-                    cycleTimer.Stop();
-                    if (cycleTimer.ElapsedMilliseconds >= 250)
+                    try
                     {
-                        AllflameLog.Throttled(
-                            "task_cycle_slow",
-                            TimeSpan.FromSeconds(1),
-                            "TASK_CYCLE_SLOW" +
-                            "|ElapsedMs=" +
-                            cycleTimer.ElapsedMilliseconds +
-                            "|" +
-                            AllflameProgressWatchdog.Describe());
+                        await _taskManager.Run(
+                            TaskGroup.Enabled,
+                            RunBehavior.UntilHandled);
+                    }
+                    finally
+                    {
+                        cycleTimer.Stop();
+                        string cycleDetail =
+                            "|ElapsedMs=" + cycleTimer.ElapsedMilliseconds +
+                            "|" + AllflameProgressWatchdog.Describe();
+                        if (cycleTimer.ElapsedMilliseconds >= 250)
+                        {
+                            AllflameLog.Throttled(
+                                "task_cycle_slow",
+                                TimeSpan.FromSeconds(1),
+                                "TASK_MANAGER_RUN_END" + cycleDetail);
+                            AllflameLog.Throttled(
+                                "task_cycle_slow_detail",
+                                TimeSpan.FromSeconds(1),
+                                "TASK_CYCLE_SLOW" + cycleDetail);
+                        }
+                        else
+                        {
+                            AllflameLog.Throttled(
+                                "task_manager_run_end",
+                                TimeSpan.FromSeconds(2),
+                                "TASK_MANAGER_RUN_END" + cycleDetail);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -1150,7 +1167,6 @@ namespace AllflameBot
                             AllflameAreaTransitionGuard.Pending);
                     }
                     SnapshotLanternCounter(visibleUiText);
-                    SnapshotNativeDeepwaterCounters();
 
                     DpbCapsuleSnapshot nativeCapsule;
                     string nativeCapsuleReason;
@@ -1225,6 +1241,8 @@ namespace AllflameBot
                     {
                         Phase = AllflamePhase.OutsideContent;
                     }
+
+                    SnapshotNativeDeepwaterCounters();
 
                     if (chartStorageScan)
                     {
@@ -1323,6 +1341,27 @@ namespace AllflameBot
                 }
                 finally
                 {
+                    if (refreshTimer.IsRunning)
+                    {
+                        refreshTimer.Stop();
+                    }
+                    string refreshDetail =
+                        "|ElapsedMs=" + refreshTimer.ElapsedMilliseconds +
+                        "|Force=" + force +
+                        "|Phase=" + Phase +
+                        "|AreaHash=" + AreaHash;
+                    if (refreshTimer.ElapsedMilliseconds >= 250)
+                    {
+                        AllflameLog.Info(
+                            "CONTEXT_REFRESH_END" + refreshDetail);
+                    }
+                    else
+                    {
+                        AllflameLog.Throttled(
+                            "context_refresh_end",
+                            TimeSpan.FromSeconds(2),
+                            "CONTEXT_REFRESH_END" + refreshDetail);
+                    }
                     // A slow scan must not consume its own cache window.
                     _nextRefreshUtc =
                         DateTime.UtcNow.AddMilliseconds(125);
@@ -1512,16 +1551,30 @@ namespace AllflameBot
         {
             CollectedSulphur = -1;
             DeepwaterCountersNativeAvailable = false;
+            bool encounterArea = String.Equals(
+                AreaId,
+                "DeepwaterEncounter",
+                StringComparison.OrdinalIgnoreCase);
+            bool voyageArea = String.Equals(
+                AreaId,
+                "DeepwaterEncounterVoyage",
+                StringComparison.OrdinalIgnoreCase);
             if (!AllflameSettings.Instance.UseNativeDeepwaterCounters ||
-                !(String.Equals(
-                    AreaId,
-                    "DeepwaterEncounter",
-                    StringComparison.OrdinalIgnoreCase) ||
-                  String.Equals(
-                    AreaId,
-                    "DeepwaterEncounterVoyage",
-                    StringComparison.OrdinalIgnoreCase)))
+                !(encounterArea || voyageArea))
             {
+                return;
+            }
+
+            if (encounterArea && Phase != AllflamePhase.ChartArea)
+            {
+                AllflameLog.Throttled(
+                    "deepwater_counter_phase_mismatch",
+                    TimeSpan.FromSeconds(5),
+                    "DEEPWATER_COUNTER_SKIPPED" +
+                    "|AreaId=" + AreaId +
+                    "|Phase=" + Phase +
+                    "|Reason=NativeCounterOutsideChartArea" +
+                    "|Action=KeepTextFallback");
                 return;
             }
 
@@ -1529,9 +1582,33 @@ namespace AllflameBot
             int textMaximum = LanternCounterMaximum;
             DpbDeepwaterCounterSnapshot nativeSnapshot;
             string reason;
-            if (!DpbNativeApi.TryCaptureDeepwaterCounters(
+            Stopwatch nativeTimer = Stopwatch.StartNew();
+            AllflameLog.Throttled(
+                "deepwater_counter_read_begin",
+                TimeSpan.FromSeconds(2),
+                "DEEPWATER_COUNTER_READ_BEGIN" +
+                "|AreaId=" + AreaId +
+                "|Phase=" + Phase);
+            bool captured = false;
+            try
+            {
+                captured = DpbNativeApi.TryCaptureDeepwaterCounters(
                     out nativeSnapshot,
-                    out reason))
+                    out reason);
+            }
+            finally
+            {
+                nativeTimer.Stop();
+                AllflameLog.Throttled(
+                    "deepwater_counter_read_end",
+                    TimeSpan.FromSeconds(2),
+                    "DEEPWATER_COUNTER_READ_END" +
+                    "|Captured=" + captured +
+                    "|ElapsedMs=" + nativeTimer.ElapsedMilliseconds +
+                    "|AreaId=" + AreaId +
+                    "|Phase=" + Phase);
+            }
+            if (!captured)
             {
                 AllflameLog.Throttled(
                     "deepwater_counter_native_unavailable",
@@ -1543,18 +1620,40 @@ namespace AllflameBot
                 return;
             }
 
-            LanternCounterCurrent = nativeSnapshot.RemainingLanterns;
-            LanternCounterMaximum = nativeSnapshot.MaxLanterns;
+            int nativeCurrent = nativeSnapshot.RemainingLanterns;
+            int nativeMaximum = nativeSnapshot.MaxLanterns;
+            bool validNativeCounter =
+                nativeMaximum > 0 &&
+                nativeMaximum <= 200 &&
+                nativeCurrent >= 0 &&
+                nativeCurrent <= nativeMaximum;
+            if (!validNativeCounter)
+            {
+                AllflameLog.Throttled(
+                    "deepwater_counter_invalid",
+                    TimeSpan.FromSeconds(5),
+                    "DEEPWATER_COUNTER_INVALID" +
+                    "|AreaId=" + AreaId +
+                    "|Phase=" + Phase +
+                    "|Native=" + nativeCurrent + "/" + nativeMaximum +
+                    "|Text=" + textCurrent + "/" + textMaximum +
+                    "|Reason=OutOfRange" +
+                    "|Action=KeepTextFallback");
+                return;
+            }
+
+            LanternCounterCurrent = nativeCurrent;
+            LanternCounterMaximum = nativeMaximum;
             CollectedSulphur = nativeSnapshot.CollectedSulphur;
-            DeepwaterCountersNativeAvailable =
-                nativeSnapshot.MaxLanterns >= 0 &&
-                nativeSnapshot.RemainingLanterns >= 0;
+            DeepwaterCountersNativeAvailable = true;
             if (textCurrent >= 0 &&
                 textMaximum > 0 &&
                 (textCurrent != LanternCounterCurrent ||
                  textMaximum != LanternCounterMaximum))
             {
-                AllflameLog.Info(
+                AllflameLog.Throttled(
+                    "deepwater_counter_mismatch",
+                    TimeSpan.FromSeconds(5),
                     "DEEPWATER_COUNTER_MISMATCH" +
                     "|Text=" + textCurrent + "/" + textMaximum +
                     "|Native=" + LanternCounterCurrent + "/" +
@@ -6278,6 +6377,8 @@ namespace AllflameBot
 
     internal abstract partial class ObserverTask : ITask
     {
+        private const int InteractionTimeoutSeconds = 8;
+        private const int FinishActionTimeoutPaddingMilliseconds = 500;
         private int _moveFailureCount;
         private DateTime _moveFailureSinceUtc = DateTime.MinValue;
         private DateTime _nextPathReloadUtc = DateTime.MinValue;
@@ -6314,7 +6415,36 @@ namespace AllflameBot
                     return false;
                 }
 
-                return await Coroutines.InteractWith(target);
+                Stopwatch interactionTimer = Stopwatch.StartNew();
+                Task<bool> interaction = Coroutines.InteractWith(target);
+                Task timeout = LokiCoroutine.Sleep(
+                    InteractionTimeoutSeconds * 1000);
+                Task completed = await Task.WhenAny(interaction, timeout);
+                interactionTimer.Stop();
+                if (completed != interaction)
+                {
+                    AllflameLog.Info(
+                        "INTERACTION_TIMEOUT" +
+                        "|Context=" + (context ?? String.Empty) +
+                        "|TimeoutSeconds=" + InteractionTimeoutSeconds +
+                        "|ElapsedMs=" + interactionTimer.ElapsedMilliseconds +
+                        "|Action=ReleaseInputAndRefresh");
+                    AllflameBot.ReleaseOwnedInput(
+                        "InteractionTimeout:" + (context ?? String.Empty));
+                    AllflameContext.RequestRefresh(
+                        "InteractionTimeout");
+                    return false;
+                }
+
+                bool interacted = await interaction;
+                AllflameLog.Throttled(
+                    "interaction_duration_" + (context ?? "Unknown"),
+                    TimeSpan.FromSeconds(2),
+                    "INTERACTION_COMPLETED" +
+                    "|Context=" + (context ?? String.Empty) +
+                    "|ElapsedMs=" + interactionTimer.ElapsedMilliseconds +
+                    "|Success=" + interacted);
+                return interacted;
             }
             catch (Exception ex)
             {
@@ -6365,7 +6495,95 @@ namespace AllflameBot
         public string Author { get { return "BoTBien"; } }
         public string Version { get { return AllflameVersion.Current; } }
 
-        public abstract Task<bool> Run();
+        public Task<bool> Run()
+        {
+            Stopwatch timer = Stopwatch.StartNew();
+            AllflameLog.Throttled(
+                "task_run_begin_" + Name,
+                TimeSpan.FromSeconds(2),
+                "TASK_RUN_BEGIN" +
+                "|Task=" + Name +
+                "|" + AllflameProgressWatchdog.Describe());
+
+            Task<bool> run;
+            try
+            {
+                run = RunCore();
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                AllflameLog.Info(
+                    "TASK_RUN_FAILED" +
+                    "|Task=" + Name +
+                    "|Stage=Invoke" +
+                    "|ElapsedMs=" + timer.ElapsedMilliseconds +
+                    "|Type=" + ex.GetType().Name +
+                    "|Message=" +
+                    (ex.Message ?? String.Empty).Replace("|", "/"));
+                throw;
+            }
+
+            if (run == null)
+            {
+                timer.Stop();
+                AllflameLog.Info(
+                    "TASK_RUN_FAILED" +
+                    "|Task=" + Name +
+                    "|Stage=Invoke" +
+                    "|ElapsedMs=" + timer.ElapsedMilliseconds +
+                    "|Type=NullTask");
+                return Task.FromResult(false);
+            }
+
+            return CompleteRun(run, timer);
+        }
+
+        private async Task<bool> CompleteRun(
+            Task<bool> run,
+            Stopwatch timer)
+        {
+            bool handled = false;
+            try
+            {
+                handled = await run;
+                return handled;
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Info(
+                    "TASK_RUN_FAILED" +
+                    "|Task=" + Name +
+                    "|Stage=Await" +
+                    "|ElapsedMs=" + timer.ElapsedMilliseconds +
+                    "|Type=" + ex.GetType().Name +
+                    "|Message=" +
+                    (ex.Message ?? String.Empty).Replace("|", "/"));
+                throw;
+            }
+            finally
+            {
+                timer.Stop();
+                string detail =
+                    "|Task=" + Name +
+                    "|Handled=" + handled +
+                    "|ElapsedMs=" + timer.ElapsedMilliseconds +
+                    "|" + AllflameProgressWatchdog.Describe();
+                if (timer.ElapsedMilliseconds >= 250)
+                {
+                    AllflameLog.Info("TASK_RUN_END" + detail);
+                }
+                else
+                {
+                    AllflameLog.Throttled(
+                        "task_run_end_" + Name,
+                        TimeSpan.FromSeconds(2),
+                        "TASK_RUN_END" + detail);
+                }
+            }
+        }
+
+        protected abstract Task<bool> RunCore();
 
         public virtual void Start() { }
         public virtual void Stop() { }
@@ -6460,7 +6678,30 @@ namespace AllflameBot
                         if (recoveryDue &&
                             DateTime.UtcNow >= _nextPathReloadUtc)
                         {
-                            ExilePather.Reload(true);
+                            AllflameBot.ReleaseOwnedInput(
+                                "MoveTargetPathFailureBeforeReload:" +
+                                label);
+                            Stopwatch reloadTimer = Stopwatch.StartNew();
+                            bool reloaded = false;
+                            try
+                            {
+                                ExilePather.Reload(true);
+                                reloaded = true;
+                            }
+                            finally
+                            {
+                                reloadTimer.Stop();
+                                AllflameBot.ReleaseOwnedInput(
+                                    "MoveTargetPathFailureAfterReload:" +
+                                    label);
+                                AllflameLog.Info(
+                                    "MOVE_TARGET_PATH_RELOAD" +
+                                    "|Task=" + Name +
+                                    "|Target=" + label +
+                                    "|Reloaded=" + reloaded +
+                                    "|ElapsedMs=" +
+                                    reloadTimer.ElapsedMilliseconds);
+                            }
                             _nextPathReloadUtc =
                                 DateTime.UtcNow.AddSeconds(2);
                             AllflameLog.Info(
@@ -6545,7 +6786,28 @@ namespace AllflameBot
                 // bot task loop while an interaction target is already near.
                 Coroutines.FinishCurrentActionTimeout =
                     heldMovement ? 750 : 350;
-                await Coroutines.FinishCurrentAction(true);
+                Task finishAction =
+                    Coroutines.FinishCurrentAction(true);
+                Task timeout = LokiCoroutine.Sleep(
+                    Coroutines.FinishCurrentActionTimeout +
+                    FinishActionTimeoutPaddingMilliseconds);
+                Task completed = await Task.WhenAny(
+                    finishAction,
+                    timeout);
+                if (completed != finishAction)
+                {
+                    AllflameLog.Info(
+                        "ACTION_SYNC_TIMEOUT|Task=" + Name +
+                        "|Target=" + target +
+                        "|TimeoutMs=" +
+                        (Coroutines.FinishCurrentActionTimeout +
+                         FinishActionTimeoutPaddingMilliseconds) +
+                        "|Action=ReleaseInputAndContinue");
+                    AllflameBot.ReleaseOwnedInput(
+                        "FinishCurrentActionTimeout:" + target);
+                    return;
+                }
+                await finishAction;
                 LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 AllflameLog.Throttled(
                     Name + "_finish_action_" + target,
@@ -6586,7 +6848,7 @@ namespace AllflameBot
         public UpdateDeepwaterStateTask()
             : base("UpdateDeepwaterStateTask", "Refreshes area, object, UI and player state.") { }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             AllflameContext.Refresh(false);
             AllflameProgressWatchdog.Observe();
@@ -6601,7 +6863,7 @@ namespace AllflameBot
                 "ChartAreaTransitionTask",
                 "Quarantines DPB reads while a Chart portal changes areas.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (!AllflameAreaTransitionGuard.Pending)
             {
@@ -7120,7 +7382,7 @@ namespace AllflameBot
             ResetTaskState();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (!LokiPoe.IsInGame || LokiPoe.Me == null)
             {
@@ -7650,7 +7912,7 @@ namespace AllflameBot
                 "UseLifeFlaskTask",
                 "Uses the Life Flask by threshold and configured utility flasks periodically.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             if (!LokiPoe.IsInGame ||
@@ -7838,7 +8100,7 @@ namespace AllflameBot
                 "UseEnduringCryTask",
                 "Uses Enduring Cry through DPB's native skill API whenever it is ready.") { }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             bool inEncounterArea =
@@ -7964,7 +8226,7 @@ namespace AllflameBot
                 "CollectSulphurRewardTask",
                 "Collects Dead Man's Sulphur after returning from a Chart Area.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (AllflameContext.Phase != AllflamePhase.SovereignHub &&
                 AllflameContext.Phase != AllflamePhase.VoyagePlanning)
@@ -8755,7 +9017,7 @@ namespace AllflameBot
         public TravelToSovereignTask()
             : base("TravelToSovereignTask", "Uses /boat to travel to The Sovereign.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (AllflameContext.Phase != AllflamePhase.OutsideContent)
             {
@@ -8897,7 +9159,7 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear(Name);
         }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             if (!AllflameRunState.BoatStagingRequired)
             {
@@ -9383,7 +9645,7 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             bool inHub =
@@ -10488,7 +10750,7 @@ namespace AllflameBot
                 "EnterStartedVoyageTask",
                 "Finds and enters the Bathysphere after Begin Voyage.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (!AllflameRunState.VoyageStarted)
             {
@@ -10686,7 +10948,7 @@ namespace AllflameBot
             ResetNativePlannerActionState();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (_nativeBeginPending)
             {
@@ -14936,7 +15198,7 @@ namespace AllflameBot
                 "DebugChartStorageTask",
                 "Opens Chart Storage and reads the visible page without moving any item.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (!AllflameChartStorageDebug.IsRequested)
             {
@@ -15244,7 +15506,7 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear(Name);
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             bool inHub =
@@ -16531,7 +16793,7 @@ namespace AllflameBot
             ResetSessionPageCache();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (_observedDepositRevision != ChartStorageUi.DepositRevision)
             {
@@ -22180,7 +22442,7 @@ namespace AllflameBot
                 "IdentifyInventoryChartsTask",
                 "Uses Valerie's Identify Items service when an unidentified Chart is in inventory.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
@@ -22405,7 +22667,7 @@ namespace AllflameBot
         public PlanVoyageTask()
             : base("OpenChartDeviceTask", "Opens the Chart Device through Valerie or the Bathysphere.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
@@ -22813,7 +23075,7 @@ namespace AllflameBot
                 AllflameContext.InventoryChartCount);
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
@@ -23621,7 +23883,20 @@ namespace AllflameBot
 
         private static void ResetBathyspherePath(string reason)
         {
+            string safeReason = reason ?? "BathyspherePathReset";
+            AllflameLog.Info(
+                "BATHYSPHERE_PATH_RESET_BEGIN" +
+                "|Reason=" + safeReason +
+                "|NavigationRevision=" +
+                AllflameMovementCoordinator.NavigationRevision);
+            bool inputClearedBeforeReload =
+                AllflameBot.ReleaseOwnedInput(
+                    "BathyspherePathResetBeforeReload");
             bool pathReloaded = false;
+            Stopwatch reloadTimer = Stopwatch.StartNew();
+            AllflameLog.Info(
+                "BATHYSPHERE_PATH_RELOAD_BEGIN" +
+                "|Reason=" + safeReason);
             try
             {
                 ExilePather.Reload(true);
@@ -23631,8 +23906,17 @@ namespace AllflameBot
             {
                 AllflameLog.Info(
                     "BATHYSPHERE_PATH_RELOAD_FAILED" +
-                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Reason=" + safeReason +
                     "|Type=" + ex.GetType().Name);
+            }
+            finally
+            {
+                reloadTimer.Stop();
+                AllflameLog.Info(
+                    "BATHYSPHERE_PATH_RELOAD_END" +
+                    "|Reason=" + safeReason +
+                    "|Reloaded=" + pathReloaded +
+                    "|ElapsedMs=" + reloadTimer.ElapsedMilliseconds);
             }
 
             bool moverReset = false;
@@ -23651,18 +23935,25 @@ namespace AllflameBot
             {
                 AllflameLog.Info(
                     "BATHYSPHERE_MOVER_RESET_FAILED" +
-                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Reason=" + safeReason +
                     "|Type=" + ex.GetType().Name);
             }
 
+            bool inputClearedAfterReload =
+                AllflameBot.ReleaseOwnedInput(
+                    "BathyspherePathResetAfterReload");
             int revision =
                 AllflameMovementCoordinator.AdvanceNavigation(
-                    reason ?? "BathyspherePathReset");
+                    safeReason);
             AllflameLog.Info(
                 "BATHYSPHERE_PATH_RESET" +
-                "|Reason=" + (reason ?? String.Empty) +
+                "|Reason=" + safeReason +
                 "|PathReloaded=" + pathReloaded +
                 "|MoverReset=" + moverReset +
+                "|InputClearedBeforeReload=" +
+                inputClearedBeforeReload +
+                "|InputClearedAfterReload=" +
+                inputClearedAfterReload +
                 "|NavigationRevision=" + revision);
         }
 
@@ -25804,7 +26095,7 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear(Name);
         }
 
-        public override Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             Vector2i cycleStart = LokiPoe.Me == null
                 ? new Vector2i()
@@ -25813,11 +26104,13 @@ namespace AllflameBot
                 Name,
                 cycleStart,
                 _target);
-            Task<bool> result = null;
+            bool handled = false;
             try
             {
-                result = RunCore();
-                return result;
+                // Await the runner before closing the metrics cycle. Reading
+                // Task.Result here blocks the DPB coroutine continuation.
+                handled = await ExecuteRunCore();
+                return handled;
             }
             finally
             {
@@ -25827,13 +26120,13 @@ namespace AllflameBot
                 VoyageRunnerMetrics.EndCycle(
                     cycleEnd,
                     _target,
-                    result != null && result.Result,
+                    handled,
                     _shortEscapeAttempts,
                     _recoveryBudgetUsed);
             }
         }
 
-        private Task<bool> RunCore()
+        private Task<bool> ExecuteRunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             bool capsuleSearchRequired =
@@ -27322,7 +27615,7 @@ namespace AllflameBot
             }
         }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             if (!AllflameContext.IsChartMapArea ||
                 !AllflameSettings.Instance.ExploreWholeChart ||
@@ -28357,7 +28650,7 @@ namespace AllflameBot
                 "VisitAllflameCapsuleTask",
                 "Passes discovered Allflame Capsules while Lanterns remain.") { }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             bool activeVoyage =
                 AllflameContext.IsVoyageMapArea &&
@@ -28503,7 +28796,7 @@ namespace AllflameBot
         public InteractLanternTask()
             : base("InteractLanternTask", "Would interact with a targetable Golden Lantern.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool chart =
                 AllflameContext.IsChartMapArea;
@@ -28794,7 +29087,7 @@ namespace AllflameBot
             ResetPathfinder();
         }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             bool encounter =
                 AllflameContext.IsChartMapArea ||
@@ -29135,7 +29428,7 @@ namespace AllflameBot
         public OpenDeepwaterChestsTask()
             : base("OpenDeepwaterChestsTask", "Opens a configured chest after navigation has reached it.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool encounter =
                 AllflameContext.IsChartMapArea ||
@@ -29649,7 +29942,7 @@ namespace AllflameBot
         public LootGroundItemsTask()
             : base("LootGroundItemsTask", "Picks evaluated ground loot after opening a reward chest.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             bool encounter =
@@ -30509,7 +30802,7 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool voyageOrRetryWait =
                 AllflameContext.IsVoyageMapArea &&
@@ -36656,7 +36949,7 @@ namespace AllflameBot
         public WaitForBathysphereTask()
             : base("WaitForBathysphereTask", "Would keep moving inside the lit area while waiting.") { }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             if (!AllflameContext.IsVoyageMapArea ||
                 AllflameContext.Phase != AllflamePhase.WaitingForBathysphere ||
@@ -36752,7 +37045,7 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (!AllflameContext.IsVoyageMapArea ||
                 (AllflameContext.Phase !=
@@ -37062,7 +37355,7 @@ namespace AllflameBot
             ResetLocalState();
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             bool inHub =
                 AllflameContext.Phase == AllflamePhase.SovereignHub ||
@@ -39654,7 +39947,7 @@ namespace AllflameBot
                    IsBottleItem(item);
         }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             string settingsSignature = BottleCycleSettingsSignature(settings);
@@ -42241,7 +42534,7 @@ namespace AllflameBot
                 "StashLootTask",
                 "Stashes non-Chart inventory items across configured tabs.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             AllflameSettings settings = AllflameSettings.Instance;
             bool inHub =
@@ -42922,7 +43215,7 @@ namespace AllflameBot
         public ReturnToHubTask()
             : base("ReturnToHubTask", "Returns to The Sovereign when Chart exploration is complete.") { }
 
-        public override async Task<bool> Run()
+        protected override async Task<bool> RunCore()
         {
             if (!AllflameContext.IsChartMapArea)
             {
@@ -43246,7 +43539,7 @@ namespace AllflameBot
         public StuckRecoveryTask()
             : base("StuckRecoveryTask", "Recovers when task, target, position and UI make no progress.") { }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             if (AllflameProgressWatchdog.TryConsumeRecovery(
                     "ReloadPathAndRefreshState"))
@@ -43394,7 +43687,7 @@ namespace AllflameBot
         public ObservationFallbackTask()
             : base("ObservationFallbackTask", "Handles the loop without sending game input.") { }
 
-        public override Task<bool> Run()
+        protected override Task<bool> RunCore()
         {
             AllflameLog.Throttled(
                 Name,

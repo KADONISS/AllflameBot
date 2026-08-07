@@ -30,6 +30,9 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
   portal reacquisition and Chart Runner handoff after exhaustion.
 - Lifecycle stop and deinitialization release held Allflame Mover input and
   clear process-hook key states before task teardown.
+- Bounded DPB interaction and `FinishCurrentAction` waits release held input,
+  queue a fresh context snapshot and return control to the ordered task loop
+  when a process-hook action does not complete.
 - Chart zero-Lantern recovery that cancels unopened chest routes, preserves a
   confirmed committed chest loot session and waits for loot before return.
 - Recording stop reasons.
@@ -41,6 +44,9 @@ reacquisition, path reload, target invalidation and retry-state reset. Do not
 add an automatic stop merely because a loop is inconvenient to diagnose. Chart
 Storage UI failures must remain bounded and return to the configured supply
 fallback without converting a transient UI fault into a bot stop.
+Interaction and movement-finish timeouts must be recoverable input cleanup
+events, not terminal bot stops; the timeout and cleanup postcondition must be
+logged.
 Once Chart Device Descend is confirmed, a Bathysphere path or portal-entry
 timeout is an extraction recovery, not a new Chart Device transaction; the
 recovery must preserve capsule priority and release the Chart request only
