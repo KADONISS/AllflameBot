@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.165 - 2026-08-08
+
+- Prevent DPB's one-coroutine-per-tick violation by awaiting interaction and
+  `FinishCurrentAction` directly instead of racing them against a second
+  `LokiCoroutine.Sleep` task; preserve DPB-native action timeout and
+  cross-tick Chart Storage timeout recovery.
+- Release owned input and queue a fresh snapshot when an interaction is
+  rejected or movement-finish synchronization fails.
+
 ## 0.23.164 - 2026-08-08
 
 - Bound DPB interaction and movement-finish waits so a stalled process-hook

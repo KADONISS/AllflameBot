@@ -6,7 +6,6 @@ expected result and whether it represents a failure or success path.
 
 Native UI fixtures should include the DPB build, native open/enabled state,
 input mode, fresh postcondition and the matching stable Element counts when a
-Voyage Planner comparison is involved. The repository includes the sanitized
-[`voyage-bathysphere-stall-recovery.md`](voyage-bathysphere-stall-recovery.md)
-fixture. It is a log-review fixture only; live client behavior remains an
-integration check.
+Voyage Planner comparison is involved. The repository includes sanitized
+Voyage recovery fixtures. They are log-review/source-invariant checks only;
+live client behavior remains an integration check.

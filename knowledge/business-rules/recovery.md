@@ -24,6 +24,9 @@ Update when a recovery contract or terminal condition is intentionally changed.
 - DPB interaction and movement-finish waits must be bounded; a timeout clears
   mover/process-hook input, queues fresh observation and returns to the task
   pipeline instead of leaving an in-flight hook action blocking the loop.
+- Never race two DPB/Loki coroutine tasks in one tick. Await the DPB action
+  directly and let its native timeout or the owning cross-tick state machine
+  bound the operation.
 - Bot stop, runtime rebuild and mover deinitialization must release owned held
   movement input and clear process-hook key states before teardown completes.
 - Every recovery action needs a structured log with reason and next action.

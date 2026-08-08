@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.164";
+        public const string Current = "0.23.165";
     }
 
     public sealed class AllflameBot : IBot
@@ -6377,8 +6377,6 @@ namespace AllflameBot
 
     internal abstract partial class ObserverTask : ITask
     {
-        private const int InteractionTimeoutSeconds = 8;
-        private const int FinishActionTimeoutPaddingMilliseconds = 500;
         private int _moveFailureCount;
         private DateTime _moveFailureSinceUtc = DateTime.MinValue;
         private DateTime _nextPathReloadUtc = DateTime.MinValue;
@@ -6415,28 +6413,12 @@ namespace AllflameBot
                     return false;
                 }
 
+                // DPB's coroutine scheduler permits one coroutine task per
+                // tick. Do not race InteractWith against LokiCoroutine.Sleep;
+                // Chart Storage already owns a cross-tick interaction timeout.
                 Stopwatch interactionTimer = Stopwatch.StartNew();
-                Task<bool> interaction = Coroutines.InteractWith(target);
-                Task timeout = LokiCoroutine.Sleep(
-                    InteractionTimeoutSeconds * 1000);
-                Task completed = await Task.WhenAny(interaction, timeout);
+                bool interacted = await Coroutines.InteractWith(target);
                 interactionTimer.Stop();
-                if (completed != interaction)
-                {
-                    AllflameLog.Info(
-                        "INTERACTION_TIMEOUT" +
-                        "|Context=" + (context ?? String.Empty) +
-                        "|TimeoutSeconds=" + InteractionTimeoutSeconds +
-                        "|ElapsedMs=" + interactionTimer.ElapsedMilliseconds +
-                        "|Action=ReleaseInputAndRefresh");
-                    AllflameBot.ReleaseOwnedInput(
-                        "InteractionTimeout:" + (context ?? String.Empty));
-                    AllflameContext.RequestRefresh(
-                        "InteractionTimeout");
-                    return false;
-                }
-
-                bool interacted = await interaction;
                 AllflameLog.Throttled(
                     "interaction_duration_" + (context ?? "Unknown"),
                     TimeSpan.FromSeconds(2),
@@ -6444,6 +6426,13 @@ namespace AllflameBot
                     "|Context=" + (context ?? String.Empty) +
                     "|ElapsedMs=" + interactionTimer.ElapsedMilliseconds +
                     "|Success=" + interacted);
+                if (!interacted)
+                {
+                    AllflameBot.ReleaseOwnedInput(
+                        "InteractionRejected:" + (context ?? String.Empty));
+                    AllflameContext.RequestRefresh(
+                        "InteractionRejected");
+                }
                 return interacted;
             }
             catch (Exception ex)
@@ -6784,30 +6773,29 @@ namespace AllflameBot
                 // Preserve DPB's FinishCurrentAction(true) synchronization,
                 // but never let a long MoveTowards action hold the complete
                 // bot task loop while an interaction target is already near.
+                // FinishCurrentAction enforces the timeout configured above;
+                // awaiting it directly keeps DPB's one-coroutine-per-tick
+                // contract intact.
+                int finishTimeoutMilliseconds = heldMovement ? 750 : 350;
                 Coroutines.FinishCurrentActionTimeout =
-                    heldMovement ? 750 : 350;
-                Task finishAction =
-                    Coroutines.FinishCurrentAction(true);
-                Task timeout = LokiCoroutine.Sleep(
-                    Coroutines.FinishCurrentActionTimeout +
-                    FinishActionTimeoutPaddingMilliseconds);
-                Task completed = await Task.WhenAny(
-                    finishAction,
-                    timeout);
-                if (completed != finishAction)
+                    finishTimeoutMilliseconds;
+                Stopwatch finishTimer = Stopwatch.StartNew();
+                await Coroutines.FinishCurrentAction(true);
+                finishTimer.Stop();
+                if (finishTimer.ElapsedMilliseconds >=
+                    finishTimeoutMilliseconds)
                 {
                     AllflameLog.Info(
                         "ACTION_SYNC_TIMEOUT|Task=" + Name +
                         "|Target=" + target +
-                        "|TimeoutMs=" +
-                        (Coroutines.FinishCurrentActionTimeout +
-                         FinishActionTimeoutPaddingMilliseconds) +
-                        "|Action=ReleaseInputAndContinue");
+                        "|TimeoutMs=" + finishTimeoutMilliseconds +
+                        "|Action=ReleaseInputAndContinue|Native=True");
                     AllflameBot.ReleaseOwnedInput(
                         "FinishCurrentActionTimeout:" + target);
+                    AllflameContext.RequestRefresh(
+                        "FinishCurrentActionTimeout");
                     return;
                 }
-                await finishAction;
                 LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 AllflameLog.Throttled(
                     Name + "_finish_action_" + target,
@@ -6829,7 +6817,10 @@ namespace AllflameBot
                     ":" + ex.Message);
                 try
                 {
-                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
+                    AllflameBot.ReleaseOwnedInput(
+                        "FinishCurrentActionFailed:" + target);
+                    AllflameContext.RequestRefresh(
+                        "FinishCurrentActionFailed");
                 }
                 catch
                 {

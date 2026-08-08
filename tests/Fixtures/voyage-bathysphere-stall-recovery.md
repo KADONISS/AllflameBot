@@ -27,9 +27,11 @@ TASK_MANAGER_RUN_END|...
 
 ## Expected recovery evidence
 
-- If an interaction or movement-finish operation exceeds its bounded wait,
-  `INTERACTION_TIMEOUT` or `ACTION_SYNC_TIMEOUT` is logged, input is cleared,
-  and a fresh context refresh is queued.
+- If the owning interaction state machine exceeds its bounded wait,
+  `CHART_STORAGE_INTERACTION_TIMEOUT` or the equivalent task-specific timeout
+  is logged; for movement-finish, DPB's native timeout produces
+  `ACTION_SYNC_TIMEOUT`. Input is cleared and a fresh context refresh is
+  queued.
 - If Bathysphere approach recovery exhausts its budget,
   `CHART_DEVICE_REQUEST_RELEASED` is followed by normal Chart Runner task
   activity; the bot does not stop solely for this transient path failure.
