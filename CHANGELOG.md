@@ -2,6 +2,15 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.166 - 2026-08-09
+
+- Use DPB's native `CloseBlockingWindows()` before Sovereign travel and
+  before boat staging movement so stale Voyage Planner, Chart Device, loot or
+  other blocking UI cannot keep the character idle on the boat.
+- Capture native UI state before cleanup, request a fresh context snapshot and
+  verify the close on the next task cycle; retry through the existing Boat
+  Staging timeout/recovery path when the postcondition remains unavailable.
+
 ## 0.23.165 - 2026-08-08
 
 - Prevent DPB's one-coroutine-per-tick violation by awaiting interaction and

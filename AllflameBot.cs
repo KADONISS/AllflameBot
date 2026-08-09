@@ -22,7 +22,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.165";
+        public const string Current = "0.23.166";
     }
 
     public sealed class AllflameBot : IBot
@@ -134,6 +134,7 @@ namespace AllflameBot
             }
 
             AllflameContext.Reset();
+            DpbUiCleanupCoordinator.Reset();
             AllflameRunState.Reset();
             VoyageRunState.Reset();
             AllflameLootState.Clear();
@@ -310,6 +311,7 @@ namespace AllflameBot
 
             string stopContext = AllflameProgressWatchdog.Describe();
             _taskManager.Stop();
+            DpbUiCleanupCoordinator.Reset();
             AllflameProgressWatchdog.Reset();
             VoyageRunnerMetrics.Reset();
             AllflameVoyageDebug.Reset();
@@ -9023,6 +9025,10 @@ namespace AllflameBot
 
             _nextBoatUtc = DateTime.UtcNow.AddSeconds(8);
 
+            await DpbUiCleanupCoordinator.EnsureClosedAsync(
+                Name,
+                false);
+
             if (AllflameSettings.Instance.UseNativeSovereignTravel)
             {
                 if (_nativeTravelPending)
@@ -9150,13 +9156,13 @@ namespace AllflameBot
             AllflameProgressWatchdog.Clear(Name);
         }
 
-        protected override Task<bool> RunCore()
+        protected override async Task<bool> RunCore()
         {
             if (!AllflameRunState.BoatStagingRequired)
             {
                 ResetLocalState();
                 AllflameProgressWatchdog.Clear(Name);
-                return Task.FromResult(false);
+                return false;
             }
 
             bool inHub =
@@ -9171,7 +9177,14 @@ namespace AllflameBot
                     TimeSpan.FromSeconds(2),
                     "BOAT_STAGING|State=WaitingForSovereign" +
                     "|Phase=" + AllflameContext.Phase);
-                return Task.FromResult(true);
+                return true;
+            }
+
+            if (!await DpbUiCleanupCoordinator.EnsureClosedAsync(
+                    Name,
+                    true))
+            {
+                return true;
             }
 
             Vector2i target;
@@ -9199,7 +9212,7 @@ namespace AllflameBot
             if (distance <= ArrivalDistance)
             {
                 Complete(player, distance, "Direct");
-                return Task.FromResult(false);
+                return false;
             }
 
             double segmentDistance;
@@ -9222,7 +9235,7 @@ namespace AllflameBot
                     "|SegmentDistance=" + segmentDistance.ToString("0.0") +
                     "|DotProduct=" + dotProduct.ToString("0.0"));
                 Complete(player, distance, "CrossedArrivalRadius");
-                return Task.FromResult(false);
+                return false;
             }
 
             bool progress = UpdateConvergence(distance, now);
@@ -9238,12 +9251,12 @@ namespace AllflameBot
             if (recoveryReason != null)
             {
                 if (TryRecover(recoveryReason, now))
-                    return Task.FromResult(true);
+                    return true;
                 StopForBoatStaging(
                     "RecoveryLimitExceeded",
                     now,
                     distance);
-                return Task.FromResult(false);
+                return false;
             }
 
             if (_movementStartedUtc != DateTime.MinValue &&
@@ -9251,11 +9264,11 @@ namespace AllflameBot
                 TimeSpan.FromSeconds(HardTimeoutSeconds))
             {
                 StopForBoatStaging("HardTimeout", now, distance);
-                return Task.FromResult(false);
+                return false;
             }
 
             if (now < _recoveryCooldownUntilUtc)
-                return Task.FromResult(true);
+                return true;
 
             bool moving = AllflameMovementCoordinator.MoveTowards(target, Name);
             if (!moving && _pathFailureSinceUtc == DateTime.MinValue)
@@ -9282,7 +9295,7 @@ namespace AllflameBot
                 "|Crossings=" + _sideCrossings.Count +
                 "|Recovery=" + _recoveryAttempts +
                 "|MoveSkill=" + AllflameMover.DescribeSelectedMovementSkill());
-            return Task.FromResult(true);
+            return true;
         }
 
         private void ResolveTarget(out Vector2i target, out string anchor)
