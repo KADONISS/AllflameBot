@@ -27,3 +27,6 @@ UI adapters are in [`AllflameBot.cs`](../../AllflameBot.cs); WPF settings UI is 
 Use a validated native semantic action when available, then the narrowest valid
 Element control; avoid global text clicks, verify the next state, and retain
 visual fallback only as a final path.
+Context-level raw Element traversal is bounded and is skipped in Deepwater
+states when the corresponding native UI API can provide the state; on-demand
+Element fallbacks retain their own scoped timeout and postcondition checks.

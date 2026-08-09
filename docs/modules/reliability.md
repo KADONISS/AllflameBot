@@ -34,6 +34,9 @@ in [`AllflameBot.cs`](../../AllflameBot.cs).
   a time; task-specific state machines provide cross-tick timeouts where
   needed, release held input, queue a fresh context snapshot and return
   control to the ordered task loop when an action does not complete.
+- Context observation uses a single-flight coordinator, stage diagnostics,
+  targeted Deepwater object reads and a bounded visible-UI circuit breaker so a
+  recoverable observation slowdown does not monopolize the task cycle.
 - Chart zero-Lantern recovery that cancels unopened chest routes, preserves a
   confirmed committed chest loot session and waits for loot before return.
 - Recording stop reasons.

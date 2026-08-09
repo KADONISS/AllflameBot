@@ -2,14 +2,37 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## 0.23.167 - 2026-08-09
+
+- Recover Secret Bottle rewards when Accept leaves the item on the cursor:
+  inspect cursor state, use native reward transfer, then place the cursor into
+  the main inventory and verify the inventory/cursor postcondition.
+- Prevent synchronous context refresh contention from monopolizing the task
+  cycle: coalesce refreshes, keep the context lock out of DPB reads, use native
+  Chart Device/Capsule state during Deepwater actions, and bound the remaining
+  visible-UI traversal with a recoverable circuit breaker.
+- Use targeted Bathysphere/Capsule lookup while waiting for extraction and
+  record refresh stage, refresh id and Fresh/Stale/Unavailable observation
+  diagnostics for recovery analysis.
+
 ## 0.23.166 - 2026-08-09
 
+- Approach the Bathysphere before interacting instead of issuing a direct
+  interaction from the former 53-70 distance band, reducing portal-entry
+  timeouts caused by unreliable long-range interaction.
+- Bound failed Sulphur pickup retries per world item with cooldown and
+  ignore-after-three-failures handling so a rejected target cannot monopolize
+  the task pipeline or repeatedly emit Dream highlight errors.
 - Use DPB's native `CloseBlockingWindows()` before Sovereign travel and
   before boat staging movement so stale Voyage Planner, Chart Device, loot or
   other blocking UI cannot keep the character idle on the boat.
 - Capture native UI state before cleanup, request a fresh context snapshot and
   verify the close on the next task cycle; retry through the existing Boat
   Staging timeout/recovery path when the postcondition remains unavailable.
+- Prevent synchronous context refresh contention from monopolizing the task
+  cycle: coalesce refreshes, keep the context lock out of DPB reads, use native
+  Chart Device/Capsule state during Deepwater actions, and bound the remaining
+  visible-UI traversal with a recoverable circuit breaker.
 
 ## 0.23.165 - 2026-08-08
 

@@ -23,6 +23,10 @@ Update when a limitation is reproduced, resolved or superseded.
 - Several settings are exposed in configuration/UI but need runtime consumer
   audits before they can be treated as active policy.
 - `AllflameBot.cs` is a large monolith with static shared state.
+- A single external DPB getter can still block its caller; context observation
+  now avoids unnecessary full scans and identifies the active stage, but
+  arbitrary DPB reads are not moved to background threads without a verified
+  thread-safety contract.
 - There is no automated test project or CI pipeline.
 - `3rdparty.json` metadata does not fully describe the references declared by the
   project file.

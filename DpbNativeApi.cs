@@ -1,8 +1,10 @@
 using System;
+using DreamPoeBot.Common;
 using System.Reflection;
 using System.Threading.Tasks;
 using DreamPoeBot.Loki;
 using DreamPoeBot.Loki.Game;
+using DreamPoeBot.Loki.Game.Objects;
 
 namespace AllflameBot
 {
@@ -39,6 +41,45 @@ namespace AllflameBot
         public bool SendToSurfaceEnabled { get; set; }
         public bool CallBathysphereEnabled { get; set; }
         public InventoryControlWrapper InventoryControl { get; set; }
+    }
+
+    internal sealed class DpbBottleCursorSnapshot
+    {
+        public bool IsOpened { get; set; }
+        public bool IsBottleMode { get; set; }
+        public bool HasItem { get; set; }
+        public Item Item { get; set; }
+        public Vector2i ItemSize { get; set; }
+        public string Mode { get; set; }
+
+        public bool HasUsableItem
+        {
+            get
+            {
+                return HasItem &&
+                    ItemSize.X > 0 &&
+                    ItemSize.Y > 0;
+            }
+        }
+
+        public string Describe()
+        {
+            int itemKey = Item == null
+                ? 0
+                : (Item.LocalId != 0 ? Item.LocalId : Item.Id);
+            string itemName = Item == null
+                ? String.Empty
+                : (Item.FullName ?? Item.Name ?? String.Empty);
+            return
+                "Opened=" + IsOpened +
+                ",Mode=" + (Mode ?? String.Empty) +
+                ",BottleMode=" + IsBottleMode +
+                ",HasItem=" + HasItem +
+                ",Usable=" + HasUsableItem +
+                ",Size=" + ItemSize.X + "x" + ItemSize.Y +
+                ",ItemKey=" + itemKey +
+                ",Item=" + itemName.Replace("|", "/");
+        }
     }
 
     internal sealed class DpbDeepwaterCounterSnapshot
@@ -472,6 +513,133 @@ namespace AllflameBot
             {
                 reason = exception.GetType().Name;
                 LogFailure("BottleRevealSnapshot", exception);
+                return false;
+            }
+        }
+
+        public static bool TryCaptureBottleCursor(
+            out DpbBottleCursorSnapshot snapshot,
+            out string reason)
+        {
+            snapshot = null;
+            reason = "Unknown";
+            try
+            {
+                Item item = LokiPoe.InGameState.CursorItemOverlay.Item;
+                var mode = LokiPoe.InGameState.CursorItemOverlay.Mode;
+                snapshot = new DpbBottleCursorSnapshot
+                {
+                    IsOpened =
+                        LokiPoe.InGameState.CursorItemOverlay.IsOpened,
+                    IsBottleMode =
+                        LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
+                        mode == LokiPoe.InGameState.CursorItemModes
+                            .OpenBottledItem,
+                    HasItem = item != null,
+                    Item = item,
+                    ItemSize =
+                        LokiPoe.InGameState.CursorItemOverlay.ItemSize,
+                    Mode = mode.ToString()
+                };
+                reason = snapshot.Describe();
+                return true;
+            }
+            catch (Exception exception)
+            {
+                reason = exception.GetType().Name;
+                LogFailure("BottleCursorSnapshot", exception);
+                return false;
+            }
+        }
+
+        public static bool TryFastMoveBottleReward(
+            out Item rewardItem,
+            out FastMoveResult result,
+            out string reason)
+        {
+            rewardItem = null;
+            result = FastMoveResult.Unsupported;
+            reason = "Unavailable";
+            try
+            {
+                if (!LokiPoe.InGameState.BottledItemRevealUi.IsOpened)
+                {
+                    reason = "BottleRevealClosed";
+                    return false;
+                }
+
+                InventoryControlWrapper control =
+                    LokiPoe.InGameState.BottledItemRevealUi
+                        .InventoryControl;
+                if (control == null ||
+                    control.Inventory == null ||
+                    control.Inventory.Items == null)
+                {
+                    reason = "RewardControlUnavailable";
+                    return false;
+                }
+
+                foreach (Item item in control.Inventory.Items)
+                {
+                    if (item != null && item.IsValid)
+                    {
+                        rewardItem = item;
+                        break;
+                    }
+                }
+                if (rewardItem == null)
+                {
+                    reason = "RewardItemUnavailable";
+                    return false;
+                }
+
+                int itemKey = rewardItem.LocalId != 0
+                    ? rewardItem.LocalId
+                    : rewardItem.Id;
+                result = control.FastMoveReward(itemKey, true);
+                reason = result.ToString();
+                return result == FastMoveResult.None;
+            }
+            catch (Exception exception)
+            {
+                reason = exception.GetType().Name;
+                LogFailure("BottleRewardFastMove", exception);
+                return false;
+            }
+        }
+
+        public static bool TryPlaceBottleCursor(
+            int column,
+            int row,
+            out PlaceCursorIntoResult result,
+            out string reason)
+        {
+            result = PlaceCursorIntoResult.Unsupported;
+            reason = "Unavailable";
+            try
+            {
+                InventoryControlWrapper control =
+                    LokiPoe.InGameState.InventoryUi
+                        .InventoryControl_Main;
+                if (control == null ||
+                    control.Inventory == null)
+                {
+                    reason = "MainInventoryUnavailable";
+                    return false;
+                }
+
+                result = control.PlaceCursorInto(
+                    column,
+                    row,
+                    false,
+                    true);
+                reason = result.ToString();
+                return result == PlaceCursorIntoResult.None;
+            }
+            catch (Exception exception)
+            {
+                reason = exception.GetType().Name;
+                LogFailure("BottleCursorPlacement", exception);
                 return false;
             }
         }

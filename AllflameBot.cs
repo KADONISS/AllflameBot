@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Controls;
 using DreamPoeBot.Common;
@@ -22,7 +23,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.166";
+        public const string Current = "0.23.167";
     }
 
     public sealed class AllflameBot : IBot
@@ -595,6 +596,13 @@ namespace AllflameBot
         WaitingForBathysphere
     }
 
+    internal enum AllflameObservationStatus
+    {
+        Fresh,
+        Stale,
+        Unavailable
+    }
+
     internal static class AllflameAreaTransitionGuard
     {
         private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(8);
@@ -778,9 +786,20 @@ namespace AllflameBot
 
     internal static class AllflameContext
     {
+        private const int MaximumVisibleUiElements = 900;
+        private const int MaximumVisibleUiScanMilliseconds = 250;
+        private const int UiScanCircuitBreakMilliseconds = 2000;
+        private const int UiScanSlowThresholdMilliseconds = 350;
         private static readonly object Sync = new object();
+        private static int _refreshInProgress;
+        private static long _refreshSequence;
+        private static long _activeRefreshId;
+        private static string _refreshStage = "Idle";
+        private static DateTime _uiScanDisabledUntilUtc = DateTime.MinValue;
         private static DateTime _nextRefreshUtc = DateTime.MinValue;
         private static DateTime _nextObjectRefreshUtc = DateTime.MinValue;
+        private static DateTime _nextWaitingFullObjectRefreshUtc =
+            DateTime.MinValue;
         private static DateTime _nextInventoryRefreshUtc = DateTime.MinValue;
         private static DateTime _nextUiRefreshUtc = DateTime.MinValue;
         private static DateTime _nextChartStorageStatsRefreshUtc =
@@ -872,12 +891,38 @@ namespace AllflameBot
             }
         }
 
+        public static bool RefreshInProgress
+        {
+            get
+            {
+                return Interlocked.CompareExchange(
+                    ref _refreshInProgress,
+                    0,
+                    0) != 0;
+            }
+        }
+
+        public static string RefreshStage
+        {
+            get { return _refreshStage ?? "Unknown"; }
+        }
+
+        public static AllflameObservationStatus ObservationStatus
+        {
+            get; private set;
+        }
+
         public static void Reset()
         {
             lock (Sync)
             {
+                Interlocked.Exchange(ref _refreshInProgress, 0);
+                _activeRefreshId = 0;
+                _refreshStage = "Idle";
+                _uiScanDisabledUntilUtc = DateTime.MinValue;
                 _nextRefreshUtc = DateTime.MinValue;
                 _nextObjectRefreshUtc = DateTime.MinValue;
+                _nextWaitingFullObjectRefreshUtc = DateTime.MinValue;
                 _nextInventoryRefreshUtc = DateTime.MinValue;
                 _nextUiRefreshUtc = DateTime.MinValue;
                 _nextChartStorageStatsRefreshUtc = DateTime.MinValue;
@@ -912,30 +957,61 @@ namespace AllflameBot
                 ChartStorageSummary = String.Empty;
                 VoyageSnapshotAvailable = false;
                 VoyageSnapshot = null;
+                ObservationStatus = AllflameObservationStatus.Stale;
             }
         }
 
         public static void Refresh(bool force)
         {
-            lock (Sync)
+            if (Interlocked.CompareExchange(
+                    ref _refreshInProgress,
+                    1,
+                    0) != 0)
+            {
+                AllflameLog.Throttled(
+                    "context_refresh_busy",
+                    TimeSpan.FromSeconds(2),
+                    "CONTEXT_REFRESH_SKIPPED" +
+                    "|Reason=RefreshInProgress" +
+                    "|RefreshId=" + _activeRefreshId +
+                    "|Stage=" + RefreshStage +
+                    "|Phase=" + Phase +
+                    "|AreaHash=" + AreaHash);
+                return;
+            }
+
+            long refreshId = Interlocked.Increment(ref _refreshSequence);
+            _activeRefreshId = refreshId;
+            _refreshStage = "Request";
+            try
             {
                 DateTime now = DateTime.UtcNow;
-                bool manualSnapshot = _manualSnapshotRequested;
-                int queuedRefreshRequests = _forceRefreshRequests;
-                if (manualSnapshot)
+                bool manualSnapshot;
+                int queuedRefreshRequests;
+                bool due;
+                lock (Sync)
                 {
-                    _manualSnapshotRequested = false;
-                    force = true;
+                    manualSnapshot = _manualSnapshotRequested;
+                    queuedRefreshRequests = _forceRefreshRequests;
+                    if (manualSnapshot)
+                    {
+                        _manualSnapshotRequested = false;
+                        force = true;
+                    }
+                    if (queuedRefreshRequests > 0)
+                    {
+                        _forceRefreshRequests = 0;
+                        force = true;
+                    }
+                    due = force || now >= _nextRefreshUtc;
                 }
-                if (queuedRefreshRequests > 0)
-                {
-                    _forceRefreshRequests = 0;
-                    force = true;
-                }
-                if (!force && now < _nextRefreshUtc)
+
+                if (!due)
                 {
                     return;
                 }
+
+                ObservationStatus = AllflameObservationStatus.Stale;
 
                 Stopwatch refreshTimer = Stopwatch.StartNew();
                 long objectScanMilliseconds = 0;
@@ -948,6 +1024,7 @@ namespace AllflameBot
                     "context_refresh_begin",
                     TimeSpan.FromSeconds(2),
                     "CONTEXT_REFRESH_BEGIN" +
+                    "|RefreshId=" + refreshId +
                     "|Force=" + force +
                     "|ManualSnapshot=" + manualSnapshot +
                     "|QueuedRefreshRequests=" + queuedRefreshRequests +
@@ -956,8 +1033,10 @@ namespace AllflameBot
                     "|ChartRequested=" +
                     AllflameRunState.ChartRequested);
 
+                bool refreshFailed = false;
                 try
                 {
+                    _refreshStage = "Runtime";
                     if (!LokiPoe.IsInGame)
                     {
                         AllflameAreaTransitionGuard.Observe(false, 0);
@@ -975,6 +1054,7 @@ namespace AllflameBot
                         return;
                     }
 
+                    _refreshStage = "Area";
                     var area = LokiPoe.CurrentWorldArea;
                     AreaId = area == null ? String.Empty : Safe(area.Id);
                     AreaName = area == null ? String.Empty : Safe(area.Name);
@@ -1004,7 +1084,7 @@ namespace AllflameBot
                         force || now >= _nextObjectRefreshUtc;
                     bool inventoryScan =
                         force || now >= _nextInventoryRefreshUtc;
-                    bool uiScan =
+                    bool uiScanRequested =
                         force || now >= _nextUiRefreshUtc;
                     bool chartStorageScan =
                         force || now >= _nextChartStorageStatsRefreshUtc;
@@ -1012,6 +1092,36 @@ namespace AllflameBot
                         AreaId,
                         "DeepwaterHub",
                         StringComparison.OrdinalIgnoreCase);
+                    bool voyageArea = String.Equals(
+                        AreaId,
+                        "DeepwaterEncounterVoyage",
+                        StringComparison.OrdinalIgnoreCase);
+                    bool nativeUiStateAvailable =
+                        (voyageArea &&
+                         AllflameSettings.Instance.UseNativeCapsuleActions) ||
+                        (AllflameRunState.ChartRequested &&
+                         AllflameSettings.Instance.UseNativeChartDevice);
+                    bool uiScan =
+                        uiScanRequested &&
+                        !nativeUiStateAvailable &&
+                        DateTime.UtcNow >= _uiScanDisabledUntilUtc;
+                    if (uiScanRequested && !uiScan)
+                    {
+                        AllflameLog.Throttled(
+                            "context_refresh_ui_skipped",
+                            TimeSpan.FromSeconds(2),
+                            "CONTEXT_REFRESH_STAGE" +
+                            "|RefreshId=" + refreshId +
+                            "|Stage=VisibleUi|State=Skipped" +
+                            "|Reason=" +
+                            (nativeUiStateAvailable
+                                ? "NativeStateAvailable"
+                                : "CircuitBreak") +
+                            "|Phase=" + Phase +
+                            "|AreaId=" + AreaId);
+                        _nextUiRefreshUtc = DateTime.UtcNow.AddMilliseconds(
+                            UiRefreshIntervalMilliseconds());
+                    }
                     if (!deepwaterHub)
                     {
                         VoyageSnapshotAvailable = false;
@@ -1019,16 +1129,38 @@ namespace AllflameBot
                     }
                     if (objectScan)
                     {
+                        _refreshStage = "Objects";
                         if (traceRefresh)
                         {
                             AllflameLog.Throttled(
                                 "context_refresh_objects_begin",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=Objects|State=Begin");
                         }
                         Stopwatch stageTimer = Stopwatch.StartNew();
-                        SnapshotObjects();
+                        bool targetedWaitingObjectScan =
+                            voyageArea &&
+                            (Phase == AllflamePhase.WaitingForBathysphere ||
+                             VoyageRunState.CallIssued);
+                        bool waitingFullScanDue =
+                            !targetedWaitingObjectScan ||
+                            now >= _nextWaitingFullObjectRefreshUtc;
+                        if (targetedWaitingObjectScan &&
+                            !waitingFullScanDue)
+                        {
+                            SnapshotWaitingForBathysphereObjects();
+                        }
+                        else
+                        {
+                            SnapshotObjects();
+                            if (targetedWaitingObjectScan)
+                            {
+                                _nextWaitingFullObjectRefreshUtc =
+                                    DateTime.UtcNow.AddSeconds(3);
+                            }
+                        }
                         stageTimer.Stop();
                         objectScanMilliseconds =
                             stageTimer.ElapsedMilliseconds;
@@ -1038,6 +1170,7 @@ namespace AllflameBot
                                 "context_refresh_objects_end",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=Objects|State=End" +
                                 "|ElapsedMs=" + objectScanMilliseconds);
                         }
@@ -1045,7 +1178,9 @@ namespace AllflameBot
                             Phase == AllflamePhase.ChartArea ||
                             Phase == AllflamePhase.Voyage
                                 ? 225
-                                : 325);
+                                : Phase == AllflamePhase.WaitingForBathysphere
+                                    ? 350
+                                    : 325);
                     }
                     else
                     {
@@ -1053,12 +1188,14 @@ namespace AllflameBot
                     }
                     if (inventoryScan)
                     {
+                        _refreshStage = "Inventory";
                         if (traceRefresh)
                         {
                             AllflameLog.Throttled(
                                 "context_refresh_inventory_begin",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=Inventory|State=Begin");
                         }
                         Stopwatch stageTimer = Stopwatch.StartNew();
@@ -1072,6 +1209,7 @@ namespace AllflameBot
                                 "context_refresh_inventory_end",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=Inventory|State=End" +
                                 "|ElapsedMs=" + inventoryScanMilliseconds);
                         }
@@ -1079,18 +1217,22 @@ namespace AllflameBot
                             DateTime.UtcNow.AddMilliseconds(250);
                     }
                     TrackPosition(now);
+                    bool visibleUiComplete = true;
                     if (uiScan)
                     {
+                        _refreshStage = "VisibleUi";
                         if (traceRefresh)
                         {
                             AllflameLog.Throttled(
                                 "context_refresh_ui_begin",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=VisibleUi|State=Begin");
                         }
                         Stopwatch stageTimer = Stopwatch.StartNew();
-                        _cachedVisibleUiText = CaptureVisibleUiText();
+                        _cachedVisibleUiText = CaptureVisibleUiText(
+                            out visibleUiComplete);
                         DeepwaterVoyageSnapshot voyageSnapshot = null;
                         VoyageSnapshotAvailable = deepwaterHub &&
                             NativeDeepwaterVoyageUi.TryCapture(
@@ -1106,11 +1248,26 @@ namespace AllflameBot
                                 "context_refresh_ui_end",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=VisibleUi|State=End" +
                                 "|ElapsedMs=" + uiScanMilliseconds);
                         }
                         _nextUiRefreshUtc = DateTime.UtcNow.AddMilliseconds(
                             UiRefreshIntervalMilliseconds());
+                        if (!visibleUiComplete ||
+                            uiScanMilliseconds >= UiScanSlowThresholdMilliseconds)
+                        {
+                            _uiScanDisabledUntilUtc = DateTime.UtcNow.AddMilliseconds(
+                                UiScanCircuitBreakMilliseconds);
+                            AllflameLog.Info(
+                                "CONTEXT_REFRESH_UI_CIRCUIT" +
+                                "|RefreshId=" + refreshId +
+                                "|Complete=" + visibleUiComplete +
+                                "|ElapsedMs=" + uiScanMilliseconds +
+                                "|DisabledUntilUtc=" +
+                                _uiScanDisabledUntilUtc.ToString("O") +
+                                "|Action=UseCachedOrNativeState");
+                        }
                     }
                     HashSet<string> visibleUiText =
                         _cachedVisibleUiText;
@@ -1146,6 +1303,7 @@ namespace AllflameBot
                         !AllflameAreaTransitionGuard.Pending;
                     CapsuleUiButtons stableCapsuleUi;
                     if (capsuleDirectScanAllowed &&
+                        uiScan &&
                         CapsuleDirectUi.TryGetStableButtons(
                             out stableCapsuleUi))
                     {
@@ -1248,12 +1406,14 @@ namespace AllflameBot
 
                     if (chartStorageScan)
                     {
+                        _refreshStage = "ChartStorage";
                         if (traceRefresh)
                         {
                             AllflameLog.Throttled(
                                 "context_refresh_storage_begin",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=ChartStorage|State=Begin");
                         }
                         Stopwatch chartStorageTimer = Stopwatch.StartNew();
@@ -1267,6 +1427,7 @@ namespace AllflameBot
                                 "context_refresh_storage_end",
                                 TimeSpan.FromSeconds(2),
                                 "CONTEXT_REFRESH_STAGE" +
+                                "|RefreshId=" + refreshId +
                                 "|Stage=ChartStorage|State=End" +
                                 "|ElapsedMs=" +
                                 chartStorageScanMilliseconds);
@@ -1339,17 +1500,33 @@ namespace AllflameBot
                 }
                 catch (Exception ex)
                 {
+                    refreshFailed = true;
+                    ObservationStatus =
+                        AllflameObservationStatus.Unavailable;
+                    AllflameLog.Info(
+                        "CONTEXT_REFRESH_FAILURE" +
+                        "|RefreshId=" + refreshId +
+                        "|Stage=" + RefreshStage +
+                        "|Phase=" + Phase +
+                        "|AreaHash=" + AreaHash);
                     AllflameLog.Error("STATE_REFRESH_FAILED", ex);
                 }
                 finally
                 {
+                    if (!refreshFailed)
+                    {
+                        ObservationStatus =
+                            AllflameObservationStatus.Fresh;
+                    }
                     if (refreshTimer.IsRunning)
                     {
                         refreshTimer.Stop();
                     }
                     string refreshDetail =
+                        "|RefreshId=" + refreshId +
                         "|ElapsedMs=" + refreshTimer.ElapsedMilliseconds +
                         "|Force=" + force +
+                        "|Stage=" + RefreshStage +
                         "|Phase=" + Phase +
                         "|AreaHash=" + AreaHash;
                     if (refreshTimer.ElapsedMilliseconds >= 250)
@@ -1368,6 +1545,12 @@ namespace AllflameBot
                     _nextRefreshUtc =
                         DateTime.UtcNow.AddMilliseconds(125);
                 }
+            }
+            finally
+            {
+                _refreshStage = "Idle";
+                _activeRefreshId = 0;
+                Interlocked.Exchange(ref _refreshInProgress, 0);
             }
         }
 
@@ -1389,10 +1572,34 @@ namespace AllflameBot
 
         public static void RefreshInventory(bool force)
         {
-            lock (Sync)
+            if (Interlocked.CompareExchange(
+                    ref _refreshInProgress,
+                    1,
+                    0) != 0)
+            {
+                AllflameLog.Throttled(
+                    "context_inventory_busy",
+                    TimeSpan.FromSeconds(2),
+                    "CONTEXT_REFRESH_SKIPPED" +
+                    "|Reason=RefreshInProgress" +
+                    "|Request=InventoryOnly" +
+                    "|RefreshId=" + _activeRefreshId +
+                    "|Stage=" + RefreshStage);
+                return;
+            }
+
+            long refreshId = Interlocked.Increment(ref _refreshSequence);
+            _activeRefreshId = refreshId;
+            _refreshStage = "InventoryOnly";
+            try
             {
                 DateTime now = DateTime.UtcNow;
-                if (!force && now < _nextInventoryRefreshUtc)
+                bool due;
+                lock (Sync)
+                {
+                    due = force || now >= _nextInventoryRefreshUtc;
+                }
+                if (!due)
                 {
                     return;
                 }
@@ -1434,6 +1641,12 @@ namespace AllflameBot
                     }
                 }
             }
+            finally
+            {
+                _refreshStage = "Idle";
+                _activeRefreshId = 0;
+                Interlocked.Exchange(ref _refreshInProgress, 0);
+            }
         }
 
         public static string Describe()
@@ -1472,7 +1685,10 @@ namespace AllflameBot
                 "|LanternCounter=" + LanternCounterCurrent + "/" + LanternCounterMaximum +
                 "|Sulphur=" + CollectedSulphur +
                 "|CountersNative=" + DeepwaterCountersNativeAvailable +
-                "|StorageSnapshot=" + Safe(AllflameSettings.Instance.LastChartStorageScan);
+                "|StorageSnapshot=" + Safe(AllflameSettings.Instance.LastChartStorageScan) +
+                "|ObservationStatus=" + ObservationStatus +
+                "|RefreshInProgress=" + RefreshInProgress +
+                "|RefreshStage=" + RefreshStage;
         }
 
         public static void RequestManualSnapshot()
@@ -1809,6 +2025,68 @@ namespace AllflameBot
             return
                 MetadataContains(metadata, "ChartPortal") ||
                 MetadataContains(metadata, "ExtractionObject");
+        }
+
+        private static void SnapshotWaitingForBathysphereObjects()
+        {
+            ClearObjectState();
+            try
+            {
+                NetworkObject capsule =
+                    LokiPoe.ObjectManager.GetObjectByName(
+                        "Allflame Capsule");
+                if (SafeValid(capsule))
+                {
+                    ObserveCapsuleCandidate(
+                        capsule,
+                        SafeObjectName(capsule),
+                        SafeObjectMetadata(capsule),
+                        SafeTargetable(capsule),
+                        "WaitingForBathysphere.TargetedLookup");
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Throttled(
+                    "waiting_capsule_lookup_failed",
+                    TimeSpan.FromSeconds(5),
+                    "CONTEXT_OBJECT_TARGETED_FAILED" +
+                    "|Target=Allflame Capsule" +
+                    "|Error=" + ex.GetType().Name);
+            }
+
+            try
+            {
+                NetworkObject bathysphere =
+                    LokiPoe.ObjectManager.GetObjectByName("Bathysphere");
+                if (SafeValid(bathysphere))
+                {
+                    bool targetable = SafeTargetable(bathysphere);
+                    BathysphereAvailable = targetable;
+                    BathysphereObject = bathysphere;
+                    ExtractionAvailable = targetable;
+                    ExtractionObject = bathysphere;
+                    AllflameLog.Throttled(
+                        "waiting_bathysphere_lookup",
+                        TimeSpan.FromSeconds(2),
+                        "CONTEXT_OBJECT_TARGETED" +
+                        "|Target=Bathysphere" +
+                        "|Targetable=" + targetable +
+                        "|Distance=" + SafeDistance(bathysphere).ToString("0.0") +
+                        "|Mode=TargetedLookup");
+                }
+            }
+            catch (Exception ex)
+            {
+                AllflameLog.Throttled(
+                    "waiting_bathysphere_lookup_failed",
+                    TimeSpan.FromSeconds(5),
+                    "CONTEXT_OBJECT_TARGETED_FAILED" +
+                    "|Target=Bathysphere" +
+                    "|Error=" + ex.GetType().Name);
+            }
+
+            LanternAuraActive = HasLanternAura();
         }
 
         private static void SnapshotObjects()
@@ -2167,14 +2445,18 @@ namespace AllflameBot
             }
         }
 
-        private static HashSet<string> CaptureVisibleUiText()
+        private static HashSet<string> CaptureVisibleUiText(
+            out bool complete)
         {
             var output = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            complete = false;
+            Stopwatch scanTimer = Stopwatch.StartNew();
             try
             {
                 List<Element> roots = LokiPoe.GetGuiElements();
                 if (roots == null)
                 {
+                    complete = true;
                     return output;
                 }
 
@@ -2182,11 +2464,33 @@ namespace AllflameBot
                 int count = 0;
                 foreach (Element root in roots)
                 {
-                    CaptureVisibleUiText(root, 0, visited, output, ref count);
-                    if (count >= 1200)
+                    if (scanTimer.ElapsedMilliseconds >=
+                            MaximumVisibleUiScanMilliseconds ||
+                        count >= MaximumVisibleUiElements)
                     {
                         break;
                     }
+                    CaptureVisibleUiText(
+                        root,
+                        0,
+                        visited,
+                        output,
+                        ref count,
+                        scanTimer,
+                        ref complete);
+                }
+                complete = scanTimer.ElapsedMilliseconds <
+                    MaximumVisibleUiScanMilliseconds &&
+                    count < MaximumVisibleUiElements;
+                if (!complete)
+                {
+                    AllflameLog.Throttled(
+                        "ui_scan_bounded",
+                        TimeSpan.FromSeconds(2),
+                        "UI_SCAN_BOUNDED" +
+                        "|Complete=False" +
+                        "|Visited=" + count +
+                        "|ElapsedMs=" + scanTimer.ElapsedMilliseconds);
                 }
             }
             catch (Exception ex)
@@ -2195,6 +2499,10 @@ namespace AllflameBot
                     "ui_scan_failed",
                     TimeSpan.FromSeconds(10),
                     "UI_SCAN_FAILED|" + ex.GetType().Name + "|" + Safe(ex.Message));
+            }
+            finally
+            {
+                scanTimer.Stop();
             }
 
             return output;
@@ -2205,10 +2513,20 @@ namespace AllflameBot
             int depth,
             HashSet<long> visited,
             HashSet<string> output,
-            ref int count)
+            ref int count,
+            Stopwatch scanTimer,
+            ref bool complete)
         {
-            if (element == null || depth > 12 || count >= 1200)
+            if (element == null ||
+                depth > 12 ||
+                count >= MaximumVisibleUiElements)
             {
+                return;
+            }
+            if (scanTimer.ElapsedMilliseconds >=
+                MaximumVisibleUiScanMilliseconds)
+            {
+                complete = false;
                 return;
             }
 
@@ -2259,7 +2577,18 @@ namespace AllflameBot
 
             foreach (Element child in children)
             {
-                CaptureVisibleUiText(child, depth + 1, visited, output, ref count);
+                CaptureVisibleUiText(
+                    child,
+                    depth + 1,
+                    visited,
+                    output,
+                    ref count,
+                    scanTimer,
+                    ref complete);
+                if (!complete)
+                {
+                    return;
+                }
             }
         }
 
@@ -8202,9 +8531,20 @@ namespace AllflameBot
 
     internal sealed partial class CollectSulphurRewardTask : ObserverTask
     {
+        private const float SulphurDirectPickupRange = 20f;
+        private const int MaximumPickupFailures = 3;
+        private static readonly TimeSpan PickupFailureCooldown =
+            TimeSpan.FromSeconds(5);
         private DateTime _nextAttemptUtc = DateTime.MinValue;
         private readonly HashSet<int> _collectedWorldIds =
             new HashSet<int>();
+        private readonly Dictionary<int, int> _pickupFailureCounts =
+            new Dictionary<int, int>();
+        private readonly Dictionary<int, DateTime> _pickupCooldownUntilUtc =
+            new Dictionary<int, DateTime>();
+        private readonly HashSet<int> _ignoredWorldIds =
+            new HashSet<int>();
+        private uint _pickupStateAreaHash;
         private bool _pickupPending;
         private int _pendingWorldId;
         private string _pendingItemName = String.Empty;
@@ -8225,9 +8565,12 @@ namespace AllflameBot
                 AllflameContext.Phase != AllflamePhase.VoyagePlanning)
             {
                 _collectedWorldIds.Clear();
+                ResetPickupFailureState();
                 ClearPendingPickup();
                 return false;
             }
+
+            ResetPickupFailureStateForArea();
 
             if (_pickupPending)
             {
@@ -8264,6 +8607,8 @@ namespace AllflameBot
                     _collectedWorldIds.Add(_pendingWorldId);
                     AllflameRunState.MarkSulphurCollected();
                     AllflameSession.RecordSulphurCollected(quantity);
+                    _pickupFailureCounts.Remove(_pendingWorldId);
+                    _pickupCooldownUntilUtc.Remove(_pendingWorldId);
                     ClearPendingPickup();
                     return true;
                 }
@@ -8283,6 +8628,11 @@ namespace AllflameBot
                     _pendingInventoryBefore +
                     "|InventoryAfter=" + inventoryAfter +
                     "|ActionNext=RetryFreshWorldItem");
+                RecordPickupFailure(
+                    _pendingWorldId,
+                    _pendingItemName,
+                    _pendingDistance,
+                    "PickupUnconfirmed");
                 ClearPendingPickup();
             }
 
@@ -8294,7 +8644,8 @@ namespace AllflameBot
                     .Where(world =>
                         world != null &&
                         world.IsValid &&
-                        !_collectedWorldIds.Contains(world.Id))
+                        !_collectedWorldIds.Contains(world.Id) &&
+                        !IsPickupSuppressed(world.Id))
                     .FirstOrDefault(IsSulphur);
             }
             catch
@@ -8303,6 +8654,18 @@ namespace AllflameBot
 
             if (sulphur == null)
             {
+                if (HasActivePickupSuppression())
+                {
+                    AllflameLog.Throttled(
+                        "sulphur_reward_suppressed",
+                        TimeSpan.FromSeconds(2),
+                        "SULPHUR_REWARD|Action=Skip" +
+                        "|Reason=TargetCooldownOrIgnored" +
+                        "|AreaHash=" + AllflameContext.AreaHash +
+                        "|NextAction=ContinueTaskPipeline");
+                    return false;
+                }
+
                 // The reward materializes just after the area transition.
                 // Hold the normal chart loop briefly so it is not abandoned.
                 if (AllflameRunState.SulphurCollectionPending)
@@ -8337,9 +8700,8 @@ namespace AllflameBot
             _nextAttemptUtc =
                 DateTime.UtcNow.AddMilliseconds(250);
 
-            const float sulphurDirectPickupRange = 70f;
             if (sulphur.Distance >
-                sulphurDirectPickupRange)
+                SulphurDirectPickupRange)
             {
                 bool moving = AllflameMovementCoordinator.MoveTowards(
                     sulphur.Position,
@@ -8351,7 +8713,7 @@ namespace AllflameBot
                     "|Distance=" + sulphur.Distance.ToString("0.0") +
                     "|Position=" + sulphur.Position +
                     "|DirectPickupRange=" +
-                    sulphurDirectPickupRange.ToString("0.0") +
+                    SulphurDirectPickupRange.ToString("0.0") +
                     "|Moving=" + moving);
                 return true;
             }
@@ -8382,6 +8744,8 @@ namespace AllflameBot
                 "|OneActionPerCycle=True");
             if (picked)
             {
+                _pickupFailureCounts.Remove(worldId);
+                _pickupCooldownUntilUtc.Remove(worldId);
                 _pickupPending = true;
                 _pendingWorldId = worldId;
                 _pendingItemName = itemName;
@@ -8391,7 +8755,126 @@ namespace AllflameBot
                 _pendingAreaHash = pickupAreaHash;
                 _pickupIssuedUtc = DateTime.UtcNow;
             }
+
+            if (!picked)
+            {
+                RecordPickupFailure(
+                    worldId,
+                    itemName,
+                    pickupDistance,
+                    "InteractionRejected");
+                return false;
+            }
+
             return true;
+        }
+
+        private void ResetPickupFailureStateForArea()
+        {
+            uint areaHash = AllflameContext.AreaHash;
+            if (_pickupStateAreaHash == areaHash)
+            {
+                return;
+            }
+
+            _pickupStateAreaHash = areaHash;
+            _pickupFailureCounts.Clear();
+            _pickupCooldownUntilUtc.Clear();
+            _ignoredWorldIds.Clear();
+        }
+
+        private void ResetPickupFailureState()
+        {
+            _pickupStateAreaHash = 0;
+            _pickupFailureCounts.Clear();
+            _pickupCooldownUntilUtc.Clear();
+            _ignoredWorldIds.Clear();
+        }
+
+        private bool IsPickupSuppressed(int worldId)
+        {
+            if (_ignoredWorldIds.Contains(worldId))
+            {
+                return true;
+            }
+
+            DateTime cooldownUntil;
+            if (!_pickupCooldownUntilUtc.TryGetValue(
+                    worldId,
+                    out cooldownUntil))
+            {
+                return false;
+            }
+
+            if (DateTime.UtcNow >= cooldownUntil)
+            {
+                _pickupCooldownUntilUtc.Remove(worldId);
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool HasActivePickupSuppression()
+        {
+            if (_ignoredWorldIds.Count > 0)
+            {
+                return true;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            foreach (DateTime cooldownUntil in
+                     _pickupCooldownUntilUtc.Values)
+            {
+                if (now < cooldownUntil)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void RecordPickupFailure(
+            int worldId,
+            string itemName,
+            float distance,
+            string reason)
+        {
+            int attempts;
+            if (!_pickupFailureCounts.TryGetValue(worldId, out attempts))
+            {
+                attempts = 0;
+            }
+            attempts++;
+            _pickupFailureCounts[worldId] = attempts;
+
+            if (attempts >= MaximumPickupFailures)
+            {
+                _ignoredWorldIds.Add(worldId);
+                _pickupCooldownUntilUtc.Remove(worldId);
+                AllflameLog.Info(
+                    "SULPHUR_REWARD|Action=Skip" +
+                    "|WorldId=" + worldId +
+                    "|Name=" + (itemName ?? String.Empty) +
+                    "|Distance=" + distance.ToString("0.0") +
+                    "|Attempts=" + attempts +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|NextAction=ContinueTaskPipeline");
+                return;
+            }
+
+            DateTime retryAt = DateTime.UtcNow.Add(PickupFailureCooldown);
+            _pickupCooldownUntilUtc[worldId] = retryAt;
+            AllflameLog.Info(
+                "SULPHUR_REWARD|Action=PickupRejected" +
+                "|WorldId=" + worldId +
+                "|Name=" + (itemName ?? String.Empty) +
+                "|Distance=" + distance.ToString("0.0") +
+                "|Attempts=" + attempts +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|RetryAfterUtc=" + retryAt.ToString("O") +
+                "|NextAction=Cooldown");
         }
 
         private void ClearPendingPickup()
@@ -22949,6 +23432,7 @@ namespace AllflameBot
         private const int MaximumEmptyDeviceRecoveries = 2;
         private const int MaximumPortalApproachRecoveries = 3;
         private const int MaximumPortalPathFailuresPerAnchor = 2;
+        private const float ReliableBathysphereInteractionDistance = 35f;
         private static readonly Vector2i[] PortalApproachOffsets =
         {
             new Vector2i(0, 0),
@@ -23276,9 +23760,11 @@ namespace AllflameBot
                     "|Metadata=" + portal.Metadata +
                     "|Distance=" +
                     portal.Distance.ToString("0.0") +
-                    "|Targetable=" + portal.IsTargetable);
+                    "|Targetable=" + portal.IsTargetable +
+                    "|InteractRange=" +
+                    ReliableBathysphereInteractionDistance.ToString("0.0"));
 
-                if (portal.Distance <= 70f &&
+                if (portal.Distance <= ReliableBathysphereInteractionDistance &&
                     DateTime.UtcNow >= _nextPortalInteractUtc)
                 {
                     await FinishMovementBeforeInteraction(
@@ -39890,9 +40376,14 @@ namespace AllflameBot
         private RewardPlacementResult _activePlacement;
         private DateTime _bottleStageDeadlineUtc = DateTime.MinValue;
         private DateTime _nextBottleAcceptClickUtc = DateTime.MinValue;
+        private DateTime _nativeBottleAcceptWaitUntilUtc = DateTime.MinValue;
         private int _bottlePlacementAttempts;
         private bool _nativeBottleAcceptAttempted;
         private bool _nativeBottleFallbackArmed;
+        private bool _nativeBottleRewardTransferAttempted;
+        private bool _bottleAcceptInputSent;
+        private bool _bottleRewardCursorAccepted;
+        private bool _cursorWasEmptyBeforeBottle;
 
         public SecretBottleProcessingTask()
             : base(
@@ -40549,6 +41040,26 @@ namespace AllflameBot
             InventoryControlWrapper inventoryControl,
             Item bottle)
         {
+            DpbBottleCursorSnapshot cursorBefore;
+            string cursorBeforeReason;
+            bool cursorBeforeCaptured =
+                DpbNativeApi.TryCaptureBottleCursor(
+                    out cursorBefore,
+                    out cursorBeforeReason);
+            _cursorWasEmptyBeforeBottle =
+                !cursorBeforeCaptured ||
+                cursorBefore == null ||
+                !cursorBefore.HasUsableItem;
+            _bottleAcceptInputSent = false;
+            _bottleRewardCursorAccepted = false;
+            _nativeBottleRewardTransferAttempted = false;
+            AllflameLog.Info(
+                "SECRET_BOTTLE_CURSOR_BEFORE_OPEN" +
+                "|Captured=" + cursorBeforeCaptured +
+                "|Empty=" + _cursorWasEmptyBeforeBottle +
+                "|State=" + (cursorBeforeCaptured
+                    ? cursorBeforeReason
+                    : "Unavailable"));
             _activeBottleKey = ItemKey(bottle);
             _activeBottleBeforeStack = Math.Max(1, bottle.StackCount);
             _activeBottleBefore = SnapshotInventory(
@@ -40628,6 +41139,10 @@ namespace AllflameBot
                             30,
                             settings.SecretBottleRevealTimeoutSeconds)));
                 _nextBottleAcceptClickUtc = DateTime.MinValue;
+                _nativeBottleAcceptWaitUntilUtc = DateTime.MinValue;
+                _nativeBottleRewardTransferAttempted = false;
+                _bottleAcceptInputSent = false;
+                _bottleRewardCursorAccepted = false;
                 _bottleOpenStage = BottleOpenStage.AwaitCursor;
                 AllflameLog.Info(
                     "SECRET_BOTTLE_OPEN" +
@@ -40640,28 +41155,50 @@ namespace AllflameBot
 
             if (_bottleOpenStage == BottleOpenStage.AwaitCursor)
             {
-                Item cursorItem =
-                    LokiPoe.InGameState.CursorItemOverlay.Item;
-                Vector2i cursorSize =
-                    LokiPoe.InGameState.CursorItemOverlay.ItemSize;
-                bool cursorReady =
-                    IsBottleRewardCursorOpen() &&
-                    cursorItem != null &&
-                    cursorSize.X > 0 && cursorSize.Y > 0;
+                DpbBottleCursorSnapshot cursorSnapshot;
+                string cursorReason;
+                bool cursorModeMismatch;
+                bool cursorReady = TryGetBottleRewardCursor(
+                    out cursorSnapshot,
+                    out cursorReason,
+                    out cursorModeMismatch);
+                AllflameLog.Throttled(
+                    "secret_bottle_cursor_state",
+                    TimeSpan.FromSeconds(1),
+                    "SECRET_BOTTLE_CURSOR_STATE" +
+                    "|Stage=AwaitCursor" +
+                    "|Ready=" + cursorReady +
+                    "|ModeMismatch=" + cursorModeMismatch +
+                    "|State=" + cursorReason);
                 if (cursorReady)
                 {
+                    if (cursorModeMismatch)
+                    {
+                        AllflameLog.Info(
+                            "SECRET_BOTTLE_CURSOR_MODE_MISMATCH" +
+                            "|Expected=OpenBottledItem" +
+                            "|Observed=" +
+                            (cursorSnapshot == null
+                                ? String.Empty
+                                : cursorSnapshot.Mode) +
+                            "|Action=TreatAsRewardAfterAccept");
+                    }
                     if (_nativeBottleFallbackArmed)
                     {
                         AllflameLog.Info(
                             "SECRET_BOTTLE_ACCEPT_NATIVE_ACK" +
                             "|Postcondition=True" +
                             "|Mode=CursorItemOverlay" +
-                            "|CursorMode=OpenBottledItem");
+                            "|CursorMode=" +
+                            (cursorSnapshot == null
+                                ? String.Empty
+                                : cursorSnapshot.Mode));
                     }
                     _nativeBottleAcceptAttempted = false;
                     _nativeBottleFallbackArmed = false;
+                    _bottleRewardCursorAccepted = true;
                     _activePlacement.Decision =
-                        EvaluateReward(cursorItem, settings);
+                        EvaluateReward(cursorSnapshot.Item, settings);
                     _bottlePlacementAttempts = 0;
                     _bottleOpenStage = BottleOpenStage.PlaceCursor;
                     return;
@@ -40672,6 +41209,7 @@ namespace AllflameBot
                         "SECRET_BOTTLE_TIMEOUT" +
                         "|Stage=RevealOrAccept" +
                         "|RewardUi=" + DescribeBottleRewardUi() +
+                        "|Cursor=" + DescribeBottleCursor() +
                         "|NextAction=ControlledStop");
                     AllflameStopController.Stop(
                         "SecretBottleRevealStuck",
@@ -40692,6 +41230,12 @@ namespace AllflameBot
                             out nativeRevealReason) &&
                         nativeRevealOpened)
                     {
+                        if (await TryNativeBottleRewardTransfer(
+                                settings,
+                                "BeforeAccept"))
+                        {
+                            return;
+                        }
                         _nativeBottleAcceptAttempted = true;
                         DpbActionResult nativeAccept =
                             DpbNativeApi.AcceptBottleReveal();
@@ -40705,9 +41249,12 @@ namespace AllflameBot
                             (nativeRevealControl != null));
                         if (nativeAccept.InputSent)
                         {
+                            _bottleAcceptInputSent = true;
                             _nativeBottleFallbackArmed = true;
-                            _nextBottleAcceptClickUtc =
+                            _nativeBottleAcceptWaitUntilUtc =
                                 DateTime.UtcNow.AddMilliseconds(600);
+                            _nextBottleAcceptClickUtc =
+                                _nativeBottleAcceptWaitUntilUtc;
                             return;
                         }
                         AllflameLog.Info(
@@ -40717,6 +41264,27 @@ namespace AllflameBot
                             "|To=ElementOrVisual" +
                             "|Reason=" + nativeAccept.Reason);
                     }
+                }
+                if (_nativeBottleFallbackArmed &&
+                    DateTime.UtcNow < _nativeBottleAcceptWaitUntilUtc)
+                {
+                    AllflameLog.Throttled(
+                        "secret_bottle_native_accept_wait",
+                        TimeSpan.FromSeconds(1),
+                        "SECRET_BOTTLE_ACCEPT_NATIVE_WAIT" +
+                        "|Postcondition=False" +
+                        "|State=" + cursorReason +
+                        "|UntilUtc=" +
+                        _nativeBottleAcceptWaitUntilUtc.ToString("O"));
+                    return;
+                }
+                if (_nativeBottleFallbackArmed &&
+                    !_nativeBottleRewardTransferAttempted &&
+                    await TryNativeBottleRewardTransfer(
+                        settings,
+                        "AfterAccept"))
+                {
+                    return;
                 }
                 if (_nativeBottleFallbackArmed)
                 {
@@ -40773,20 +41341,28 @@ namespace AllflameBot
                     await LokiCoroutine.Sleep(25);
                     DreamPoeBot.BotFramework.MouseManager
                         .ClickLMB(0, 0);
+                    _bottleAcceptInputSent = true;
                 }
                 return;
             }
 
             if (_bottleOpenStage == BottleOpenStage.PlaceCursor)
             {
-                Item cursorItem =
-                    LokiPoe.InGameState.CursorItemOverlay.Item;
-                Vector2i cursorSize =
-                    LokiPoe.InGameState.CursorItemOverlay.ItemSize;
+                DpbBottleCursorSnapshot cursorSnapshot;
+                string cursorReason;
+                bool cursorModeMismatch;
+                if (!TryGetBottleRewardCursor(
+                        out cursorSnapshot,
+                        out cursorReason,
+                        out cursorModeMismatch))
+                {
+                    return;
+                }
+                Item cursorItem = cursorSnapshot.Item;
+                Vector2i cursorSize = cursorSnapshot.ItemSize;
                 InventoryControlWrapper inventoryControl =
                     MainInventory();
-                if (!IsBottleRewardCursorOpen() ||
-                    cursorItem == null || cursorSize.X <= 0 ||
+                if (cursorItem == null || cursorSize.X <= 0 ||
                     cursorSize.Y <= 0 || inventoryControl == null ||
                     inventoryControl.Inventory == null ||
                     inventoryControl.InventorySlotUiElement == null)
@@ -40829,10 +41405,39 @@ namespace AllflameBot
                 _activePlacement.Column = column;
                 _activePlacement.Row = row;
                 LokiPoe.ProcessHookManager.ClearAllKeyStates();
-                DreamPoeBot.BotFramework.MouseManager
-                    .SetMousePosition(slotLocation, true);
-                await LokiCoroutine.Sleep(25);
-                DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                PlaceCursorIntoResult nativePlaceResult;
+                string nativePlaceReason;
+                bool nativePlaced =
+                    DpbNativeApi.TryPlaceBottleCursor(
+                        column,
+                        row,
+                        out nativePlaceResult,
+                        out nativePlaceReason);
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_CURSOR_PLACE_NATIVE" +
+                    "|Attempt=" + _bottlePlacementAttempts +
+                    "|Slot=" + column + "," + row +
+                    "|ModeMismatch=" + cursorModeMismatch +
+                    "|InputSent=" + nativePlaced +
+                    "|Postcondition=False" +
+                    "|Result=" + nativePlaceResult +
+                    "|Reason=" + nativePlaceReason +
+                    "|Cursor=" + cursorReason);
+                string placementMode = "Native";
+                if (!nativePlaced)
+                {
+                    AllflameLog.Info(
+                        "UI_FALLBACK" +
+                        "|Task=" + Name +
+                        "|From=NativeCursorPlacement" +
+                        "|To=InventorySlotElement" +
+                        "|Reason=" + nativePlaceReason);
+                    DreamPoeBot.BotFramework.MouseManager
+                        .SetMousePosition(slotLocation, true);
+                    await LokiCoroutine.Sleep(25);
+                    DreamPoeBot.BotFramework.MouseManager.ClickLMB(0, 0);
+                    placementMode = "InventorySlotElement";
+                }
                 _bottleStageDeadlineUtc =
                     DateTime.UtcNow.AddSeconds(1);
                 _bottleOpenStage =
@@ -40841,6 +41446,7 @@ namespace AllflameBot
                     "SECRET_BOTTLE_CURSOR_PLACE" +
                     "|Attempt=" + _bottlePlacementAttempts +
                     "|Maximum=" + maximumAttempts +
+                    "|Mode=" + placementMode +
                     "|Slot=" + column + "," + row +
                     "|Confirmed=False" +
                     "|Action=ConfirmOnNextCycle" +
@@ -40851,8 +41457,15 @@ namespace AllflameBot
             if (_bottleOpenStage ==
                 BottleOpenStage.ConfirmPlacement)
             {
-                bool placed =
-                    !IsBottleRewardCursorOpen();
+                bool cursorHeld = IsBottleRewardCursorHeld();
+                bool placed = !cursorHeld;
+                AllflameLog.Throttled(
+                    "secret_bottle_cursor_placement_confirmation",
+                    TimeSpan.FromSeconds(1),
+                    "SECRET_BOTTLE_CURSOR_PLACE_CONFIRM" +
+                    "|Placed=" + placed +
+                    "|CursorHeld=" + cursorHeld +
+                    "|Cursor=" + DescribeBottleCursor());
                 if (!placed &&
                     DateTime.UtcNow < _bottleStageDeadlineUtc)
                 {
@@ -40972,7 +41585,7 @@ namespace AllflameBot
                 increasedStacks.Count == 0)
             {
                 _failed++;
-                if (IsBottleRewardCursorOpen())
+                if (IsBottleRewardCursorHeld())
                 {
                     AllflameStopController.Stop(
                         "SecretBottleCursorStuck",
@@ -41078,26 +41691,68 @@ namespace AllflameBot
             _activePlacement = null;
             _bottleStageDeadlineUtc = DateTime.MinValue;
             _nextBottleAcceptClickUtc = DateTime.MinValue;
+            _nativeBottleAcceptWaitUntilUtc = DateTime.MinValue;
             _bottlePlacementAttempts = 0;
             _nativeBottleAcceptAttempted = false;
             _nativeBottleFallbackArmed = false;
+            _nativeBottleRewardTransferAttempted = false;
+            _bottleAcceptInputSent = false;
+            _bottleRewardCursorAccepted = false;
+            _cursorWasEmptyBeforeBottle = false;
         }
 
-        private static bool IsBottleRewardCursorOpen()
+        private bool TryGetBottleRewardCursor(
+            out DpbBottleCursorSnapshot snapshot,
+            out string reason,
+            out bool modeMismatch)
         {
-            try
-            {
-                return LokiPoe.InGameState.CursorItemOverlay.IsOpened &&
-                       String.Equals(
-                           LokiPoe.InGameState.CursorItemOverlay.Mode
-                               .ToString(),
-                           "OpenBottledItem",
-                           StringComparison.OrdinalIgnoreCase);
-            }
-            catch
+            snapshot = null;
+            reason = "Unavailable";
+            modeMismatch = false;
+            if (!DpbNativeApi.TryCaptureBottleCursor(
+                    out snapshot,
+                    out reason) ||
+                snapshot == null)
             {
                 return false;
             }
+
+            modeMismatch = snapshot.HasUsableItem &&
+                !snapshot.IsBottleMode;
+            bool acceptedMode = snapshot.IsBottleMode ||
+                (modeMismatch &&
+                 _cursorWasEmptyBeforeBottle &&
+                 (_bottleAcceptInputSent ||
+                  _bottleRewardCursorAccepted));
+            return snapshot.HasUsableItem && acceptedMode;
+        }
+
+        private static bool IsBottleRewardCursorHeld()
+        {
+            DpbBottleCursorSnapshot snapshot;
+            string reason;
+            if (!DpbNativeApi.TryCaptureBottleCursor(
+                    out snapshot,
+                    out reason) ||
+                snapshot == null)
+            {
+                return false;
+            }
+            return snapshot.HasUsableItem;
+        }
+
+        private static string DescribeBottleCursor()
+        {
+            DpbBottleCursorSnapshot snapshot;
+            string reason;
+            if (!DpbNativeApi.TryCaptureBottleCursor(
+                    out snapshot,
+                    out reason) ||
+                snapshot == null)
+            {
+                return "Unavailable:" + reason;
+            }
+            return snapshot.Describe();
         }
 
         private static bool TryFindBottleRevealAcceptButton(
@@ -41366,6 +42021,206 @@ namespace AllflameBot
                 item.IsValid &&
                 item.LocationTopLeft.X == column &&
                 item.LocationTopLeft.Y == row);
+        }
+
+        private async Task<bool> TryNativeBottleRewardTransfer(
+            AllflameSettings settings,
+            string stage)
+        {
+            _nativeBottleRewardTransferAttempted = true;
+            Item rewardItem;
+            FastMoveResult fastMoveResult;
+            string fastMoveReason;
+            bool inputSent =
+                DpbNativeApi.TryFastMoveBottleReward(
+                    out rewardItem,
+                    out fastMoveResult,
+                    out fastMoveReason);
+            AllflameLog.Info(
+                "SECRET_BOTTLE_REWARD_FAST_MOVE" +
+                "|Stage=" + (stage ?? String.Empty) +
+                "|Mode=Native" +
+                "|InputSent=" + inputSent +
+                "|Postcondition=False" +
+                "|Result=" + fastMoveResult +
+                "|Reason=" + fastMoveReason +
+                "|Item=" + (rewardItem == null
+                    ? String.Empty
+                    : (rewardItem.FullName ??
+                       rewardItem.Name ?? String.Empty)));
+            if (!inputSent)
+            {
+                return false;
+            }
+
+            Item transferredItem =
+                await WaitForBottleRewardInventoryDelta(
+                    rewardItem,
+                    900);
+            bool transferConfirmed = transferredItem != null;
+            AllflameLog.Info(
+                "SECRET_BOTTLE_REWARD_FAST_MOVE_CONFIRM" +
+                "|Stage=" + (stage ?? String.Empty) +
+                "|InputSent=True" +
+                "|Postcondition=" + transferConfirmed +
+                "|Item=" + (transferredItem == null
+                    ? String.Empty
+                    : (transferredItem.FullName ??
+                       transferredItem.Name ?? String.Empty)));
+            if (transferConfirmed)
+            {
+                _nativeBottleFallbackArmed = false;
+                _activePlacement.Decision =
+                    EvaluateReward(rewardItem, settings);
+                _activePlacement.Status =
+                    "NativeFastMoveVerified";
+                _bottleStageDeadlineUtc =
+                    DateTime.UtcNow.AddSeconds(1);
+                _bottleOpenStage =
+                    BottleOpenStage.ResolvePlacedItem;
+                return true;
+            }
+
+            DpbBottleCursorSnapshot cursorSnapshot;
+            string cursorReason;
+            bool cursorModeMismatch;
+            if (TryGetBottleRewardCursor(
+                    out cursorSnapshot,
+                    out cursorReason,
+                    out cursorModeMismatch))
+            {
+                _nativeBottleFallbackArmed = false;
+                _bottleRewardCursorAccepted = true;
+                _activePlacement.Decision =
+                    EvaluateReward(cursorSnapshot.Item, settings);
+                _activePlacement.Status =
+                    "NativeFastMoveCursorFallback";
+                _bottleOpenStage = BottleOpenStage.PlaceCursor;
+                AllflameLog.Info(
+                    "SECRET_BOTTLE_REWARD_FAST_MOVE_FALLBACK" +
+                    "|Stage=" + (stage ?? String.Empty) +
+                    "|Reason=CursorStillHeld" +
+                    "|ModeMismatch=" + cursorModeMismatch +
+                    "|Cursor=" + cursorReason +
+                    "|Action=PlaceCursor" +
+                    "|Postcondition=False");
+                return true;
+            }
+
+            return false;
+        }
+
+        private async Task<Item> WaitForBottleRewardInventoryDelta(
+            Item expectedReward,
+            int timeoutMilliseconds)
+        {
+            DateTime until =
+                DateTime.UtcNow.AddMilliseconds(
+                    Math.Max(100, timeoutMilliseconds));
+            do
+            {
+                Item transferred =
+                    FindBottleRewardInventoryDelta(expectedReward);
+                if (transferred != null)
+                {
+                    return transferred;
+                }
+                await LokiCoroutine.Sleep(55);
+            }
+            while (DateTime.UtcNow < until);
+
+            return null;
+        }
+
+        private Item FindBottleRewardInventoryDelta(Item expectedReward)
+        {
+            Dictionary<int, ItemSnapshot> before =
+                _activeBottleBefore;
+            if (before == null)
+            {
+                return null;
+            }
+
+            List<Item> candidates = InventoryItems(MainInventory())
+                .Where(item =>
+                {
+                    if (item == null ||
+                        !item.IsValid ||
+                        IsBottleItem(item))
+                    {
+                        return false;
+                    }
+                    ItemSnapshot old;
+                    if (!before.TryGetValue(ItemKey(item), out old))
+                    {
+                        return true;
+                    }
+                    if (Math.Max(1, item.StackCount) > old.StackCount)
+                    {
+                        return true;
+                    }
+                    string name = item.FullName ?? item.Name ??
+                        String.Empty;
+                    string metadata = item.Metadata ?? String.Empty;
+                    return !String.Equals(
+                               name,
+                               old.Name,
+                               StringComparison.OrdinalIgnoreCase) ||
+                           !String.Equals(
+                               metadata,
+                               old.Metadata,
+                               StringComparison.OrdinalIgnoreCase);
+                })
+                .ToList();
+            if (candidates.Count == 0)
+            {
+                return null;
+            }
+
+            if (expectedReward == null)
+            {
+                return candidates[0];
+            }
+
+            int expectedKey = ItemKey(expectedReward);
+            Item keyMatch = candidates.FirstOrDefault(item =>
+                expectedKey != 0 && ItemKey(item) == expectedKey);
+            if (keyMatch != null)
+            {
+                return keyMatch;
+            }
+
+            string expectedMetadata =
+                expectedReward.Metadata ?? String.Empty;
+            if (!String.IsNullOrWhiteSpace(expectedMetadata))
+            {
+                Item metadataMatch = candidates.FirstOrDefault(item =>
+                    String.Equals(
+                        item.Metadata,
+                        expectedMetadata,
+                        StringComparison.OrdinalIgnoreCase));
+                if (metadataMatch != null)
+                {
+                    return metadataMatch;
+                }
+            }
+
+            string expectedName = expectedReward.FullName ??
+                expectedReward.Name ?? String.Empty;
+            if (!String.IsNullOrWhiteSpace(expectedName))
+            {
+                Item nameMatch = candidates.FirstOrDefault(item =>
+                    String.Equals(
+                        item.FullName ?? item.Name ?? String.Empty,
+                        expectedName,
+                        StringComparison.OrdinalIgnoreCase));
+                if (nameMatch != null)
+                {
+                    return nameMatch;
+                }
+            }
+
+            return candidates[0];
         }
 
         private static bool TryFindAcceptButton(
