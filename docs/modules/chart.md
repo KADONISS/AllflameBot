@@ -21,6 +21,8 @@ Chart settings are in [`AllflameSettings.cs`](../../AllflameSettings.cs).
 - Terrain/topology/hybrid target selection.
 - Lantern and chest handoff priorities.
 - Native Chart Device state reads with stable UI fallback.
+- Valerie identification postconditions, bounded obstacle recovery and
+  area-scoped approach invalidation.
 - Confirmed zero-Lantern gating for new chest work and the handoff of committed
   chest loot to the return flow.
 

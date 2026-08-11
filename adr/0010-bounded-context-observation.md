@@ -23,9 +23,13 @@ stop the ordered task cycle before its watchdog or recovery task could run.
 - Prefer the verified native Chart Device and Capsule APIs during their Deepwater
   states, and use targeted Bathysphere/Capsule object lookup while waiting for
   extraction. A full object scan remains a bounded fallback.
+- Skip the global Element traversal in `DeepwaterEncounter` and
+  `DeepwaterEncounterVoyage`; native semantic state, targeted objects and
+  action-scoped Element/visual fallbacks own those states.
 - Bound the remaining visible-UI traversal by node count and cooperative
-  elapsed-time checks. A slow or incomplete scan opens a short circuit breaker;
-  cached text and native state continue to serve the task pipeline.
+  elapsed-time checks. A slow or incomplete scan disables further global scans
+  until the current `AreaHash` changes; skipped scans do not reuse cached text
+  for current UI flags.
 - Mark observation state as `Fresh`, `Stale` or `Unavailable` and record a
   refresh id and stage in boundary logs. These are recoverable observation
   states, not terminal bot-stop conditions.
@@ -39,8 +43,9 @@ failure mode rather than make the bot safer.
 
 - Chart Device and Bathysphere workflows no longer require a full raw UI-tree
   scan on every refresh cycle.
-- A cached visible-UI result can remain stale briefly, but consequential native
-  actions still require their own postcondition and existing Element fallback.
+- Deepwater encounter state remains available through native reads and targeted
+  object snapshots, while consequential fallback actions retain their own
+  scoped Element/visual postcondition checks.
 - Logs identify the refresh id, current stage, bounded UI scan and circuit
   breaker state when observation degrades.
 - A single external getter can still block its caller if DPB itself blocks inside
@@ -49,6 +54,7 @@ failure mode rather than make the bot safer.
 ## Evidence
 
 - Latest paired sessions ended after `CONTEXT_REFRESH_BEGIN` without a matching
-  end event while waiting for Bathysphere or confirming Chart Device Descend.
+  end event while waiting for Bathysphere or immediately after native Chart
+  Device Descend.
 - `AllflameBot.cs` previously held `AllflameContext.Sync` across
   `SnapshotObjects`, `SnapshotInventory` and `CaptureVisibleUiText`.

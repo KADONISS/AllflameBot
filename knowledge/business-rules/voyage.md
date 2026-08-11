@@ -34,7 +34,8 @@ Update when source and runtime evidence confirm a changed Voyage rule.
 - Bathysphere call, wait and surface transfer are separate stages.
 - A Bathysphere path failure must invalidate/rebuild movement context and may
   rotate bounded approach anchors derived from the observed portal position;
-  it must not restart Chart Device recovery after Descend is confirmed.
+  it must not restart Chart Device recovery while the post-Descend transition
+  is waiting for an area or Bathysphere postcondition.
 - If Bathysphere approach recovery is exhausted, release the Chart Device
   request so the Chart Runner can resume instead of leaving a stale cycle
   active.

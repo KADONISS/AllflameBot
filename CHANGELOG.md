@@ -2,6 +2,41 @@
 
 All notable changes to AllflameBot are documented in this file.
 
+## Unreleased
+
+## 0.23.168 - 2026-08-12
+
+- Treat a successful native Chart Device `Descend()` as an accepted action and
+  wait for an area-hash or Bathysphere postcondition instead of polling UI
+  closure after the action.
+- Quarantine native Chart Device and stable-Element UI probes during the
+  post-Descend transition so a blocking DPB getter cannot stop the host task
+  cycle; add probe boundaries for remaining pre-Descend reads.
+- Keep bounded portal-entry/path recovery and Chart Runner handoff intact when
+  the area or Bathysphere postcondition does not arrive.
+
+- Detect a coroutine cycle stalled inside TaskManager/native Chart Device work
+  with an independent runtime heartbeat; perform host-thread input/UI cleanup,
+  send Space for a Chart Device stall, return to Chart Runner, and rebuild the
+  runtime only after the bounded five-second recovery wait. Limit runtime
+  recovery to two attempts per area and suppress further retries after the
+  Chart Device request is released.
+- Prevent utility-flask native calls from monopolizing the task cycle after map
+  entry with a five-second cooldown, transition guard, input cleanup, duration
+  diagnostics and a per-area circuit breaker for slow or failed calls.
+- Recover a stalled post-Descend Bathysphere transition by sending Space after
+  10 seconds, retrying the interaction after 5 seconds and reopening the Chart
+  Device when the second interaction has no area-transition postcondition.
+- Keep Chart Device recovery state until the new UI is detected, reset stale
+  Descend/portal state, verify a single loaded chart before Descend and return
+  to Chart Runner after the bounded recovery budget is exhausted.
+- Skip the global Element scan in Deepwater encounter areas, refresh native
+  Voyage/Capsule state independently, clear stale UI flags after skipped scans
+  and keep slow/incomplete UI-scan recovery disabled until `AreaHash` changes.
+- Verify Valerie Chart identification from the inventory-count postcondition;
+  when accepted input makes no progress, blacklist the live approach position
+  within radius 5 for the current `AreaHash` and replan without stopping.
+
 ## 0.23.167 - 2026-08-09
 
 - Recover Secret Bottle rewards when Accept leaves the item on the cursor:

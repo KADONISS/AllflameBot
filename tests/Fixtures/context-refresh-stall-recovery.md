@@ -24,11 +24,18 @@ stall, not a recorded coroutine fault or terminal recovery stop.
 - Chart Device refreshes log
   `CONTEXT_REFRESH_STAGE|State=Skipped|Reason=NativeStateAvailable` while the
   native Chart Device API owns the state.
+- Deepwater encounter refreshes log
+  `CONTEXT_REFRESH_STAGE|Stage=VisibleUi|State=Skipped|Reason=DeepwaterScoped`
+  with `Policy=NativeAndOnDemandFallback`; they do not enter the global
+  Element traversal.
 - Voyage/Bathysphere refreshes use native Capsule state and targeted
   `CONTEXT_OBJECT_TARGETED` lookup before falling back to a full object scan.
 - A bounded visible-UI traversal emits `UI_SCAN_BOUNDED` and
-  `CONTEXT_REFRESH_UI_CIRCUIT` when its budget is exceeded, then later refreshes
-  continue with cached/native state.
+  `CONTEXT_REFRESH_UI_CIRCUIT|AreaHash=...|DisabledUntil=AreaChange` when its
+  budget is exceeded; the same area keeps skipping the scan until its hash
+  changes.
+- A skipped or incomplete scan does not reuse cached visible text for current
+  UI flags; native state or an action-scoped fallback must confirm the state.
 - Refresh boundary records include `RefreshId`, `Stage` and
   `ObservationStatus=Fresh|Stale|Unavailable`.
 - A transient observation failure does not emit a new terminal bot stop; the

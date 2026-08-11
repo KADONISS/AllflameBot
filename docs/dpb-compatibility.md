@@ -23,7 +23,7 @@ and the actual DPB binaries used for a build.
 - Target framework: .NET Framework 4.8.
 - Platform: x64.
 - Language: C# 7.3.
-- Build reference verified on 2026-08-09: `DreamPoeBot` `0.3.29.31`.
+- Build reference verified on 2026-08-12: `DreamPoeBot` `0.3.29.32`.
 - External references: `DreamPoeBot.exe` and `Newtonsoft.Json.dll`.
 - Runtime integrations include `LokiPoe`, `ExilePather`, `Element`, inventory/UI
   controls, process hook and `LokiCoroutine`.

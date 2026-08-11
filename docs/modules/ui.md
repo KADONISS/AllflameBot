@@ -20,6 +20,8 @@ UI adapters are in [`AllflameBot.cs`](../../AllflameBot.cs); WPF settings UI is 
 - Native DPB semantic controls for process-covered actions.
 - Input dispatch and held-input cleanup.
 - Postcondition snapshot and fallback mode logging.
+- Post-Descend UI probe quarantine: area/capsule state owns the transition
+  postcondition until bounded recovery explicitly reacquires the Chart Device.
 - Notification settings UI, masked webhook entry and delivery-status display.
 
 ## Required checks
@@ -27,6 +29,8 @@ UI adapters are in [`AllflameBot.cs`](../../AllflameBot.cs); WPF settings UI is 
 Use a validated native semantic action when available, then the narrowest valid
 Element control; avoid global text clicks, verify the next state, and retain
 visual fallback only as a final path.
-Context-level raw Element traversal is bounded and is skipped in Deepwater
-states when the corresponding native UI API can provide the state; on-demand
-Element fallbacks retain their own scoped timeout and postcondition checks.
+Context-level raw Element traversal is skipped entirely in
+`DeepwaterEncounter` and `DeepwaterEncounterVoyage`. Native semantic reads,
+object snapshots and action-scoped Element/visual fallbacks own those states;
+the remaining global scan is bounded by node/time budgets and disabled for the
+current `AreaHash` after a slow or incomplete read.

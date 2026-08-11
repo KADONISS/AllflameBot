@@ -24,6 +24,16 @@ Voyage tasks, `VoyagePlanningUi`, `VoyageRunState` and voyage planners are in
   budgets; terrain snapshots are rebuilt only when their metadata signature
   changes.
 - Bathysphere call/wait/extraction handoff.
+- Deepwater encounter refreshes skip the global Element tree and use native
+  Capsule/counter state plus targeted objects; direct Element or visual probes
+  remain action-scoped fallbacks.
+- A successful Chart Device Descend enters a post-Descend transition state
+  without polling the native Chart Device UI. Area-hash change or Bathysphere
+  appearance is the postcondition; a stalled area transition sends Space once,
+  retries the Bathysphere after 5 seconds and can reopen the Chart Device
+  without reusing stale Descend/portal state. Chart loading is duplicate-safe:
+  an occupied device is not Ctrl-clicked again and the one-item postcondition
+  is logged before Descend.
 - Bathysphere approach validates the current portal path, rotates bounded
   world-space approach anchors after repeated failures and releases the Chart
   Device request back to the Chart Runner only after recovery is exhausted.
@@ -35,8 +45,9 @@ Verify one input action per cycle where required, fresh UI snapshots, inventory
 delta, board slot postconditions, capsule priority and non-terminal recovery.
 Native planner actions require consecutive agreement with the stable Element
 snapshot; otherwise retain the stable Element/visual fallback.
-After Chart Device Descend is confirmed, portal-entry timeout recovery must
-reload/reacquire movement state without reopening the Chart Device transaction.
+After Chart Device Descend is accepted, portal-entry timeout recovery must
+reload/reacquire movement state without polling or reopening the Chart Device
+transaction until the bounded recovery explicitly hands control back.
 Normal frontier exploration owns an explicit progress watchdog and rotates its
 target/recovery strategy after a bounded budget rather than accumulating
 independent timeout chains.
