@@ -2,12 +2,12 @@
 
 ## Updated
 
-2026-08-12
+2026-08-14
 
 ## Repository
 
 - Branch: `main`
-- Current source release: `0.23.168`
+- Current source release: `0.23.169`
 - Target: .NET Framework 4.8, x64, C# 7.3
 - Runtime shape: one DPB plugin assembly with ordered ObserverTasks
 - Automated tests/CI: not currently present
@@ -20,6 +20,8 @@
   movement with next-cycle verification; successful Chart Device Descend enters
   a post-Descend transition state without polling native Chart Device UI, using
   area/capsule postconditions and bounded extraction recovery.
+- Native Voyage Planner closed snapshots are authoritative, so planner-close
+  checks do not fall through to blocking Element scans after the UI is gone.
 
 ## Active architecture work
 

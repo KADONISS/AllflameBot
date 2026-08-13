@@ -23,7 +23,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.168";
+        public const string Current = "0.23.169";
     }
 
     public sealed class AllflameBot : IBot
@@ -12320,6 +12320,11 @@ namespace AllflameBot
         private int _stage;
         private DateTime _retryAfterUtc = DateTime.MinValue;
         private DateTime _voyageUiExpectedUntilUtc = DateTime.MinValue;
+        private DateTime _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+        private int _valerieDialogTransitionAttempts;
+        private DateTime _valerieDialogOptionDeadlineUtc = DateTime.MinValue;
+        private int _valerieDialogOptionAttempts;
+        private bool _valerieDialogOptionIssued;
         private DateTime _valerieEffectDeadlineUtc = DateTime.MinValue;
         private int _valerieEffectFailures;
         private bool _manualReady;
@@ -12362,6 +12367,11 @@ namespace AllflameBot
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
             _voyageUiExpectedUntilUtc = DateTime.MinValue;
+            _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+            _valerieDialogTransitionAttempts = 0;
+            _valerieDialogOptionDeadlineUtc = DateTime.MinValue;
+            _valerieDialogOptionAttempts = 0;
+            _valerieDialogOptionIssued = false;
             _valerieEffectDeadlineUtc = DateTime.MinValue;
             _valerieEffectFailures = 0;
             _manualReady = false;
@@ -12381,6 +12391,11 @@ namespace AllflameBot
             _stage = 0;
             _retryAfterUtc = DateTime.MinValue;
             _voyageUiExpectedUntilUtc = DateTime.MinValue;
+            _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+            _valerieDialogTransitionAttempts = 0;
+            _valerieDialogOptionDeadlineUtc = DateTime.MinValue;
+            _valerieDialogOptionAttempts = 0;
+            _valerieDialogOptionIssued = false;
             _valerieEffectDeadlineUtc = DateTime.MinValue;
             _valerieEffectFailures = 0;
             _manualReady = false;
@@ -12459,6 +12474,11 @@ namespace AllflameBot
                 AllflameProgressWatchdog.Clear();
                 _stage = 0;
                 _valerieEffectDeadlineUtc = DateTime.MinValue;
+                _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+                _valerieDialogTransitionAttempts = 0;
+                _valerieDialogOptionDeadlineUtc = DateTime.MinValue;
+                _valerieDialogOptionAttempts = 0;
+                _valerieDialogOptionIssued = false;
                 _valerieEffectFailures = 0;
                 _manualReady = false;
                 _planningReadyAtOpen = false;
@@ -12547,6 +12567,121 @@ namespace AllflameBot
                 return true;
             }
 
+            // Valerie interaction returns before DPB finishes rebuilding the
+            // NPC dialog/planner state. Do not touch synchronous DPB getters
+            // during that transition; one blocked getter otherwise prevents
+            // the task manager and runtime watchdog from progressing.
+            if (_valerieDialogTransitionUntilUtc != DateTime.MinValue)
+            {
+                if (DateTime.UtcNow < _valerieDialogTransitionUntilUtc)
+                {
+                    AllflameLog.Throttled(
+                        "voyage_dialog_transition_wait",
+                        TimeSpan.FromMilliseconds(700),
+                        "VOYAGE_DIALOG_TRANSITION_WAIT" +
+                        "|Attempt=" + _valerieDialogTransitionAttempts +
+                        "|Action=DeferNativeAndDialogReads" +
+                        "|RemainingMs=" +
+                        Math.Max(
+                            0,
+                            (int)(_valerieDialogTransitionUntilUtc -
+                                DateTime.UtcNow).TotalMilliseconds));
+                    return true;
+                }
+
+                AllflameLog.Info(
+                    "VOYAGE_DIALOG_TRANSITION" +
+                    "|State=ProbeReady" +
+                    "|Attempt=" + _valerieDialogTransitionAttempts +
+                    "|Action=ResumePlannerAndDialogReads");
+                _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+            }
+
+            // Use the known DPB action directly. Enumerating the NPC dialog or
+            // recursively scanning its Element tree can block the host while
+            // DPB rebuilds the dialog after Valerie interaction.
+            if (_valerieDialogOptionDeadlineUtc != DateTime.MinValue &&
+                !_valerieDialogOptionIssued)
+            {
+                _valerieDialogOptionIssued = true;
+                _valerieDialogOptionAttempts++;
+                string conversationResult = String.Empty;
+                bool invocationIssued = false;
+                AllflameLog.Info(
+                    "VOYAGE_DIALOG_PROBE_BEGIN" +
+                    "|Mode=Conversation" +
+                    "|Option=Plan Voyage" +
+                    "|Attempt=" + _valerieDialogOptionAttempts);
+                try
+                {
+                    var result =
+                        LokiPoe.InGameState.NpcDialogUi.Converse(
+                            "Plan Voyage");
+                    conversationResult = Convert.ToString(result);
+                    // A returned "None" still means the known action was
+                    // invoked and must not be repeated in this transition.
+                    invocationIssued = true;
+                }
+                catch (Exception exception)
+                {
+                    AllflameLog.Info(
+                        "VOYAGE_DIALOG_PROBE_FAILED" +
+                        "|Mode=Conversation" +
+                        "|Option=Plan Voyage" +
+                        "|Type=" + exception.GetType().Name +
+                        "|Message=" +
+                        (exception.Message ?? String.Empty).Replace("|", "/"));
+                }
+                ResetValerieApproachRecovery(
+                    0,
+                    "VoyageDialogActionIssued");
+                _valerieEffectDeadlineUtc = DateTime.MinValue;
+                _valerieEffectFailures = 0;
+                _voyageUiExpectedUntilUtc =
+                    DateTime.UtcNow.AddSeconds(5);
+                VoyagePlanningUi.ArmExpectedOpen(
+                    TimeSpan.FromSeconds(12));
+                _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(800);
+                AllflameLog.Info(
+                    "VOYAGE_DIALOG_PROBE" +
+                    "|Attempt=" + _valerieDialogOptionAttempts +
+                    "|Mode=Conversation" +
+                    "|Option=Plan Voyage" +
+                    "|InputSent=" + invocationIssued +
+                    "|Result=" + conversationResult +
+                    "|Postcondition=DeferredVoyagePlannerProbe");
+                AllflameLog.Info(
+                    "VOYAGE_DIALOG_PROBE_END" +
+                    "|Mode=Conversation" +
+                    "|Option=Plan Voyage" +
+                    "|Invoked=" + invocationIssued);
+                AllflameLog.Info(
+                    "VOYAGE_OPEN|Source=ValerieConversation" +
+                    "|Option=Plan Voyage" +
+                    "|Result=" + conversationResult +
+                    "|InvocationIssued=" + invocationIssued);
+                return true;
+            }
+
+            // Converse has its own render latch. This check must happen before
+            // NativeDeepwaterVoyageUi.TryCapture for the same reason as the
+            // Valerie interaction quarantine above.
+            if (_voyageUiExpectedUntilUtc != DateTime.MinValue &&
+                DateTime.UtcNow < _voyageUiExpectedUntilUtc)
+            {
+                AllflameLog.Throttled(
+                    "voyage_visual_render_wait_early",
+                    TimeSpan.FromMilliseconds(700),
+                    "VOYAGE_VISUAL_WAIT|Reason=DialogueAccepted" +
+                    "|Action=DeferNativeAndDialogReads" +
+                    "|RemainingMs=" +
+                    Math.Max(
+                        0,
+                        (int)(_voyageUiExpectedUntilUtc -
+                            DateTime.UtcNow).TotalMilliseconds));
+                return true;
+            }
+
             // Image matching is intentionally armed only after the bot has
             // requested Plan Voyage, DPB reports the planning UI, or an
             // already-confirmed visual stage is in progress. Scanning the
@@ -12558,14 +12693,83 @@ namespace AllflameBot
                 _valerieEffectDeadlineUtc != DateTime.MinValue ||
                 AllflameContext.PlanVoyageVisible;
             DeepwaterVoyageSnapshot nativeVoyageSnapshot;
-            bool nativeVoyageOpen =
+            AllflameLog.Throttled(
+                "voyage_native_probe_begin",
+                TimeSpan.FromMilliseconds(500),
+                "VOYAGE_NATIVE_PROBE_BEGIN|Mode=DeepwaterVoyageSnapshot");
+            Stopwatch nativeProbeTimer = Stopwatch.StartNew();
+            bool nativeVoyageCaptured =
                 NativeDeepwaterVoyageUi.TryCapture(
-                    out nativeVoyageSnapshot) &&
+                    out nativeVoyageSnapshot);
+            nativeProbeTimer.Stop();
+            AllflameLog.Throttled(
+                "voyage_native_probe_end",
+                TimeSpan.FromMilliseconds(500),
+                "VOYAGE_NATIVE_PROBE_END" +
+                "|Captured=" + nativeVoyageCaptured +
+                "|Opened=" +
+                (nativeVoyageSnapshot != null &&
+                 nativeVoyageSnapshot.IsOpened) +
+                "|ElapsedMs=" + nativeProbeTimer.ElapsedMilliseconds);
+            bool nativeVoyageOpen =
+                nativeVoyageCaptured &&
+                nativeVoyageSnapshot != null &&
                 nativeVoyageSnapshot.IsOpened;
             bool voyageOpen =
                 nativeVoyageOpen ||
-                (visualScanArmed &&
+                (!nativeVoyageCaptured &&
+                 visualScanArmed &&
                  VoyagePlanningUi.IsOpen());
+
+            if (!voyageOpen &&
+                _valerieDialogOptionIssued &&
+                _valerieDialogOptionDeadlineUtc != DateTime.MinValue &&
+                DateTime.UtcNow >= _valerieDialogOptionDeadlineUtc)
+            {
+                SendSpaceForVoyageDialogRecovery(
+                    "DialogPlannerTimeout");
+                AllflameContext.RequestRefresh(
+                    "VoyageDialogPlannerTimeout");
+                AllflameProgressWatchdog.MarkProgress(
+                    "VoyageDialogPlannerTimeout");
+                AllflameLog.Info(
+                    "VOYAGE_DIALOG_RECOVERY" +
+                    "|Attempt=" + _valerieDialogOptionAttempts +
+                    "|Reason=PlannerOpenTimeout" +
+                    "|Action=SpaceRefreshAndReinteract");
+                ResetValerieApproachRecovery(
+                    0,
+                    "VoyageDialogPlannerTimeout");
+                _valerieDialogOptionDeadlineUtc = DateTime.MinValue;
+                _valerieDialogOptionAttempts = 0;
+                _valerieDialogOptionIssued = false;
+                _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+                _voyageUiExpectedUntilUtc = DateTime.MinValue;
+                _valerieEffectDeadlineUtc = DateTime.MinValue;
+                _retryAfterUtc = DateTime.UtcNow.AddMilliseconds(500);
+                return true;
+            }
+
+            // The direct dialog action is one-shot for this transition. Keep
+            // world movement and Valerie re-interaction suppressed until the
+            // planner confirms open or the bounded recovery deadline expires.
+            if (!voyageOpen &&
+                _valerieDialogOptionIssued &&
+                _valerieDialogOptionDeadlineUtc != DateTime.MinValue)
+            {
+                AllflameLog.Throttled(
+                    "voyage_dialog_planner_wait",
+                    TimeSpan.FromSeconds(1),
+                    "VOYAGE_DIALOG_WAIT" +
+                    "|Reason=AwaitPlannerOpen" +
+                    "|Attempt=" + _valerieDialogOptionAttempts +
+                    "|RemainingMs=" +
+                    Math.Max(
+                        0,
+                        (int)(_valerieDialogOptionDeadlineUtc -
+                            DateTime.UtcNow).TotalMilliseconds));
+                return true;
+            }
 
             AllflameLog.Throttled(
                 "voyage_config",
@@ -12640,6 +12844,11 @@ namespace AllflameBot
                     return true;
                 }
                 _valerieEffectDeadlineUtc = DateTime.MinValue;
+                _valerieDialogTransitionUntilUtc = DateTime.MinValue;
+                _valerieDialogTransitionAttempts = 0;
+                _valerieDialogOptionDeadlineUtc = DateTime.MinValue;
+                _valerieDialogOptionAttempts = 0;
+                _valerieDialogOptionIssued = false;
                 _valerieEffectFailures = 0;
             }
             if (!voyageOpen)
@@ -12665,6 +12874,22 @@ namespace AllflameBot
 
                 if (_voyageUiExpectedUntilUtc != DateTime.MinValue)
                 {
+                    if (_valerieDialogOptionIssued &&
+                        _valerieDialogOptionDeadlineUtc != DateTime.MinValue)
+                    {
+                        AllflameLog.Throttled(
+                            "voyage_dialog_planner_wait",
+                            TimeSpan.FromSeconds(1),
+                            "VOYAGE_DIALOG_WAIT" +
+                            "|Reason=AwaitPlannerOpen" +
+                            "|Attempt=" + _valerieDialogOptionAttempts +
+                            "|RemainingMs=" +
+                            Math.Max(
+                                0,
+                                (int)(_valerieDialogOptionDeadlineUtc -
+                                    DateTime.UtcNow).TotalMilliseconds));
+                        return true;
+                    }
                     _voyageUiExpectedUntilUtc = DateTime.MinValue;
                     _stage = 0;
                     await Coroutines.CloseBlockingWindows();
@@ -12673,46 +12898,6 @@ namespace AllflameBot
                     AllflameLog.Info(
                         "VOYAGE_VISUAL_RECOVERY|Reason=TitleTimeout" +
                         "|Action=CloseUiBeforeRetry");
-                    return true;
-                }
-
-                string voyageDialogOption =
-                    FindVoyageDialogOption();
-                if (LokiPoe.InGameState.NpcDialogUi.IsOpened)
-                {
-                    ResetValerieApproachRecovery(
-                        0,
-                        "ValerieDialogOpened");
-                    _valerieEffectDeadlineUtc = DateTime.MinValue;
-                    _valerieEffectFailures = 0;
-                }
-                if (LokiPoe.InGameState.NpcDialogUi.IsOpened &&
-                    !String.IsNullOrEmpty(voyageDialogOption))
-                {
-                    var result =
-                        LokiPoe.InGameState.NpcDialogUi.Converse(
-                            voyageDialogOption);
-                    _stage = 0;
-                    VoyagePlanningUi.ArmExpectedOpen(
-                        TimeSpan.FromSeconds(12));
-                    _voyageUiExpectedUntilUtc =
-                        DateTime.UtcNow.AddSeconds(5);
-                    _retryAfterUtc =
-                        DateTime.UtcNow.AddMilliseconds(800);
-                    AllflameLog.Info(
-                        "VOYAGE_OPEN|Source=ValerieConversation" +
-                        "|Option=" + voyageDialogOption +
-                        "|Result=" + result);
-                    return true;
-                }
-
-                if (LokiPoe.InGameState.NpcDialogUi.IsOpened)
-                {
-                    AllflameLog.Throttled(
-                        "voyage_dialog_option_missing",
-                        TimeSpan.FromSeconds(2),
-                        "VOYAGE_DIALOG_WAIT|Entries=" +
-                        GetDialogEntrySummary());
                     return true;
                 }
 
@@ -12804,6 +12989,22 @@ namespace AllflameBot
                     interacted
                         ? DateTime.UtcNow.AddMilliseconds(900)
                         : DateTime.MinValue;
+                if (interacted)
+                {
+                    _valerieDialogTransitionAttempts++;
+                    _valerieDialogTransitionUntilUtc =
+                        DateTime.UtcNow.AddSeconds(5);
+                    _valerieDialogOptionDeadlineUtc =
+                        DateTime.UtcNow.AddSeconds(12);
+                    _valerieDialogOptionAttempts = 0;
+                    AllflameLog.Info(
+                        "VOYAGE_DIALOG_TRANSITION" +
+                        "|State=Armed" +
+                        "|Attempt=" + _valerieDialogTransitionAttempts +
+                        "|TimeoutSeconds=5" +
+                        "|OptionDeadlineSeconds=12" +
+                        "|Action=DeferNativeAndDialogReads");
+                }
                 _retryAfterUtc =
                     DateTime.UtcNow.AddMilliseconds(
                         interacted ? 650 : 800);
@@ -13811,12 +14012,13 @@ namespace AllflameBot
                 if (NativeDeepwaterVoyageUi.TryCapture(
                         out nativeSnapshot))
                 {
-                    source = "Native";
-                    if (nativeSnapshot != null &&
-                        nativeSnapshot.IsOpened)
-                    {
-                        return true;
-                    }
+                    bool nativeOpen =
+                        nativeSnapshot != null &&
+                        nativeSnapshot.IsOpened;
+                    source = nativeOpen
+                        ? "NativeOpen"
+                        : "NativeClosed";
+                    return nativeOpen;
                 }
             }
             catch
@@ -14132,152 +14334,58 @@ namespace AllflameBot
             return true;
         }
 
-        private static string FindVoyageDialogOption()
+        private static bool SendSpaceForVoyageDialogRecovery(
+            string reason)
         {
+            bool inputSent = false;
             try
             {
-                var entries =
-                    LokiPoe.InGameState.NpcDialogUi.DialogEntries;
-                if (entries != null)
+                AllflameBot.ReleaseOwnedInput(
+                    "VoyageDialogRecoveryBeforeSpace");
+                if (LokiPoe.ClientWindowHandle != IntPtr.Zero)
                 {
-                    foreach (var entry in entries)
-                    {
-                        if (entry == null ||
-                            !entry.IsDialogChoice)
-                        {
-                            continue;
-                        }
-
-                        string text =
-                            (entry.Text ?? String.Empty).Trim();
-                        if (IsVoyageDialogueText(text))
-                        {
-                            return text;
-                        }
-                    }
+                    DreamPoeBot.Loki.Game.Interop.SetForegroundWindow(
+                        LokiPoe.ClientWindowHandle);
+                    LokiPoe.Input.SimulateKeyEvent(
+                        System.Windows.Forms.Keys.Space,
+                        true,
+                        false,
+                        true);
+                    inputSent = true;
                 }
             }
-            catch
+            catch (Exception exception)
             {
+                AllflameLog.Info(
+                    "VOYAGE_DIALOG_RECOVERY_SPACE_FAILED" +
+                    "|Reason=" + (reason ?? String.Empty) +
+                    "|Type=" + exception.GetType().Name +
+                    "|Message=" +
+                    (exception.Message ?? String.Empty).Replace("|", "/"));
             }
-
-            try
-            {
-                var entries =
-                    LokiPoe.InGameState.NpcDialogUi.DialogEntries2;
-                if (entries != null)
-                {
-                    foreach (var entry in entries)
-                    {
-                        if (entry == null ||
-                            !entry.IsDialogChoice)
-                        {
-                            continue;
-                        }
-
-                        string text =
-                            (entry.Text ?? String.Empty).Trim();
-                        if (IsVoyageDialogueText(text))
-                        {
-                            return text;
-                        }
-                    }
-                }
-            }
-            catch
-            {
-            }
-
-            // Known variants are retained as a fallback for DPB builds whose
-            // DialogEntries collection temporarily returns no elements.
-            string[] knownOptions =
-            {
-                "Plan Voyage",
-                "Plan your Voyage"
-            };
-            foreach (string option in knownOptions)
+            finally
             {
                 try
                 {
-                    if (LokiPoe.InGameState.NpcDialogUi.CanConverse(
-                        option))
-                    {
-                        return option;
-                    }
+                    LokiPoe.ProcessHookManager.ClearAllKeyStates();
                 }
-                catch
+                catch (Exception exception)
                 {
+                    AllflameLog.Info(
+                        "VOYAGE_DIALOG_RECOVERY_SPACE_CLEANUP_FAILED" +
+                        "|Reason=" + (reason ?? String.Empty) +
+                        "|Type=" + exception.GetType().Name);
                 }
             }
-            return String.Empty;
+
+            AllflameLog.Info(
+                "VOYAGE_DIALOG_RECOVERY_SPACE" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|InputSent=" + inputSent +
+                "|Postcondition=DeferredDialogReacquire");
+            return inputSent;
         }
 
-        private static bool IsVoyageDialogueText(string text)
-        {
-            return
-                !String.IsNullOrWhiteSpace(text) &&
-                text.IndexOf(
-                    "plan",
-                    StringComparison.OrdinalIgnoreCase) >= 0 &&
-                text.IndexOf(
-                    "voyage",
-                    StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        private static string GetDialogEntrySummary()
-        {
-            var output = new List<string>();
-            try
-            {
-                var entries =
-                    LokiPoe.InGameState.NpcDialogUi.DialogEntries;
-                if (entries != null)
-                {
-                    output.AddRange(
-                        entries
-                            .Where(entry => entry != null)
-                            .Select(entry =>
-                                (entry.Text ?? String.Empty)
-                                    .Replace("|", "/")
-                                    .Replace("\r", " ")
-                                    .Replace("\n", " "))
-                            .Where(text =>
-                                !String.IsNullOrWhiteSpace(text)));
-                }
-            }
-            catch
-            {
-            }
-
-            try
-            {
-                var entries =
-                    LokiPoe.InGameState.NpcDialogUi.DialogEntries2;
-                if (entries != null)
-                {
-                    output.AddRange(
-                        entries
-                            .Where(entry => entry != null)
-                            .Select(entry =>
-                                (entry.Text ?? String.Empty)
-                                    .Replace("|", "/")
-                                    .Replace("\r", " ")
-                                    .Replace("\n", " "))
-                            .Where(text =>
-                                !String.IsNullOrWhiteSpace(text)));
-                }
-            }
-            catch
-            {
-            }
-
-            return output.Count == 0
-                ? "<none>"
-                : String.Join(
-                    ",",
-                    output.Distinct(
-                        StringComparer.OrdinalIgnoreCase));
-        }
     }
 
     internal static class VoyagePlanningUi
@@ -14485,10 +14593,13 @@ namespace AllflameBot
         {
             DeepwaterVoyageSnapshot nativeSnapshot;
             if (NativeDeepwaterVoyageUi.TryCapture(
-                    out nativeSnapshot) &&
-                nativeSnapshot.IsOpened)
+                    out nativeSnapshot))
             {
-                return true;
+                // A successful native closed snapshot is authoritative. Do
+                // not fall through to the synchronous Element scan while DPB
+                // has already confirmed that the planner is closed.
+                return nativeSnapshot != null &&
+                    nativeSnapshot.IsOpened;
             }
             StableVoyageSnapshot stable;
             if (TryResolveStable(out stable))

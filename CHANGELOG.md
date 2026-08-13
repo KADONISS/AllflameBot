@@ -4,6 +4,15 @@ All notable changes to AllflameBot are documented in this file.
 
 ## Unreleased
 
+## 0.23.169 - 2026-08-14
+
+- Treat a successful native Voyage Planner snapshot with `Opened=False` as an
+  authoritative close result, preventing a synchronous Element scan from
+  blocking the task host after the planner has already closed.
+- Keep native planner-open detection authoritative and use Element/visual
+  fallback only when the native snapshot is unavailable.
+- Build and verify the release against DreamPoeBot `0.3.29.34`.
+
 ## 0.23.168 - 2026-08-12
 
 - Treat a successful native Chart Device `Descend()` as an accepted action and
