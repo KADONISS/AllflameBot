@@ -7514,6 +7514,65 @@ namespace AllflameBot
                 return false;
             }
         }
+
+        protected async Task<DpbWorldItemLootResult>
+            LootWorldItemWithFallback(
+                WorldItem target,
+                bool shouldMove,
+                int timeoutMilliseconds,
+                string context)
+        {
+            DpbWorldItemLootResult result;
+            try
+            {
+                result = await DpbNativeApi.LootWorldItemAsync(
+                    target,
+                    shouldMove,
+                    timeoutMilliseconds,
+                    context);
+            }
+            catch (Exception exception)
+            {
+                result = new DpbWorldItemLootResult
+                {
+                    ApiAvailable = false,
+                    Result = LootResult.NotAWorldItem,
+                    Reason = "NativeLootAdapterException",
+                    Exception = exception.GetType().Name
+                };
+                AllflameLog.Info(
+                    "DPB_WORLD_ITEM_LOOT" +
+                    "|Context=" +
+                    (context ?? String.Empty).Replace("|", "/") +
+                    "|Mode=Unavailable" +
+                    "|Result=FallbackRequired" +
+                    "|Exception=" + exception.GetType().Name +
+                    "|Postcondition=FallbackInteract");
+            }
+
+            if (result.ApiAvailable)
+            {
+                return result;
+            }
+
+            bool fallbackAccepted = await InteractWithRecovery(
+                target,
+                (context ?? "WorldItem") + " fallback");
+            result.FallbackUsed = true;
+            result.FallbackAccepted = fallbackAccepted;
+            AllflameLog.Info(
+                "DPB_WORLD_ITEM_LOOT_FALLBACK" +
+                "|Context=" +
+                (context ?? String.Empty).Replace("|", "/") +
+                "|InputSent=" + fallbackAccepted +
+                "|Postcondition=DeferredInventoryOrWorldItem" +
+                "|NativeReason=" +
+                (result.Reason ?? String.Empty).Replace("|", "/") +
+                "|Exception=" +
+                (result.Exception ?? String.Empty).Replace("|", "/"));
+            return result;
+        }
+
         private uint _valerieRecoveryAreaHash;
         private DateTime _valerieRecoveryStartedUtc = DateTime.MinValue;
         private DateTime _valerieRecoveryLastProgressUtc = DateTime.MinValue;
@@ -9664,7 +9723,30 @@ namespace AllflameBot
             int inventoryBefore =
                 AllflameContext.GetInventoryQuantity(itemName);
             float pickupDistance = sulphur.Distance;
-            bool picked = await InteractWithRecovery(sulphur);
+            DpbWorldItemLootResult pickup =
+                await LootWorldItemWithFallback(
+                    sulphur,
+                    false,
+                    250,
+                    "SulphurReward:" + worldId);
+            if (pickup.ShouldMove)
+            {
+                bool moving = AllflameMovementCoordinator.MoveTowards(
+                    sulphur.Position,
+                    Name + " native loot approach");
+                AllflameLog.Info(
+                    "SULPHUR_REWARD|Action=Move" +
+                    "|WorldId=" + worldId +
+                    "|Distance=" + pickupDistance.ToString("0.0") +
+                    "|Result=" + pickup.Result +
+                    "|Moving=" + moving +
+                    "|AttemptConsumed=False");
+                return true;
+            }
+
+            bool picked =
+                pickup.ActionAccepted ||
+                pickup.Result == LootResult.TimedOut;
             AllflameLog.Info(
                 "SULPHUR_REWARD|Action=PickupIssued" +
                 "|WorldId=" + worldId +
@@ -9673,10 +9755,16 @@ namespace AllflameBot
                 "|Distance=" +
                 pickupDistance.ToString("0.0") +
                 "|InteractSuccess=" + picked +
+                "|NativeResult=" + pickup.Result +
+                "|FallbackUsed=" + pickup.FallbackUsed +
+                "|Postcondition=" +
+                (pickup.AwaitPostcondition
+                    ? "ConfirmOnLaterCycle"
+                    : "RetryOrCooldown") +
                 "|InventoryBefore=" + inventoryBefore +
                 "|ActionNext=ConfirmOnLaterCycle" +
                 "|OneActionPerCycle=True");
-            if (picked)
+            if (pickup.AwaitPostcondition)
             {
                 _pickupFailureCounts.Remove(worldId);
                 _pickupCooldownUntilUtc.Remove(worldId);
@@ -9690,13 +9778,15 @@ namespace AllflameBot
                 _pickupIssuedUtc = DateTime.UtcNow;
             }
 
-            if (!picked)
+            if (!pickup.AwaitPostcondition)
             {
                 RecordPickupFailure(
                     worldId,
                     itemName,
                     pickupDistance,
-                    "InteractionRejected");
+                    pickup.ApiAvailable
+                        ? "NativeResult=" + pickup.Result
+                        : "InteractionRejected");
                 return false;
             }
 
@@ -32146,19 +32236,17 @@ namespace AllflameBot
 
             int attempts;
             _attempts.TryGetValue(target.Id, out attempts);
-            _attempts[target.Id] = attempts + 1;
             int effectiveDelayMs =
                 Math.Max(
                     30,
                     Math.Min(
                         500,
                         settings.LootActionDelayMilliseconds));
-            _retryAfter[target.Id] = DateTime.UtcNow.AddMilliseconds(
-                attempts == 0
-                    ? effectiveDelayMs
-                    : Math.Max(
-                        100,
-                        settings.LootRetryDelayMilliseconds));
+            int retryDelayMs = attempts == 0
+                ? effectiveDelayMs
+                : Math.Max(
+                    100,
+                    settings.LootRetryDelayMilliseconds);
 
             Item item = SafeItem(target);
             string dropSignature =
@@ -32189,8 +32277,74 @@ namespace AllflameBot
                 (item == null
                     ? target.Id.ToString()
                     : item.FullName));
+            DpbWorldItemLootResult pickup =
+                await LootWorldItemWithFallback(
+                    target,
+                    false,
+                    250,
+                    "GroundLoot:" + target.Id);
+            if (pickup.ShouldMove)
+            {
+                _retryAfter[target.Id] = DateTime.UtcNow.AddMilliseconds(
+                    Math.Max(50, effectiveDelayMs));
+                bool moving = AllflameMovementCoordinator.MoveTowards(
+                    target.Position,
+                    Name + " native loot approach");
+                AllflameLog.Info(
+                    "GROUND_LOOT_PICKUP_MOVE" +
+                    "|WorldId=" + target.Id +
+                    "|Distance=" + target.Distance.ToString("0.0") +
+                    "|Result=" + pickup.Result +
+                    "|Moving=" + moving +
+                    "|AttemptConsumed=False");
+                return true;
+            }
+
+            _attempts[target.Id] = attempts + 1;
+            _retryAfter[target.Id] = DateTime.UtcNow.AddMilliseconds(
+                retryDelayMs);
+
+            bool confirmationExpected =
+                pickup.AwaitPostcondition || pickup.FallbackUsed;
+            if (!confirmationExpected)
+            {
+                AllflameContext.RequestRefresh(
+                    "GroundLootNative:" + pickup.Result);
+                int failedAttempt = attempts + 1;
+                string failureReason = pickup.InvalidTarget
+                    ? "InvalidTarget=" + pickup.Result
+                    : "NativeResult=" + pickup.Result;
+                AllflameSession.RecordRejectedPickup();
+                AllflameLog.Info(
+                    "NOTIFICATION_PICKUP_REJECTED" +
+                    "|Item=" + inventoryItemName.Replace("|", "/") +
+                    "|Reason=" + failureReason +
+                    "|PlayerDead=" +
+                    (LokiPoe.Me == null || LokiPoe.Me.IsDead) +
+                    "|AreaChanged=False" +
+                    "|InventoryConfirmed=False" +
+                    "|WorldItemGone=" +
+                    (FindWorldItem(target.Id) == null) +
+                    "|InteractSuccess=False" +
+                    "|NativeResult=" + pickup.Result);
+                if (failedAttempt >= MaxConsecutiveLootAttempts)
+                {
+                    GiveUpGroundLoot(
+                        target.Id,
+                        failedAttempt,
+                        failureReason);
+                }
+                if (BottleSafetyMovement.IsActive)
+                {
+                    BottleSafetyMovement.Move(
+                        "NativeGroundLootPickupRejected");
+                }
+                return true;
+            }
+
             bool interactionAccepted =
-                await InteractWithRecovery(target);
+                pickup.ActionAccepted ||
+                pickup.Result == LootResult.TimedOut;
             _pendingPickupActive = true;
             _pendingWorldId = target.Id;
             _pendingAreaHash = interactionAreaHash;
@@ -32209,6 +32363,8 @@ namespace AllflameBot
                 "|Priority=" + LootPriority(target) +
                 "|Attempt=" + (attempts + 1) +
                 "|InteractionAccepted=" + interactionAccepted +
+                "|NativeResult=" + pickup.Result +
+                "|FallbackUsed=" + pickup.FallbackUsed +
                 "|ConfirmedRemoved=False" +
                 "|Action=ConfirmOnNextCycle" +
                 "|OneActionPerCycle=True");
@@ -32326,35 +32482,10 @@ namespace AllflameBot
                 "|InteractSuccess=" + interactionAccepted);
             if (attempt >= MaxConsecutiveLootAttempts)
             {
-                DateTime cooldownUntil = DateTime.UtcNow.AddSeconds(
-                    UnlootableCooldownSeconds);
-                _unlootableUntil[worldId] = cooldownUntil;
-                _retryAfter[worldId] = cooldownUntil;
-                AllflameLootState.MarkDropUnlootable(worldId);
-                bool committedChartLoot =
-                    !AllflameContext.IsVoyageMapArea &&
-                    AllflameLootState.CommittedChestLootActive;
-                bool returnToSafeZone = HasNearbyMonster() ||
-                    (ZeroLanternSafety.IsExhausted(
-                        AllflameContext.IsVoyageMapArea &&
-                        AllflameContext.Phase == AllflamePhase.Voyage) &&
-                     !AllflameContext.LanternAuraActive &&
-                     !committedChartLoot);
-                if (returnToSafeZone)
-                {
-                    AllflameLootState.Clear();
-                }
-                AllflameLog.Info(
-                    "GROUND_LOOT_GIVE_UP" +
-                    "|WorldId=" + worldId +
-                    "|Attempts=" + attempt +
-                    "|Reason=InteractionRejected" +
-                    "|CooldownSeconds=" +
-                    UnlootableCooldownSeconds +
-                    "|Action=" +
-                    (returnToSafeZone
-                        ? "ReturnToSafeZone"
-                        : "ResumeChestRoute"));
+                GiveUpGroundLoot(
+                    worldId,
+                    attempt,
+                    "InteractionRejected");
             }
             if (BottleSafetyMovement.IsActive)
             {
@@ -32363,6 +32494,42 @@ namespace AllflameBot
             }
             ClearPendingPickup();
             return true;
+        }
+
+        private void GiveUpGroundLoot(
+            int worldId,
+            int attempt,
+            string reason)
+        {
+            DateTime cooldownUntil = DateTime.UtcNow.AddSeconds(
+                UnlootableCooldownSeconds);
+            _unlootableUntil[worldId] = cooldownUntil;
+            _retryAfter[worldId] = cooldownUntil;
+            AllflameLootState.MarkDropUnlootable(worldId);
+            bool committedChartLoot =
+                !AllflameContext.IsVoyageMapArea &&
+                AllflameLootState.CommittedChestLootActive;
+            bool returnToSafeZone = HasNearbyMonster() ||
+                (ZeroLanternSafety.IsExhausted(
+                    AllflameContext.IsVoyageMapArea &&
+                    AllflameContext.Phase == AllflamePhase.Voyage) &&
+                 !AllflameContext.LanternAuraActive &&
+                 !committedChartLoot);
+            if (returnToSafeZone)
+            {
+                AllflameLootState.Clear();
+            }
+            AllflameLog.Info(
+                "GROUND_LOOT_GIVE_UP" +
+                "|WorldId=" + worldId +
+                "|Attempts=" + attempt +
+                "|Reason=" + (reason ?? String.Empty).Replace("|", "/") +
+                "|CooldownSeconds=" +
+                UnlootableCooldownSeconds +
+                "|Action=" +
+                (returnToSafeZone
+                    ? "ReturnToSafeZone"
+                    : "ResumeChestRoute"));
         }
 
         private static WorldItem FindWorldItem(int worldId)

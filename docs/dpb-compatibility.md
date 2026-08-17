@@ -33,6 +33,8 @@ and the actual DPB binaries used for a build.
 - `WorldUi.GoToTheSovereign()` for semantic hub travel.
 - `AllflameCapsuleUi` state, `SendToSurface()` and `CaalBathysphere()`.
 - `AllflameLootUi` state and reward `InventoryControl` reads.
+- `Coroutines.Loot(WorldItem, bool, int)` for typed World Item pickup results,
+  including `ShouldMove` and timeout outcomes.
 - `BottledItemRevealUi` state, reward control and `Accept()`.
 - `DeepwaterChartUi` state, loaded inventory and `Descend()`.
 - `DeepwaterVoyageUi` state, Chart wrappers, `ClearBoard()` and

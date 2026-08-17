@@ -26,6 +26,9 @@ Price/filter support is in [`AllflamePrices.cs`](../../AllflamePrices.cs) and
   retaining Charts in inventory; reserved Message in a Bottle items keep their
   existing processing exception.
 - Native Allflame Loot UI state with filtered reward transfer.
+- Native DPB World Item pickup through `Coroutines.Loot` for ground loot and
+  Sulphur rewards, with `ShouldMove` delegated to the movement coordinator and
+  `InteractWith` retained as the unavailable-API fallback.
 
 ## Required checks
 
@@ -34,3 +37,8 @@ Message in a Bottle cursor behavior and avoid declaring completion from a stale
 inventory snapshot. Keep committed Chart chest loot ahead of Bathysphere return
 until its eligible drops are resolved. Do not replace filtered
 `FastMoveReward()` with native `TakeAll()`.
+
+For World Items, a native `None` result and a timeout are followed by the
+existing inventory/world-item postcondition check. A typed native failure is
+refreshed and retried through the task cooldowns; it does not create a new stop
+path.

@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using DreamPoeBot.Common;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -32,6 +33,71 @@ namespace AllflameBot
                     ? String.Empty
                     : exception.GetType().Name
             };
+        }
+    }
+
+    internal sealed class DpbWorldItemLootResult
+    {
+        public bool ApiAvailable { get; set; }
+        public LootResult Result { get; set; }
+        public bool FallbackUsed { get; set; }
+        public bool FallbackAccepted { get; set; }
+        public long ElapsedMilliseconds { get; set; }
+        public string Reason { get; set; }
+        public string Exception { get; set; }
+
+        public bool ActionAccepted
+        {
+            get
+            {
+                return FallbackAccepted ||
+                    (ApiAvailable && Result == LootResult.None);
+            }
+        }
+
+        public bool ShouldMove
+        {
+            get
+            {
+                return ApiAvailable &&
+                    Result == LootResult.ShouldMove;
+            }
+        }
+
+        // A timeout may occur after the dispatcher has already sent pickup
+        // input, so let the task verify inventory/world-item state first.
+        public bool AwaitPostcondition
+        {
+            get
+            {
+                return ActionAccepted ||
+                    (ApiAvailable && Result == LootResult.TimedOut);
+            }
+        }
+
+        public bool InvalidTarget
+        {
+            get
+            {
+                return ApiAvailable &&
+                    (Result == LootResult.IdIsZero ||
+                     Result == LootResult.NotAWorldItem);
+            }
+        }
+
+        public string Describe()
+        {
+            return
+                "ApiAvailable=" + ApiAvailable +
+                ",Result=" + Result +
+                ",ActionAccepted=" + ActionAccepted +
+                ",ShouldMove=" + ShouldMove +
+                ",AwaitPostcondition=" + AwaitPostcondition +
+                ",FallbackUsed=" + FallbackUsed +
+                ",FallbackAccepted=" + FallbackAccepted +
+                ",ElapsedMs=" + ElapsedMilliseconds +
+                ",Reason=" + (Reason ?? String.Empty) +
+                ",Exception=" + (Exception ?? String.Empty);
         }
     }
 
@@ -200,6 +266,7 @@ namespace AllflameBot
                 "|WorldTravel=Compiled" +
                 "|Capsule=Compiled" +
                 "|Loot=Compiled" +
+                "|WorldItemLoot=Compiled" +
                 "|BottleReveal=Compiled" +
                 "|ChartDevice=Compiled" +
                 "|VoyagePlanner=Compiled" +
@@ -222,6 +289,102 @@ namespace AllflameBot
                 AllflameSettings.Instance.UseNativeVoyagePlannerActions +
                 "|NativeVoyageStash=StableStashUi" +
                 "|BlockingWindowCleanup=Compiled");
+        }
+
+        public static async Task<DpbWorldItemLootResult>
+            LootWorldItemAsync(
+                WorldItem worldItem,
+                bool shouldMove,
+                int timeoutMilliseconds,
+                string context)
+        {
+            var output = new DpbWorldItemLootResult
+            {
+                ApiAvailable = false,
+                Result = LootResult.NotAWorldItem,
+                Reason = "Unavailable",
+                Exception = String.Empty
+            };
+            string safeContext =
+                (context ?? String.Empty).Replace("|", "/");
+
+            if (worldItem == null)
+            {
+                output.Reason = "TargetMissing";
+                AllflameLog.Info(
+                    "DPB_WORLD_ITEM_LOOT" +
+                    "|Context=" + safeContext +
+                    "|Mode=Skipped" +
+                    "|Result=NotAWorldItem" +
+                    "|Postcondition=Unavailable");
+                return output;
+            }
+
+            if (!AllflameSettings.Instance.UseNativeLootUi)
+            {
+                output.Reason = "NativeLootDisabled";
+                AllflameLog.Info(
+                    "DPB_WORLD_ITEM_LOOT" +
+                    "|Context=" + safeContext +
+                    "|Mode=Disabled" +
+                    "|Result=FallbackRequired" +
+                    "|Postcondition=FallbackInteract");
+                return output;
+            }
+
+            int timeout = Math.Max(1, timeoutMilliseconds);
+            Stopwatch timer = Stopwatch.StartNew();
+            try
+            {
+                LootResult result =
+                    await DreamPoeBot.Loki.Bot.Coroutines.Loot(
+                        worldItem,
+                        shouldMove,
+                        timeout);
+                timer.Stop();
+                output.ApiAvailable = true;
+                output.Result = result;
+                output.ElapsedMilliseconds = timer.ElapsedMilliseconds;
+                output.Reason = result.ToString();
+                AllflameLog.Info(
+                    "DPB_WORLD_ITEM_LOOT" +
+                    "|Context=" + safeContext +
+                    "|Mode=Native" +
+                    "|Result=" + result +
+                    "|ShouldMove=" + shouldMove +
+                    "|TimeoutMs=" + timeout +
+                    "|ElapsedMs=" + output.ElapsedMilliseconds +
+                    "|Postcondition=" +
+                    (output.AwaitPostcondition
+                        ? "DeferredInventoryOrWorldItem"
+                        : "RetryOrCooldown"));
+                if (result != LootResult.None &&
+                    result != LootResult.ShouldMove)
+                {
+                    AllflameBot.ReleaseOwnedInput(
+                        "NativeWorldItemLoot:" + result);
+                }
+                return output;
+            }
+            catch (Exception exception)
+            {
+                timer.Stop();
+                output.ElapsedMilliseconds = timer.ElapsedMilliseconds;
+                output.Reason = "NativeLootException";
+                output.Exception = exception.GetType().Name;
+                LogFailure("WorldItemLoot", exception);
+                AllflameBot.ReleaseOwnedInput(
+                    "NativeWorldItemLootException");
+                AllflameLog.Info(
+                    "DPB_WORLD_ITEM_LOOT" +
+                    "|Context=" + safeContext +
+                    "|Mode=Unavailable" +
+                    "|Result=FallbackRequired" +
+                    "|Exception=" + exception.GetType().Name +
+                    "|ElapsedMs=" + output.ElapsedMilliseconds +
+                    "|Postcondition=FallbackInteract");
+                return output;
+            }
         }
 
         public static async Task<DpbActionResult>

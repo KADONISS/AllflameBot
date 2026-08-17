@@ -4,6 +4,10 @@ All notable changes to AllflameBot are documented in this file.
 
 ## Unreleased
 
+- Use DPB `Coroutines.Loot` for ground World Items and Sulphur rewards when
+  available, keep the existing filter and inventory/world-item confirmation
+  flow, and fall back to `InteractWith` when the native API is unavailable.
+
 ## 0.23.169 - 2026-08-14
 
 - Treat a successful native Voyage Planner snapshot with `Opened=False` as an
