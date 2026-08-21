@@ -79,6 +79,30 @@ CHART_DEVICE_REQUEST_RELEASED|ChartSupplyChecksReset=True|Action=ResumeChartRunn
 
 ## Expected recovery evidence
 
+After the initial Bathysphere input is accepted, extraction owns the
+transition until an area-hash postcondition is observed. The owning task sends
+one Space after 10 seconds, retries the Bathysphere after the five-second
+cooldown, and does not let the Chart Device task compete with that recovery:
+
+```text
+VOYAGE_STAGE|Stage=9|Action=Extract|Success=True|...
+BATHYSPHERE_TRANSITION_ARMED|Mode=VoyageExtraction|...
+BATHYSPHERE_TRANSITION_WAIT|Mode=VoyageExtraction|...
+BATHYSPHERE_SPACE_INPUT|Reason=NoAreaTransitionAfter10Seconds|InputSent=True|Postcondition=DeferredFreshSnapshot
+BATHYSPHERE_SPACE_RECOVERY|Mode=VoyageExtraction|Interactions=1|RetryAfterSeconds=5|Postcondition=DeferredFreshSnapshot
+BATHYSPHERE_ENTER|Mode=VoyageExtractionRetry|Interaction=2|Success=True
+BATHYSPHERE_TRANSITION_READY|Mode=VoyageExtraction|...
+```
+
+If the second interaction still has no area-transition postcondition, the
+voyage call is released and the normal capsule-rescue/runner state can resume
+without a new automatic stop:
+
+```text
+BATHYSPHERE_EXTRACTION_RECOVERY_EXHAUSTED|Action=ReleaseCallAndResumeCapsuleRescue
+CHART_DEVICE_REQUEST_RELEASED|Reason=BathysphereExtractionRecoveryExhausted|Action=ResumeChartRunner
+```
+
 - If the owning interaction state machine exceeds its bounded wait,
   `CHART_STORAGE_INTERACTION_TIMEOUT` or the equivalent task-specific timeout
   is logged; for movement-finish, DPB's native timeout produces
@@ -87,6 +111,9 @@ CHART_DEVICE_REQUEST_RELEASED|ChartSupplyChecksReset=True|Action=ResumeChartRunn
 - If Bathysphere approach recovery exhausts its budget,
   `CHART_DEVICE_REQUEST_RELEASED` is followed by normal Chart Runner task
   activity; the bot does not stop solely for this transient path failure.
+- If three in-range Bathysphere inputs are rejected, the extraction task logs
+  `BATHYSPHERE_EXTRACT_GIVE_UP`, releases the call and process-hook input, and
+  returns to capsule rescue instead of calling `AllflameStopController.Stop`.
 - A stalled area transition sends one Space after 10 seconds, waits 5 seconds
   before interaction #2, and reopens the Chart Device only after the second
   interaction still has no area-transition postcondition.

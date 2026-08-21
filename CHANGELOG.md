@@ -8,6 +8,20 @@ All notable changes to AllflameBot are documented in this file.
   available, keep the existing filter and inventory/world-item confirmation
   flow, and fall back to `InteractWith` when the native API is unavailable.
 
+## 0.23.170 - 2026-08-21
+
+- Keep Bathysphere extraction as the owning transition task after accepted
+  input, so Chart Device recovery cannot compete with Voyage extraction.
+- Recover a stalled extraction with one Space after 10 seconds and a bounded
+  second Bathysphere interaction after five seconds, using fresh object
+  snapshots instead of blocking UI scans.
+- Rotate bounded Bathysphere approach anchors and reload movement state when
+  the live portal distance stops improving; release the Chart request and
+  resume the normal runner when extraction recovery is exhausted.
+- Treat repeated rejected Bathysphere inputs as a recoverable call handoff,
+  clearing held input and refreshing state instead of issuing a terminal stop.
+- Build and verify the release against DreamPoeBot `0.3.29.39`.
+
 ## 0.23.169 - 2026-08-14
 
 - Treat a successful native Voyage Planner snapshot with `Opened=False` as an

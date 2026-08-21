@@ -23,7 +23,7 @@ namespace AllflameBot
 {
     internal static class AllflameVersion
     {
-        public const string Current = "0.23.169";
+        public const string Current = "0.23.170";
     }
 
     public sealed class AllflameBot : IBot
@@ -1027,6 +1027,12 @@ namespace AllflameBot
         Unavailable
     }
 
+    internal enum AllflameAreaTransitionMode
+    {
+        ChartDevice,
+        VoyageExtraction
+    }
+
     internal static class AllflameAreaTransitionGuard
     {
         private const int MaximumChartDeviceRecoveryRequests = 2;
@@ -1052,8 +1058,18 @@ namespace AllflameBot
         private static bool _freshSnapshotRequested;
         private static bool _chartDeviceRecoveryRequested;
         private static int _chartDeviceRecoveryCount;
+        private static AllflameAreaTransitionMode _mode =
+            AllflameAreaTransitionMode.ChartDevice;
 
         public static bool Pending { get { return _pending; } }
+        public static bool IsVoyageExtraction
+        {
+            get
+            {
+                return _mode ==
+                    AllflameAreaTransitionMode.VoyageExtraction;
+            }
+        }
         public static int PortalId { get { return _portalId; } }
         public static bool ChartDeviceRecoveryRequested
         {
@@ -1087,9 +1103,22 @@ namespace AllflameBot
             _spaceRecoverySent = false;
             _retryIssuedUtc = DateTime.MinValue;
             _freshSnapshotRequested = false;
+            _mode = AllflameAreaTransitionMode.ChartDevice;
         }
 
         public static void Arm(NetworkObject portal)
+        {
+            Arm(portal, AllflameAreaTransitionMode.ChartDevice);
+        }
+
+        public static void ArmVoyageExtraction(NetworkObject portal)
+        {
+            Arm(portal, AllflameAreaTransitionMode.VoyageExtraction);
+        }
+
+        private static void Arm(
+            NetworkObject portal,
+            AllflameAreaTransitionMode mode)
         {
             if (_pending || portal == null)
             {
@@ -1109,8 +1138,12 @@ namespace AllflameBot
             _spaceRecoverySent = false;
             _retryIssuedUtc = DateTime.MinValue;
             _freshSnapshotRequested = false;
+            _mode = mode;
             AllflameLog.Info(
-                "CHART_AREA_TRANSITION_ARMED" +
+                TransitionEvent(
+                    "CHART_AREA_TRANSITION_ARMED",
+                    "BATHYSPHERE_TRANSITION_ARMED") +
+                "|Mode=" + ModeName() +
                 "|SourceAreaHash=" + _sourceAreaHash +
                 "|PortalId=" + _portalId +
                 "|PortalPosition=" + _portalPosition +
@@ -1127,22 +1160,33 @@ namespace AllflameBot
 
             DateTime now = DateTime.UtcNow;
             TimeSpan elapsed = now - _startedUtc;
+            bool voyageExtraction = IsVoyageExtraction;
             if (elapsed >= HardTimeout)
             {
                 string detail =
-                    "ActiveTask=LoadChartDeviceTask" +
+                    "ActiveTask=" +
+                    (voyageExtraction
+                        ? "ExtractTask"
+                        : "LoadChartDeviceTask") +
                     "|SourceAreaHash=" + _sourceAreaHash +
                     "|ObservedAreaHash=" + observedAreaHash +
                     "|PortalId=" + _portalId +
                     "|Interactions=" + _interactionCount +
                     "|ElapsedMilliseconds=" +
                     (int)elapsed.TotalMilliseconds +
-                    "|Action=ReopenChartDevice";
-                AllflameLog.Info("CHART_AREA_TRANSITION_TIMEOUT|" + detail);
+                    "|Action=" +
+                    (voyageExtraction
+                        ? "ReleaseCallAndResumeCapsuleRescue"
+                        : "ReopenChartDevice");
+                AllflameLog.Info(
+                    TransitionEvent(
+                        "CHART_AREA_TRANSITION_TIMEOUT",
+                        "BATHYSPHERE_TRANSITION_TIMEOUT") +
+                    "|" + detail);
                 RequestChartDeviceRecovery(
                     "TransitionHardTimeout",
                     detail);
-                return true;
+                return !voyageExtraction;
             }
 
             _sourceRuntimeReady =
@@ -1152,7 +1196,7 @@ namespace AllflameBot
                 _candidateAreaHash = 0;
                 _stableCandidateSamples = 0;
                 LogWait("RuntimeNotReady", observedAreaHash, elapsed);
-                return true;
+                return !voyageExtraction || !runtimeReady;
             }
 
             if (observedAreaHash == _sourceAreaHash)
@@ -1186,7 +1230,7 @@ namespace AllflameBot
                         "|ElapsedMilliseconds=" +
                         (int)elapsed.TotalMilliseconds);
                 }
-                return true;
+                return !voyageExtraction;
             }
 
             if (_candidateAreaHash == observedAreaHash)
@@ -1202,11 +1246,14 @@ namespace AllflameBot
             if (_stableCandidateSamples < 2)
             {
                 LogWait("NewAreaStabilityCheck", observedAreaHash, elapsed);
-                return true;
+                return !voyageExtraction;
             }
 
             AllflameLog.Info(
-                "CHART_AREA_TRANSITION_READY" +
+                TransitionEvent(
+                    "CHART_AREA_TRANSITION_READY",
+                    "BATHYSPHERE_TRANSITION_READY") +
+                "|Mode=" + ModeName() +
                 "|SourceAreaHash=" + _sourceAreaHash +
                 "|NewAreaHash=" + observedAreaHash +
                 "|StableSamples=" + _stableCandidateSamples +
@@ -1248,7 +1295,10 @@ namespace AllflameBot
             _nextRetryUtc = DateTime.UtcNow + RetryDelay;
             _freshSnapshotRequested = true;
             AllflameLog.Info(
-                "CHART_AREA_TRANSITION_SPACE_RECOVERY" +
+                TransitionEvent(
+                    "CHART_AREA_TRANSITION_SPACE_RECOVERY",
+                    "BATHYSPHERE_SPACE_RECOVERY") +
+                "|Mode=" + ModeName() +
                 "|SourceAreaHash=" + _sourceAreaHash +
                 "|PortalId=" + _portalId +
                 "|Interactions=" + _interactionCount +
@@ -1273,6 +1323,13 @@ namespace AllflameBot
             if (!_pending)
             {
                 return false;
+            }
+
+            if (IsVoyageExtraction)
+            {
+                return ReleaseVoyageExtractionRecovery(
+                    reason,
+                    detail);
             }
 
             int recovery = _chartDeviceRecoveryCount + 1;
@@ -1318,6 +1375,34 @@ namespace AllflameBot
             AllflameProgressWatchdog.MarkProgress(
                 "ChartAreaTransitionRecovery");
             return true;
+        }
+
+        private static bool ReleaseVoyageExtractionRecovery(
+            string reason,
+            string detail)
+        {
+            uint sourceAreaHash = _sourceAreaHash;
+            int portalId = _portalId;
+            int interactions = _interactionCount;
+            AllflameLog.Info(
+                "BATHYSPHERE_EXTRACTION_RECOVERY_EXHAUSTED" +
+                "|Reason=" + (reason ?? String.Empty) +
+                "|SourceAreaHash=" + sourceAreaHash +
+                "|PortalId=" + portalId +
+                "|Interactions=" + interactions +
+                "|Detail=" + (detail ?? String.Empty) +
+                "|Action=ReleaseCallAndResumeCapsuleRescue");
+            VoyageRunState.AllowCallRetry();
+            ResetTransitionState();
+            AllflameBot.ReleaseOwnedInput(
+                "BathysphereExtractionRecoveryExhausted");
+            AllflameRunState.ReleaseChartDeviceRequest(
+                "BathysphereExtractionRecoveryExhausted");
+            AllflameMovementCoordinator.Reset();
+            AllflameContext.RequestManualSnapshot();
+            AllflameProgressWatchdog.MarkProgress(
+                "BathysphereExtractionRecoveryExhausted");
+            return false;
         }
 
         public static bool ConsumeChartDeviceRecoveryRequest()
@@ -1366,7 +1451,10 @@ namespace AllflameBot
             AllflameLog.Throttled(
                 "chart_portal_interaction_suppressed",
                 TimeSpan.FromSeconds(1),
-                "CHART_PORTAL_INTERACTION_SUPPRESSED" +
+                TransitionEvent(
+                    "CHART_PORTAL_INTERACTION_SUPPRESSED",
+                    "BATHYSPHERE_INTERACTION_SUPPRESSED") +
+                "|Mode=" + ModeName() +
                 "|SourceAreaHash=" + _sourceAreaHash +
                 "|CurrentAreaHash=" + currentAreaHash +
                 "|PortalId=" + _portalId +
@@ -1385,7 +1473,10 @@ namespace AllflameBot
             AllflameLog.Throttled(
                 "chart_area_transition_wait",
                 TimeSpan.FromSeconds(1),
-                "CHART_AREA_TRANSITION_WAIT" +
+                TransitionEvent(
+                    "CHART_AREA_TRANSITION_WAIT",
+                    "BATHYSPHERE_TRANSITION_WAIT") +
+                "|Mode=" + ModeName() +
                 "|Reason=" + reason +
                 "|SourceAreaHash=" + _sourceAreaHash +
                 "|ObservedAreaHash=" + observedAreaHash +
@@ -1393,6 +1484,22 @@ namespace AllflameBot
                 "|Interactions=" + _interactionCount +
                 "|ElapsedMilliseconds=" +
                 Math.Max(0, (int)elapsed.TotalMilliseconds));
+        }
+
+        private static string ModeName()
+        {
+            return IsVoyageExtraction
+                ? "VoyageExtraction"
+                : "ChartDevice";
+        }
+
+        private static string TransitionEvent(
+            string chartEvent,
+            string extractionEvent)
+        {
+            return IsVoyageExtraction
+                ? extractionEvent
+                : chartEvent;
         }
     }
 
@@ -7990,6 +8097,11 @@ namespace AllflameBot
         protected override async Task<bool> RunCore()
         {
             if (!AllflameAreaTransitionGuard.Pending)
+            {
+                return false;
+            }
+
+            if (AllflameAreaTransitionGuard.IsVoyageExtraction)
             {
                 return false;
             }
@@ -25964,7 +26076,7 @@ namespace AllflameBot
             return true;
         }
 
-        private static void ResetBathyspherePath(string reason)
+        internal static void ResetBathyspherePath(string reason)
         {
             string safeReason = reason ?? "BathyspherePathReset";
             AllflameLog.Info(
@@ -26060,6 +26172,17 @@ namespace AllflameBot
                 "CHART_AREA_TRANSITION_SPACE_INPUT",
                 "CHART_AREA_TRANSITION_SPACE_FAILED",
                 "CHART_AREA_TRANSITION_SPACE_CLEANUP_FAILED");
+        }
+
+        internal static bool SendSpaceForBathysphereRecovery(
+            string reason)
+        {
+            return SendSpaceInput(
+                reason,
+                false,
+                "BATHYSPHERE_SPACE_INPUT",
+                "BATHYSPHERE_SPACE_FAILED",
+                "BATHYSPHERE_SPACE_CLEANUP_FAILED");
         }
 
         private static bool SendSpaceInput(
@@ -39193,11 +39316,31 @@ namespace AllflameBot
     internal sealed class ExtractTask : ObserverTask
     {
         private const float BathysphereExtractionInteractionDistance = 35f;
+        private const int BathysphereApproachNoProgressSeconds = 4;
+        private const int MaximumBathysphereApproachRecoveries = 3;
+        private static readonly Vector2i[] BathysphereApproachOffsets =
+        {
+            new Vector2i(0, 0),
+            new Vector2i(42, 0),
+            new Vector2i(0, 42),
+            new Vector2i(-42, 0),
+            new Vector2i(0, -42),
+            new Vector2i(30, 30),
+            new Vector2i(-30, 30),
+            new Vector2i(-30, -30),
+            new Vector2i(30, -30)
+        };
         private DateTime _nextInteractUtc = DateTime.MinValue;
         private DateTime _firstFailureUtc = DateTime.MinValue;
         private int _failedObjectId;
         private int _failedAttempts;
         private uint _failedAreaHash;
+        private int _approachObjectId;
+        private uint _approachAreaHash;
+        private int _approachAnchorIndex;
+        private int _approachRecoveries;
+        private float _approachBestDistance = Single.MaxValue;
+        private DateTime _approachLastProgressUtc = DateTime.MinValue;
 
         public ExtractTask()
             : base("ExtractTask", "Would use the encounter Bathysphere extraction object.") { }
@@ -39215,6 +39358,13 @@ namespace AllflameBot
 
         protected override async Task<bool> RunCore()
         {
+            if (AllflameAreaTransitionGuard.Pending &&
+                AllflameAreaTransitionGuard.IsVoyageExtraction &&
+                await RunVoyageTransitionRecovery())
+            {
+                return true;
+            }
+
             if (!AllflameContext.IsVoyageMapArea ||
                 (AllflameContext.Phase !=
                     AllflamePhase.WaitingForBathysphere &&
@@ -39299,23 +39449,15 @@ namespace AllflameBot
             if (extraction.Distance >
                 BathysphereExtractionInteractionDistance)
             {
-                if (AllflameProgressWatchdog.TryConsumeRecovery(
-                        "ReloadPathAndReacquireBathysphere"))
+                PrepareBathysphereApproach(extraction);
+                if (TryRecoverBathysphereApproach(extraction))
                 {
-                    try
-                    {
-                        ExilePather.Reload(true);
-                    }
-                    catch
-                    {
-                    }
-                    AllflameContext.Refresh(true);
-                    AllflameProgressWatchdog.MarkProgress(
-                        "ReacquireBathysphere");
                     return true;
                 }
+                Vector2i approachTarget =
+                    BathysphereApproachTarget(extraction);
                 bool moving = AllflameMovementCoordinator.MoveTowards(
-                    extraction.Position,
+                    approachTarget,
                     Name);
                 AllflameLog.Throttled(
                     "voyage_return_bathysphere_move",
@@ -39327,11 +39469,16 @@ namespace AllflameBot
                     (String.IsNullOrEmpty(extraction.Name)
                         ? "Unknown"
                         : extraction.Name) +
-                    "|Target=" + extraction.Position +
+                    "|Target=" + approachTarget +
+                    "|PortalPosition=" + extraction.Position +
                     "|Distance=" +
                     extraction.Distance.ToString("0.0") +
                     "|InteractRange=" +
                     BathysphereExtractionInteractionDistance.ToString("0.0") +
+                    "|ApproachAnchor=" + _approachAnchorIndex +
+                    "|ApproachRecovery=" + _approachRecoveries +
+                    "|NoProgressSeconds=" +
+                    ApproachNoProgressSeconds() +
                     "|Moving=" + moving);
                 return true;
             }
@@ -39417,9 +39564,10 @@ namespace AllflameBot
             if (used)
             {
                 AllflameProgressWatchdog.MarkProgress(
-                    "ExtractAccepted");
+                    "ExtractionInputAcceptedAwaitingTransition");
+                AllflameAreaTransitionGuard.ArmVoyageExtraction(
+                    extraction);
                 ResetInteractionState();
-                AllflameProgressWatchdog.Clear();
             }
             else
             {
@@ -39468,13 +39616,17 @@ namespace AllflameBot
                         "|ObjectId=" + extraction.Id +
                         "|Attempts=" + _failedAttempts +
                         "|ElapsedSeconds=" + elapsedSeconds +
-                        "|NextAction=ControlledStop");
-                    AllflameStopController.Stop(
-                        "BathysphereExtractGiveUp",
-                        "ObjectId=" + extraction.Id +
-                        "|AreaHash=" + AllflameContext.AreaHash +
-                        "|Attempts=" + _failedAttempts +
-                        "|ElapsedSeconds=" + elapsedSeconds);
+                        "|NextAction=ReleaseCallAndResumeCapsuleRescue");
+                    VoyageRunState.AllowCallRetry();
+                    AllflameRunState.ReleaseChartDeviceRequest(
+                        "BathysphereExtractGiveUp");
+                    AllflameBot.ReleaseOwnedInput(
+                        "BathysphereExtractGiveUp");
+                    AllflameMovementCoordinator.Reset();
+                    AllflameContext.RequestManualSnapshot();
+                    AllflameProgressWatchdog.MarkProgress(
+                        "BathysphereExtractGiveUp");
+                    ResetInteractionState();
                     return true;
                 }
             }
@@ -39489,6 +39641,239 @@ namespace AllflameBot
             _failedObjectId = 0;
             _failedAttempts = 0;
             _failedAreaHash = 0;
+            ResetBathysphereApproach();
+        }
+
+        private async Task<bool> RunVoyageTransitionRecovery()
+        {
+            if (AllflameStopController.StopRequested)
+            {
+                return true;
+            }
+
+            if (AllflameAreaTransitionGuard.CanSendSpace(
+                    AllflameContext.AreaHash))
+            {
+                AllflameBot.ReleaseOwnedInput(
+                    "BathysphereSpaceRecovery");
+                bool spaceSent =
+                    EnterBathysphereTask
+                        .SendSpaceForBathysphereRecovery(
+                            "NoAreaTransitionAfter10Seconds");
+                try
+                {
+                    await Coroutines.CloseBlockingWindows();
+                }
+                catch (Exception ex)
+                {
+                    AllflameLog.Info(
+                        "BATHYSPHERE_SPACE_CLOSE_FAILED" +
+                        "|Type=" + ex.GetType().Name);
+                }
+                AllflameAreaTransitionGuard.RegisterSpaceRecovery(
+                    spaceSent);
+                AllflameContext.RequestManualSnapshot();
+                return true;
+            }
+
+            if (!AllflameAreaTransitionGuard.CanRetry(
+                    AllflameContext.AreaHash))
+            {
+                AllflameAreaTransitionGuard.LogInteractionSuppressed(
+                    AllflameContext.AreaHash);
+                return true;
+            }
+
+            int interaction =
+                AllflameAreaTransitionGuard.RegisterRetry();
+            NetworkObject portal = AllflameContext.ExtractionObject;
+            if (!AllflameContext.IsActualExtractionObject(portal))
+            {
+                portal = AllflameContext.BathysphereObject;
+            }
+            if (portal == null ||
+                !portal.IsValid ||
+                !AllflameContext.IsActualExtractionObject(portal) ||
+                portal.Id != AllflameAreaTransitionGuard.PortalId)
+            {
+                AllflameLog.Info(
+                    "BATHYSPHERE_ENTER" +
+                    "|Mode=VoyageExtractionRetry" +
+                    "|Interaction=" + interaction +
+                    "|Success=False" +
+                    "|Reason=FreshPortalUnavailable" +
+                    "|ExpectedPortalId=" +
+                    AllflameAreaTransitionGuard.PortalId +
+                    "|CurrentAreaHash=" +
+                    AllflameContext.AreaHash);
+                return true;
+            }
+
+            if (portal.Distance >
+                BathysphereExtractionInteractionDistance)
+            {
+                bool moving = AllflameMovementCoordinator.MoveTowards(
+                    portal.Position,
+                    Name + " transition recovery");
+                AllflameLog.Throttled(
+                    "bathysphere_transition_approach",
+                    TimeSpan.FromSeconds(1),
+                    "BATHYSPHERE_TRANSITION_APPROACH" +
+                    "|Interaction=" + interaction +
+                    "|ObjectId=" + portal.Id +
+                    "|Distance=" + portal.Distance.ToString("0.0") +
+                    "|Moving=" + moving);
+                return true;
+            }
+
+            await FinishMovementBeforeInteraction(
+                "Voyage Bathysphere Transition Retry");
+            bool entered = await InteractWithRecovery(portal);
+            AllflameLog.Info(
+                "BATHYSPHERE_ENTER" +
+                "|Mode=VoyageExtractionRetry" +
+                "|Interaction=" + interaction +
+                "|Success=" + entered +
+                "|ObjectId=" + portal.Id +
+                "|Distance=" + portal.Distance.ToString("0.0"));
+            return true;
+        }
+
+        private void PrepareBathysphereApproach(NetworkObject extraction)
+        {
+            if (_approachObjectId == extraction.Id &&
+                _approachAreaHash == AllflameContext.AreaHash)
+            {
+                if (extraction.Distance + 2f < _approachBestDistance)
+                {
+                    _approachBestDistance = extraction.Distance;
+                    _approachLastProgressUtc = DateTime.UtcNow;
+                }
+                return;
+            }
+
+            _approachObjectId = extraction.Id;
+            _approachAreaHash = AllflameContext.AreaHash;
+            _approachAnchorIndex = 0;
+            _approachRecoveries = 0;
+            _approachBestDistance = extraction.Distance;
+            _approachLastProgressUtc = DateTime.UtcNow;
+        }
+
+        private Vector2i BathysphereApproachTarget(
+            NetworkObject extraction)
+        {
+            int index = Math.Max(
+                0,
+                Math.Min(
+                    _approachAnchorIndex,
+                    BathysphereApproachOffsets.Length - 1));
+            Vector2i offset = BathysphereApproachOffsets[index];
+            return new Vector2i(
+                extraction.Position.X + offset.X,
+                extraction.Position.Y + offset.Y);
+        }
+
+        private bool TryRecoverBathysphereApproach(
+            NetworkObject extraction)
+        {
+            if (_approachLastProgressUtc == DateTime.MinValue ||
+                DateTime.UtcNow - _approachLastProgressUtc <
+                    TimeSpan.FromSeconds(
+                        BathysphereApproachNoProgressSeconds))
+            {
+                return false;
+            }
+
+            int elapsedSeconds = ApproachNoProgressSeconds();
+            AllflameProgressWatchdog.SetRetry(
+                _approachRecoveries *
+                    BathysphereApproachOffsets.Length +
+                _approachAnchorIndex + 1);
+            AllflameLog.Info(
+                "BATHYSPHERE_APPROACH_NO_PROGRESS" +
+                "|ObjectId=" + extraction.Id +
+                "|AreaHash=" + AllflameContext.AreaHash +
+                "|PortalPosition=" + extraction.Position +
+                "|Distance=" + extraction.Distance.ToString("0.0") +
+                "|BestDistance=" +
+                _approachBestDistance.ToString("0.0") +
+                "|AnchorIndex=" + _approachAnchorIndex +
+                "|Recovery=" + _approachRecoveries +
+                "|ElapsedSeconds=" + elapsedSeconds +
+                "|Action=ReloadPathAndRotateAnchor");
+
+            if (_approachAnchorIndex <
+                BathysphereApproachOffsets.Length - 1)
+            {
+                _approachAnchorIndex++;
+            }
+            else
+            {
+                _approachAnchorIndex = 0;
+                _approachRecoveries++;
+            }
+
+            if (_approachRecoveries >
+                MaximumBathysphereApproachRecoveries)
+            {
+                AllflameLog.Info(
+                    "BATHYSPHERE_APPROACH_RECOVERY_EXHAUSTED" +
+                    "|ObjectId=" + extraction.Id +
+                    "|AreaHash=" + AllflameContext.AreaHash +
+                    "|Recoveries=" + _approachRecoveries +
+                    "|Max=" +
+                    MaximumBathysphereApproachRecoveries +
+                    "|Action=ReleaseCallAndResumeCapsuleRescue");
+                VoyageRunState.AllowCallRetry();
+                AllflameBot.ReleaseOwnedInput(
+                    "BathysphereApproachRecoveryExhausted");
+                AllflameMovementCoordinator.Reset();
+                AllflameContext.RequestManualSnapshot();
+                AllflameProgressWatchdog.MarkProgress(
+                    "BathysphereApproachRecoveryExhausted");
+                ResetBathysphereApproach();
+                return true;
+            }
+
+            EnterBathysphereTask.ResetBathyspherePath(
+                "BathysphereApproachNoProgress");
+            _approachBestDistance = extraction.Distance;
+            _approachLastProgressUtc = DateTime.UtcNow;
+            AllflameContext.RequestManualSnapshot();
+            AllflameProgressWatchdog.MarkProgress(
+                "BathysphereApproachAnchorRotated");
+            AllflameLog.Info(
+                "BATHYSPHERE_APPROACH_ANCHOR_ROTATED" +
+                "|ObjectId=" + extraction.Id +
+                "|AnchorIndex=" + _approachAnchorIndex +
+                "|AnchorTarget=" +
+                BathysphereApproachTarget(extraction) +
+                "|Recovery=" + _approachRecoveries +
+                "|Action=RefreshPathAndContinue");
+            return true;
+        }
+
+        private int ApproachNoProgressSeconds()
+        {
+            if (_approachLastProgressUtc == DateTime.MinValue)
+            {
+                return 0;
+            }
+            return Math.Max(
+                0,
+                (int)(DateTime.UtcNow -
+                    _approachLastProgressUtc).TotalSeconds);
+        }
+
+        private void ResetBathysphereApproach()
+        {
+            _approachObjectId = 0;
+            _approachAreaHash = 0;
+            _approachAnchorIndex = 0;
+            _approachRecoveries = 0;
+            _approachBestDistance = Single.MaxValue;
+            _approachLastProgressUtc = DateTime.MinValue;
         }
     }
 
